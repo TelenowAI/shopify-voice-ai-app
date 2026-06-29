@@ -19,7 +19,6 @@
 - [🤖 Automations & the data written back](#-automations--the-data-written-back)
 - [📥 Telenow webhooks (inbound)](#-telenow-webhooks-inbound)
 - [🛡️ Security notes](#️-security-notes)
-- [🛒 App Store listing copy & SEO](#-app-store-listing-copy--seo)
 - [✅ Production checklist](#-production-checklist)
 - [🧪 Local round-trip test](#-local-round-trip-test)
 - [📁 Project layout](#-project-layout)
@@ -148,37 +147,6 @@ We verify by recomputing the HMAC over the **raw body** with that secret (consta
 - **Open-redirect / SSRF guard.** The `?shop=` parameter is validated against `*.myshopify.com` and sanitized via the library before any OAuth redirect.
 - **Quiet hours.** Calls are suppressed inside each automation's local quiet-hours window (and re-checked at fire time for delayed calls).
 - **Webhook dedupe.** Shopify redelivers webhooks (and `checkouts/update` fires many times per cart), so the app refuses to place a second call for the same entity within a TTL, clearing the mark if placement itself fails so a genuine retry still goes through.
-
-## 🛒 App Store listing copy & SEO
-
-Set **Pricing → Free**. Because the app connects to a paid external service, the listing must disclose it (a common review-rejection reason if hidden). Note: Shopify forbids the word "Shopify" in app names. Suggested fields:
-
-- **App name (≤30 chars):** `Telenow Voice AI: Call Shoppers`
-  - Alternates: `Telenow Voice AI — Order Calls`, `Telenow AI Voice Call Agent`
-- **Tagline / subtitle (≤62 chars):** `AI calls shoppers: abandoned cart, COD, delivery & win-back`
-  - Alternate: `AI voice agent that calls shoppers & confirms COD orders`
-- **Search terms / keywords (Shopify weights name + tagline + these):**
-  `abandoned cart recovery`, `abandoned checkout`, `cash on delivery`, `COD confirmation`, `COD verification`, `RTO reduction`, `order confirmation call`, `delivery updates`, `shipping notification`, `failed delivery`, `NDR retry`, `where is my order`, `win back customers`, `customer re-engagement`, `lead callback`, `speed to lead`, `instant lead call`, `review request`, `feedback call`, `NPS survey`, `AI voice agent`, `AI phone call`, `outbound calling`, `IVR`, `automated calls`, `multilingual voice`, `Hindi voice agent`, `India COD`
-- **Short description (≤120 chars, for the card):**
-  `An AI voice agent that automatically calls your shoppers to recover abandoned carts, confirm COD orders, and more.`
-- **Description (benefit-led, keyword-rich — paste into the listing body):**
-  > **Turn store events into real phone calls — placed by an AI voice agent, with the outcome written back onto the order.** Telenow Voice AI automatically phones your shoppers at the moments that matter and logs what happened as order tags, notes, and a metafield — no glue code, no extra dashboards.
-  >
-  > **What the AI voice agent does for you:**
-  > - **Abandoned cart recovery** — call shoppers who left checkout and send them back to finish, with an optional discount.
-  > - **Cash on delivery (COD) confirmation & RTO reduction** — verify COD orders by phone before you ship, so you stop paying for returns-to-origin and refused parcels.
-  > - **Order confirmation calls** — confirm new orders the moment they're placed.
-  > - **Delivery & shipping updates** — call with tracking the moment an order is fulfilled, and retry failed deliveries (NDR) so parcels don't bounce back.
-  > - **"Where is my order?" answered live** — the agent can look up orders, products, and customers during the call and answer two-way, in real time.
-  > - **Win-back & re-engagement** — re-activate lapsed customers who haven't ordered in a while.
-  > - **Instant lead callback (speed to lead)** — phone a new customer or lead within seconds of sign-up.
-  > - **Review, feedback & NPS calls** — collect ratings and feedback after delivery.
-  >
-  > **Why merchants choose it:** a natural, multilingual AI voice (English plus Hindi and other Indian languages, and global languages) that uses your existing Telenow agents, and writes every call result straight back onto the order so your team always knows the outcome.
-  >
-  > This app is free to install. It connects to Telenow (https://telenow.ai), a separate AI voice-calling service that requires its own account. Telenow charges for call usage on its own platform per its pricing (https://telenow.ai/#pricing); these charges are not processed by Shopify. The app sends your shopper's phone number and the order context you enable to Telenow to place calls — no payment card data is sent. Telenow's Terms (https://telenow.ai/terms) and Privacy Policy (https://telenow.ai/privacy) apply.
-- **Pricing:** Free to install. Requires a Telenow account; Telenow bills for call usage on its own platform (no charges through Shopify).
-- **Privacy / data handling (for the listing's data-access section):** sends shopper phone + order context to Telenow to place calls; stores call metadata (session→order) for write-back; supports the mandatory GDPR webhooks. Voice recordings/transcripts are held by Telenow.
 
 ## ✅ Production checklist
 
