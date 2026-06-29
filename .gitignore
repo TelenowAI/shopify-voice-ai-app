@@ -1,0 +1,18 @@
+# dependencies
+node_modules/
+
+# env / secrets — NEVER commit your API keys or Shopify app secret
+.env
+.env.local
+.env.*.local
+
+# file-persistence stub (swap for a real DB in production)
+data/*.json
+!data/.gitkeep
+
+# logs / os cruft
+*.log
+.DS_Store
+
+# local agent/editor config
+.claude/

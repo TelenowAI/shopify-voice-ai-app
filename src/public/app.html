@@ -1,0 +1,381 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Telenow for Shopify — Settings</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #171a21;
+    --line: #262b35;
+    --text: #e7eaf0;
+    --muted: #9aa3b2;
+    --accent: #6c5ce7;
+    --ok: #2ecc71;
+    --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 28px 18px 80px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 18px; margin: 14px 0;
+  }
+  .card h2 { font-size: 16px; margin: 0 0 2px; }
+  .card .hint { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin: 10px 0 4px; }
+  input[type="text"], input[type="password"], input[type="number"], select {
+    width: 100%; padding: 9px 11px; border-radius: 8px;
+    border: 1px solid var(--line); background: #0d0f14; color: var(--text); font-size: 14px;
+  }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 160px; }
+  .toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+  .toggle input { width: 18px; height: 18px; accent-color: var(--accent); }
+  button {
+    background: var(--accent); color: #fff; border: 0; padding: 11px 18px;
+    border-radius: 9px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button.secondary { background: #2a2f3a; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .bar {
+    position: sticky; bottom: 0; background: linear-gradient(180deg, transparent, var(--bg) 40%);
+    padding: 16px 0 0; display: flex; gap: 10px; align-items: center;
+  }
+  .pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); }
+  .pill.on { color: var(--ok); border-color: var(--ok); }
+  .pill.off { color: var(--muted); }
+  .msg { font-size: 13px; }
+  .msg.ok { color: var(--ok); }
+  .msg.err { color: var(--err); }
+  .quiet { margin-top: 6px; }
+  .quiet[hidden] { display: none; }
+  code { background: #0d0f14; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  a { color: var(--accent); }
+  table.leads { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.leads th, table.leads td {
+    text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px;
+  }
+  table.leads th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  table.leads tr:last-child td { border-bottom: 0; }
+  .status { font-size: 11.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .status.completed, .status.placed { color: var(--ok); border-color: var(--ok); }
+  .status.failed { color: var(--err); border-color: var(--err); }
+  .empty { color: var(--muted); font-size: 13px; }
+</style>
+
+<div class="wrap">
+  <h1>Telenow for Shopify</h1>
+  <p class="sub">Place automated AI voice calls on store events and write the outcome back onto orders. Shop: <code id="shopName">—</code></p>
+
+  <!-- Telenow connection -->
+  <div class="card">
+    <h2>Telenow connection</h2>
+    <p class="hint">Paste your Telenow API key (<code>vai_live_…</code>) from Telenow → Developers → API Keys. We validate it and show your org.</p>
+    <div class="row">
+      <div style="flex: 2 1 320px;">
+        <label>Telenow API key</label>
+        <input id="apiKey" type="password" placeholder="vai_live_…" autocomplete="off" />
+        <div id="keyStatus" class="msg" style="margin-top:6px;"></div>
+      </div>
+      <div style="display:flex; align-items:flex-end;">
+        <button class="secondary" type="button" id="validateKey">Validate key</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Win-back threshold (global) -->
+  <div class="card">
+    <h2>Win-back threshold</h2>
+    <p class="hint">The scheduled win-back job calls customers whose last order is older than this many days.</p>
+    <div style="max-width: 220px;">
+      <label>Days since last order</label>
+      <input id="winBackDays" type="number" min="1" max="3650" />
+    </div>
+  </div>
+
+  <!-- Automations render here -->
+  <div id="automations"></div>
+
+  <!-- Recent leads -->
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div>
+        <h2>Recent leads</h2>
+        <p class="hint" style="margin-bottom:0;">New customers captured from <code>customers/create</code> and the callback we placed.</p>
+      </div>
+      <button class="secondary" type="button" id="refreshLeads">Refresh</button>
+    </div>
+    <div id="leads" style="margin-top:12px;"></div>
+  </div>
+
+  <div class="bar">
+    <button type="button" id="save">Save settings</button>
+    <span id="saveMsg" class="msg"></span>
+  </div>
+
+  <footer style="margin-top:28px; padding-top:14px; border-top:1px solid var(--line); color:var(--muted); font-size:12.5px;">
+    <a href="https://telenow.ai/privacy" target="_blank" rel="noopener">Privacy Policy</a>
+    &nbsp;·&nbsp;
+    <a href="https://telenow.ai/terms" target="_blank" rel="noopener">Terms of Service</a>
+    &nbsp;·&nbsp;
+    <a href="https://telenow.ai/#pricing" target="_blank" rel="noopener">Pricing</a>
+    &nbsp;·&nbsp;
+    <a href="mailto:support@telenow.ai">Support</a>
+    <div style="margin-top:6px;">Free app — voice calls are billed by your Telenow account, not through Shopify. © Telenow AI.</div>
+  </footer>
+</div>
+
+<script type="module">
+  // The shop is passed as ?shop= for display only. AUTH comes from a signed
+  // session token delivered in the URL FRAGMENT (#t=…) by the OAuth callback —
+  // we keep it in memory and send it as a Bearer token on every /api/* call.
+  // Never rely on the query param for auth.
+  const params = new URLSearchParams(location.search);
+  const shop = params.get('shop') || '';
+  const TOKEN = new URLSearchParams(location.hash.slice(1)).get('t') || '';
+  document.getElementById('shopName').textContent = shop || '(missing ?shop=)';
+
+  const qs = (s) => document.querySelector(s);
+  const apiKeyEl = qs('#apiKey');
+  const winBackEl = qs('#winBackDays');
+  const automationsEl = qs('#automations');
+  const leadsEl = qs('#leads');
+
+  let MODEL = null; // server-provided settings (redacted key)
+  let CATALOG = []; // automation definitions (key/label/triggers)
+
+  function api(path, opts = {}) {
+    const url = new URL(path, location.origin);
+    if (shop) url.searchParams.set('shop', shop); // display/back-compat only — NOT auth
+    return fetch(url, {
+      ...opts,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
+        ...(opts.headers || {}),
+      },
+    }).then(async (r) => {
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      return data;
+    });
+  }
+
+  function automationCard(def, cfg) {
+    const q = cfg.quietHours || {};
+    return `
+      <div class="card" data-key="${def.key}">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <h2>${def.label}</h2>
+            <p class="hint">Triggers: ${def.triggers.join(', ')}</p>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" data-field="enabled" ${cfg.enabled ? 'checked' : ''}/>
+            <span>Enabled</span>
+          </label>
+        </div>
+        <div class="row">
+          <div style="flex: 2 1 280px;">
+            <label>Telenow agent ID (UUID)</label>
+            <input type="text" data-field="agentId" value="${cfg.agentId || ''}" placeholder="agent uuid"/>
+          </div>
+          <div>
+            <label>Delay (minutes)</label>
+            <input type="number" min="0" max="10080" data-field="delayMinutes" value="${cfg.delayMinutes ?? 0}"/>
+          </div>
+        </div>
+        <label class="toggle quiet-toggle" style="margin-top:12px;">
+          <input type="checkbox" data-field="quietEnabled" ${q.enabled ? 'checked' : ''}/>
+          <span>Quiet hours (don't call inside this local window)</span>
+        </label>
+        <div class="row quiet" ${q.enabled ? '' : 'hidden'}>
+          <div><label>From</label><input type="text" data-field="quietStart" value="${q.start || '21:00'}" placeholder="21:00"/></div>
+          <div><label>To</label><input type="text" data-field="quietEnd" value="${q.end || '09:00'}" placeholder="09:00"/></div>
+          <div><label>Timezone (IANA)</label><input type="text" data-field="quietTz" value="${q.timezone || 'Asia/Kolkata'}"/></div>
+        </div>
+      </div>`;
+  }
+
+  function render() {
+    automationsEl.innerHTML = CATALOG.map((def) =>
+      automationCard(def, MODEL.automations[def.key] || {}),
+    ).join('');
+    // Wire quiet-hours show/hide.
+    automationsEl.querySelectorAll('.card').forEach((card) => {
+      const qt = card.querySelector('[data-field="quietEnabled"]');
+      const quiet = card.querySelector('.quiet');
+      qt.addEventListener('change', () => (quiet.hidden = !qt.checked));
+    });
+  }
+
+  // Mask the middle of a phone number so we don't render full PII in the table.
+  function maskPhone(p) {
+    if (!p) return '—';
+    return p.length < 6 ? '•••' : `${p.slice(0, 3)}•••${p.slice(-3)}`;
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+  }
+
+  // Build the leads table with DOM nodes + textContent (never innerHTML for data).
+  function renderLeads(leads) {
+    leadsEl.textContent = '';
+    if (!leads || leads.length === 0) {
+      const p = document.createElement('p');
+      p.className = 'empty';
+      p.textContent = 'No leads yet. They appear here when a customer is created in your store.';
+      leadsEl.appendChild(p);
+      return;
+    }
+    const table = document.createElement('table');
+    table.className = 'leads';
+    const thead = document.createElement('thead');
+    const htr = document.createElement('tr');
+    for (const h of ['Created', 'Name', 'Phone', 'Status', 'Disposition']) {
+      const th = document.createElement('th');
+      th.textContent = h;
+      htr.appendChild(th);
+    }
+    thead.appendChild(htr);
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+    for (const lead of leads) {
+      const tr = document.createElement('tr');
+      const cells = [
+        fmtDate(lead.createdAt),
+        lead.name || '—',
+        maskPhone(lead.phone),
+        null, // status pill
+        lead.disposition || '—',
+      ];
+      cells.forEach((val, i) => {
+        const td = document.createElement('td');
+        if (i === 3) {
+          const span = document.createElement('span');
+          const status = String(lead.status || 'queued');
+          span.className = `status ${status}`;
+          span.textContent = status;
+          td.appendChild(span);
+        } else {
+          td.textContent = val;
+          td.title = val; // full value on hover (cells are ellipsized)
+        }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    leadsEl.appendChild(table);
+  }
+
+  async function loadLeads() {
+    try {
+      const data = await api('/api/leads');
+      renderLeads(data.leads);
+    } catch (e) {
+      leadsEl.textContent = '';
+      const p = document.createElement('p');
+      p.className = 'empty';
+      p.textContent = `Failed to load leads: ${e.message}`;
+      leadsEl.appendChild(p);
+    }
+  }
+
+  function collect() {
+    const automations = {};
+    automationsEl.querySelectorAll('.card[data-key]').forEach((card) => {
+      const key = card.getAttribute('data-key');
+      const get = (f) => card.querySelector(`[data-field="${f}"]`);
+      automations[key] = {
+        enabled: get('enabled').checked,
+        agentId: get('agentId').value.trim(),
+        delayMinutes: Number(get('delayMinutes').value) || 0,
+        quietHours: {
+          enabled: get('quietEnabled').checked,
+          start: get('quietStart').value.trim() || '21:00',
+          end: get('quietEnd').value.trim() || '09:00',
+          timezone: get('quietTz').value.trim() || 'Asia/Kolkata',
+        },
+      };
+    });
+    const patch = { winBackDays: Number(winBackEl.value) || 60, automations };
+    // Only send the API key if the merchant typed a new one (don't overwrite
+    // with the masked placeholder).
+    const typed = apiKeyEl.value.trim();
+    if (typed && !typed.includes('…')) patch.telenowApiKey = typed;
+    return patch;
+  }
+
+  async function load() {
+    if (!shop) {
+      qs('#saveMsg').textContent = 'Missing ?shop= — open this page from the app install link.';
+      qs('#saveMsg').className = 'msg err';
+      return;
+    }
+    const data = await api('/api/settings');
+    MODEL = data.settings;
+    CATALOG = data.catalog;
+    winBackEl.value = MODEL.winBackDays;
+    if (MODEL.telenowApiKeySet) apiKeyEl.placeholder = MODEL.telenowApiKey || 'key set ••••';
+    render();
+    loadLeads();
+  }
+
+  qs('#refreshLeads').addEventListener('click', loadLeads);
+
+  qs('#validateKey').addEventListener('click', async () => {
+    const key = apiKeyEl.value.trim();
+    const status = qs('#keyStatus');
+    status.textContent = 'Validating…';
+    status.className = 'msg';
+    try {
+      // Save the key first (validation happens server-side against Telenow /me).
+      const patch = key && !key.includes('…') ? { telenowApiKey: key } : {};
+      const res = await api('/api/validate-key', { method: 'POST', body: JSON.stringify(patch) });
+      status.textContent = `Connected: ${res.org_name} (role ${res.key_role})`;
+      status.className = 'msg ok';
+    } catch (e) {
+      status.textContent = `Invalid: ${e.message}`;
+      status.className = 'msg err';
+    }
+  });
+
+  qs('#save').addEventListener('click', async () => {
+    const btn = qs('#save');
+    const msg = qs('#saveMsg');
+    btn.disabled = true;
+    msg.textContent = 'Saving…';
+    msg.className = 'msg';
+    try {
+      const res = await api('/api/settings', { method: 'POST', body: JSON.stringify(collect()) });
+      MODEL = res.settings;
+      msg.textContent = res.hookStatus
+        ? `Saved. ${res.hookStatus}`
+        : 'Saved.';
+      msg.className = 'msg ok';
+      apiKeyEl.value = ''; // clear typed key after save
+      if (MODEL.telenowApiKeySet) apiKeyEl.placeholder = MODEL.telenowApiKey || 'key set ••••';
+    } catch (e) {
+      msg.textContent = `Error: ${e.message}`;
+      msg.className = 'msg err';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  load().catch((e) => {
+    qs('#saveMsg').textContent = `Failed to load: ${e.message}`;
+    qs('#saveMsg').className = 'msg err';
+  });
+</script>

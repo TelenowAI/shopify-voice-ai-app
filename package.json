@@ -1,0 +1,50 @@
+{
+  "name": "@telenow/shopify-app",
+  "version": "1.0.0",
+  "description": "Telenow Voice AI for Shopify: an AI voice agent that automatically calls shoppers for abandoned cart recovery, cash-on-delivery (COD) confirmation and RTO reduction, order confirmation, delivery and shipping updates, failed-delivery (NDR) retry, win-back, instant lead callback, and review/NPS calls — and writes the call outcome back onto the order. Free app; requires a Telenow account billed on usage.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "roundtrip": "node test/roundtrip.mjs",
+    "dev:seed": "node scripts/seed-demo.js",
+    "dev:preview": "npm run dev:seed && SHOPIFY_API_KEY=dev SHOPIFY_API_SECRET=dev HOST=http://localhost:3000 PORT=3000 node src/server.js"
+  },
+  "dependencies": {
+    "@shopify/shopify-api": "^13.1.0",
+    "dotenv": "^17.0.0",
+    "express": "^4.21.0"
+  },
+  "keywords": [
+    "shopify",
+    "telenow",
+    "voice-ai",
+    "ai-voice-agent",
+    "abandoned-cart-recovery",
+    "abandoned-checkout",
+    "cod-confirmation",
+    "cash-on-delivery",
+    "rto-reduction",
+    "order-confirmation-call",
+    "delivery-updates",
+    "shipping-notifications",
+    "failed-delivery",
+    "ndr-retry",
+    "where-is-my-order",
+    "win-back",
+    "customer-re-engagement",
+    "lead-callback",
+    "speed-to-lead",
+    "review-call",
+    "nps-survey",
+    "feedback-call",
+    "outbound-calling",
+    "multilingual-voice",
+    "hindi-voice-agent"
+  ]
+}
