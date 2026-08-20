@@ -363,6 +363,12 @@
     pickerScroll: 0,
     pickerToken: 0,
     numbers: null,
+    callScope: null,
+    callOffset: 0,
+    callLimit: 50,
+    callTotal: 0,
+    callHasMore: false,
+    callDepthCapped: false,
     agents: null,
     calls: null,
     leads: null,
@@ -708,7 +714,7 @@
     if (S.calls === null) return '<div class="empty">Loading calls…</div>';
     return `
       <h1>Call history</h1>
-      <p class="page-sub">Calls placed by your Telenow organization.</p>
+      <p class="page-sub">Calls from the ${esc(String(S.callScope ?? 0))} agent(s) you added to this store.</p>
       <div class="toolbar">
         <select id="callSort">
           <option value="newest">Newest first</option>
@@ -724,14 +730,26 @@
         <button class="btn secondary" data-refresh="calls">Refresh</button>
       </div>
       ${!S.calls.length ? `<div class="card empty"><div class="big">☏</div>
-        <h2>No calls yet</h2><p class="hint">Calls placed for this store will appear here.</p></div>`
+        <h2>${S.callScope ? 'No calls yet' : 'No agents added'}</h2>
+        <p class="hint">${S.callScope
+          ? 'Calls from your added agents will appear here.'
+          : 'This list only shows calls from agents you have added. Add one on the Agents page first.'}</p>
+        ${S.callScope ? '' : '<p><button class="btn" data-go="agents">Go to Agents</button></p>'}</div>`
       : `<div class="card table-wrap" style="padding:0;"><table>
           <thead><tr>
             <th>When</th><th>Agent</th><th>To</th><th>Direction</th>
             <th>Status</th><th>Outcome</th><th>Duration</th>
           </tr></thead>
           <tbody>${S.calls.map(callRow).join('')}</tbody>
-        </table></div>`}`;
+        </table></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap;">
+        <span class="hint">Showing ${esc(String((S.callOffset || 0) + 1))}–${esc(String((S.callOffset || 0) + S.calls.length))} of ${esc(String(S.callTotal || 0))}
+          ${S.callDepthCapped ? ' · deeper pages unavailable across multiple agents' : ''}</span>
+        <span style="display:flex;gap:8px;">
+          <button class="btn secondary" id="callPrev"${(S.callOffset || 0) > 0 ? '' : ' disabled'}>&larr; Previous</button>
+          <button class="btn secondary" id="callNext"${S.callHasMore ? '' : ' disabled'}>Next &rarr;</button>
+        </span>
+      </div>`}`;
   }
 
   function viewLeads() {
@@ -1648,8 +1666,12 @@
 
     const sort = $('#callSort');
     const status = $('#callStatus');
-    if (sort) sort.addEventListener('change', loadCalls);
-    if (status) status.addEventListener('change', loadCalls);
+    if (sort) sort.addEventListener('change', () => { S.callOffset = 0; loadCalls(); });
+    if (status) status.addEventListener('change', () => { S.callOffset = 0; loadCalls(); });
+    const callPrev = $('#callPrev');
+    if (callPrev) callPrev.addEventListener('click', () => pageCalls(-1));
+    const callNext = $('#callNext');
+    if (callNext) callNext.addEventListener('click', () => pageCalls(1));
 
     const validateBtn = $('#validateBtn');
     if (validateBtn) validateBtn.addEventListener('click', validateKey);
@@ -1716,17 +1738,39 @@
     if (!connected()) { S.calls = []; render(); return; }
     const sort = $('#callSort') ? $('#callSort').value : 'newest';
     const status = $('#callStatus') ? $('#callStatus').value : '';
+    // Remember the filters so paging keeps them; render() rebuilds the selects.
+    S.callSort = sort;
+    S.callStatus = status;
     try {
-      const q = new URLSearchParams({ limit: '50', sort });
+      const q = new URLSearchParams({
+        limit: String(S.callLimit || 50),
+        offset: String(S.callOffset || 0),
+        sort,
+      });
       if (status) q.set('status', status);
       const r = await api('/api/calls?' + q.toString());
       S.calls = r.calls || [];
+      S.callScope = r.scopedToAgents ?? null;
+      S.callTotal = r.total ?? 0;
+      S.callHasMore = Boolean(r.hasMore);
+      S.callDepthCapped = Boolean(r.depthCapped);
       S.error = '';
     } catch (err) {
       S.calls = [];
       if (err.code !== 'no_api_key') S.error = 'Could not load calls: ' + err.message;
     }
     render();
+  }
+
+  /** Move by one page and reload. */
+  function pageCalls(delta) {
+    const limit = S.callLimit || 50;
+    const next = Math.max(0, (S.callOffset || 0) + delta * limit);
+    if (next === (S.callOffset || 0)) return;
+    S.callOffset = next;
+    S.calls = null;
+    render();
+    loadCalls();
   }
 
   async function loadLeads() {

@@ -444,20 +444,78 @@ app.post('/api/test-call', async (req, res) => {
   }
 });
 
-// GET /api/calls — call history for the org.
+// How deep merged pagination can go. Serving rows [offset, offset+limit) of a
+// merged stream means pulling offset+limit rows from EVERY agent, so the fetch
+// grows with page depth — this caps that rather than letting page 40 fan out
+// into a huge multi-agent read.
+const MERGE_DEPTH_CAP = 400;
+
+// GET /api/calls — call history, restricted to the agents this store added.
+//
+// The org's Telenow account may run agents unrelated to this shop, so showing
+// every call would leak other conversations into the merchant's list. Scope is
+// savedAgents, not the org.
+//
+// One saved agent uses the upstream agent_id filter directly (exact total, one
+// request, real offset). Several are fetched in parallel and merged, because
+// that filter takes a single id.
 app.get('/api/calls', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
   const client = telenowFor(shop, res);
   if (!client) return;
+
+  const saved = getSavedAgents(shop);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+  const empty = { calls: [], total: 0, limit, offset: 0, hasMore: false, scopedToAgents: saved.length };
+  if (!saved.length) { res.json({ ...empty, scopedToAgents: 0 }); return; }
+
+  const status = req.query.status || undefined;
+  const sort = req.query.sort || undefined;
+  // An explicit ?agentId= narrows further, but only within the saved set.
+  const only = String(req.query.agentId || '').trim();
+  const ids = only ? saved.filter((id) => id === only) : saved;
+  if (!ids.length) { res.json(empty); return; }
+
   try {
-    res.json(await client.listCalls({
-      limit: req.query.limit,
-      offset: req.query.offset,
-      status: req.query.status,
-      agentId: req.query.agentId,
-      sort: req.query.sort,
-    }));
+    if (ids.length === 1) {
+      const r = await client.listCalls({ limit, offset, status, sort, agentId: ids[0] });
+      res.json({
+        calls: r.calls, total: r.total, limit, offset,
+        hasMore: offset + (r.calls?.length || 0) < (r.total || 0),
+        scopedToAgents: saved.length,
+      });
+      return;
+    }
+
+    // Pull enough from each agent that the merged stream reaches this page.
+    const need = Math.min(offset + limit, MERGE_DEPTH_CAP);
+    const pages = await Promise.all(
+      ids.map((id) => client.listCalls({ limit: Math.min(need, 200), offset: 0, status, sort, agentId: id })
+        .catch(() => ({ calls: [], total: 0 }))),
+    );
+    const merged = pages.flatMap((p) => p.calls || []);
+    const total = pages.reduce((n, p) => n + (p.total || 0), 0);
+    // Each page was sorted on its own, so the concatenation is not sorted.
+    const time = (c) => new Date(c.start_time || c.created_at || 0).getTime() || 0;
+    const dur = (c) => Number(c.duration_sec) || 0;
+    const cmp = {
+      oldest: (a, b) => time(a) - time(b),
+      longest: (a, b) => dur(b) - dur(a),
+      shortest: (a, b) => dur(a) - dur(b),
+    }[sort] || ((a, b) => time(b) - time(a));
+    merged.sort(cmp);
+
+    res.json({
+      calls: merged.slice(offset, offset + limit),
+      total, limit, offset,
+      hasMore: merged.length > offset + limit,
+      // True when the cap, not the data, ended the list — so the UI can say so
+      // instead of implying there is nothing further.
+      depthCapped: need >= MERGE_DEPTH_CAP && total > MERGE_DEPTH_CAP,
+      scopedToAgents: saved.length,
+    });
   } catch (err) {
     telenowFail(res, err, 'calls');
   }
