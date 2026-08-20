@@ -13,7 +13,7 @@
 import express from 'express';
 
 import { shopify, HOST } from './shopify.js';
-import { saveShop } from './store.js';
+import { saveShop, getShop } from './store.js';
 import { mintSessionToken } from './session.js';
 import { getSettings } from './settings.js';
 import { ensureTelenowHook } from './webhooks/telenow.js';
@@ -118,6 +118,13 @@ async function registerShopifyWebhooks(session) {
 export function rootHandler(req, res) {
   const shop = req.query.shop;
   if (shop && isValidShop(String(shop))) {
+    // Already installed: go straight to the settings UI. Embedded apps are loaded
+    // at "/" inside the admin iframe, and restarting OAuth there would try to
+    // navigate that iframe to Shopify's consent screen, which refuses to be framed.
+    if (getShop(String(shop))) {
+      res.redirect(`/app?shop=${encodeURIComponent(String(shop))}`);
+      return;
+    }
     res.redirect(`/auth?shop=${encodeURIComponent(String(shop))}`);
     return;
   }

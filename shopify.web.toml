@@ -1,0 +1,13 @@
+# Tells the Shopify CLI how to run this app's backend during `shopify app dev`.
+# The CLI assigns a PORT, starts a tunnel, and injects HOST/SHOPIFY_API_KEY/
+# SHOPIFY_API_SECRET into the process below.
+#
+# Both roles on purpose: one Express server serves the settings UI (/app), the
+# OAuth routes (/auth) and the webhook receivers. The CLI's reverse proxy only
+# creates a catch-all "default" route for a component with the FRONTEND role —
+# with "backend" alone, requests to "/" get a 500 "Invalid path" from the proxy
+# and never reach this app.
+roles = ["frontend", "backend"]
+
+[commands]
+dev = "npm run dev:cli"

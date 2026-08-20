@@ -11,6 +11,10 @@
 //   POST   /api/v1/hooks               → subscribe to call-result webhooks
 //   GET    /api/v1/hooks?source=...    → list subscriptions
 //   DELETE /api/v1/hooks/:id           → remove a subscription
+//   GET    /api/v1/agents             → list agents (slim: no system prompt)
+//   GET    /api/v1/calls               → list call sessions
+//   GET    /api/v1/calls/:id           → one call session
+//   GET    /api/v1/numbers             → list phone numbers
 //
 // SECURITY: never log the API key. Errors below include status + response body
 // for debugging but deliberately do not echo the Authorization/X-API-Key header.
@@ -103,19 +107,26 @@ export class TelenowClient {
    * @param {'hangup'|'none'|string} [args.machineDetection='hangup']
    * @returns {Promise<{ sessionId: string, status: string, startTime?: string }>}
    */
-  async initiateCall({ agentId, mobileNumber, variables = {}, identifier, machineDetection = 'hangup' }) {
+  async initiateCall({
+    agentId,
+    mobileNumber,
+    variables = {},
+    identifier,
+    machineDetection = 'hangup',
+    fromNumberId,
+  }) {
     if (!agentId) throw new TelenowError('initiateCall: agentId is required');
     if (!mobileNumber) throw new TelenowError('initiateCall: mobileNumber (E.164) is required');
-    const res = await this.#request('POST', '/api/sessions/initiate-call', {
-      agentId,
-      mobileNumber,
-      variables,
-      identifier,
-      machineDetection,
-    });
-    // The initiate-call response is ENVELOPED: { success, data: { sessionId, ... } }.
-    // Some failures arrive as 2xx with success:false, so guard on that too. We
-    // return the inner `data` so callers can read result.sessionId directly.
+    const body = { agentId, mobileNumber, variables, identifier };
+    // 'agent' (or empty) means "use whatever the agent has configured" — the
+    // field is optional upstream, so omit it rather than sending a value.
+    if (machineDetection && machineDetection !== 'agent') body.machineDetection = machineDetection;
+    // Caller id. Upstream rejects fromNumberId AND fromNumber together, so only
+    // ever send the id; omitting it falls back to the agent's default number.
+    if (fromNumberId) body.fromNumberId = fromNumberId;
+    const res = await this.#request('POST', '/api/sessions/initiate-call', body);
+    // Enveloped: { success, data: { sessionId, ... } }. Some failures arrive as
+    // 2xx with success:false, so guard on that too.
     if (res && res.success === false) {
       throw new TelenowError(res.error || 'Telenow initiate-call failed', undefined, res);
     }
@@ -167,6 +178,201 @@ export class TelenowClient {
   deleteHook(id) {
     if (!id) throw new TelenowError('deleteHook: id is required');
     return this.#request('DELETE', `/api/v1/hooks/${encodeURIComponent(id)}`);
+  }
+
+  // ── Read surface used by the embedded UI ──────────────────────────────────
+  // Paths and shapes taken from the backend router (routes/public_api.rs).
+
+  /**
+   * List the org voice agents. The API returns a slim projection only (never
+   * the system prompt), so this is safe to render inside a third-party app.
+   * @param {object} [opts]
+   * @param {number} [opts.limit=100]   1..200
+   * @param {number} [opts.offset=0]
+   * @param {boolean} [opts.isActive]   Filter by active state.
+   * @returns {Promise<{ agents: Array<object>, total: number }>}
+   */
+  async listAgents({ limit = 100, offset = 0, isActive } = {}) {
+    const q = new URLSearchParams();
+    q.set("limit", String(Math.min(Math.max(Number(limit) || 100, 1), 200)));
+    q.set("offset", String(Math.max(Number(offset) || 0, 0)));
+    if (typeof isActive === "boolean") q.set("is_active", String(isActive));
+    const res = await this.#request("GET", "/api/v1/agents?" + q.toString());
+    return { agents: res?.agents ?? [], total: res?.total ?? 0 };
+  }
+
+  /**
+   * List call sessions for the org, newest first by default.
+   * @param {object} [opts]
+   * @param {number} [opts.limit=50]    1..200
+   * @param {number} [opts.offset=0]
+   * @param {string} [opts.status]      Raw session status ("active" | "ended" | ...).
+   * @param {string} [opts.agentId]     Restrict to one agent.
+   * @param {string} [opts.sort]        newest | oldest | longest | shortest
+   * @returns {Promise<{ calls: Array<object>, total: number }>}
+   */
+  async listCalls({ limit = 50, offset = 0, status, agentId, sort } = {}) {
+    const q = new URLSearchParams();
+    q.set("limit", String(Math.min(Math.max(Number(limit) || 50, 1), 200)));
+    q.set("offset", String(Math.max(Number(offset) || 0, 0)));
+    if (status) q.set("status", String(status));
+    if (agentId) q.set("agent_id", String(agentId));
+    if (sort) q.set("sort", String(sort));
+    const res = await this.#request("GET", "/api/v1/calls?" + q.toString());
+    return { calls: res?.calls ?? [], total: res?.total ?? 0 };
+  }
+
+  /** Fetch one call session by id (full detail). */
+  getCallDetail(id) {
+    if (!id) throw new TelenowError("getCallDetail: id is required");
+    return this.#request("GET", "/api/v1/calls/" + encodeURIComponent(id));
+  }
+
+  /**
+   * Fetch ONE agent with its full configuration (providers, prompt, session
+   * config, metadata). This is the Dashboard surface (/api/agents/:id), not
+   * /api/v1 — the v1 list is a slim projection that deliberately omits the
+   * system prompt and provider config. Reads work with any valid key role.
+   *
+   * NOTE the wire casing: Dashboard RESPONSES are snake_case (llm_provider,
+   * tts_voice, system_prompt) even though CREATE/UPDATE bodies are camelCase.
+   * Nested config objects mix both (session_config.bargeInSensitivity but
+   * stt_config.smart_format), so bind to the exact keys - do not normalise.
+   * @param {string} id
+   * @returns {Promise<object>} the agent object
+   */
+  async getAgent(id) {
+    if (!id) throw new TelenowError('getAgent: id is required');
+    const res = await this.#request('GET', '/api/agents/' + encodeURIComponent(id));
+    // Dashboard surface wraps results in { success, data }.
+    return res?.data ?? res;
+  }
+
+  /**
+   * Per-agent aggregates and the latency breakdown behind the "expected
+   * latency" strip: totalSessions, totalMessages, totalDuration,
+   * avgSessionDuration, avgMessagesPerSession, avgSttMs, avgLlmMs, avgTtsMs,
+   * avgFlowMs, avgServerMs, avgNetRttMs, latencySamples. All camelCase here.
+   * @param {string} id
+   * @returns {Promise<object>}
+   */
+  async getAgentStats(id) {
+    if (!id) throw new TelenowError('getAgentStats: id is required');
+    const res = await this.#request('GET', '/api/agents/' + encodeURIComponent(id) + '/stats');
+    return res?.data ?? res;
+  }
+
+  /**
+   * Provider catalog — turns raw ids into human labels. Sections: llm, stt,
+   * tts, telephony (arrays of { id, name, blurb, latency:{ms,tier},
+   * perMinuteUsd, configFields:[{key,label,options:[{label,value}]}] }), plus
+   * platformFee:{perMinUsd,percent}. Stable enough to cache per process.
+   * @returns {Promise<object>}
+   */
+  async getCatalog() {
+    const res = await this.#request('GET', '/api/catalog');
+    return res?.data ?? res;
+  }
+
+  /**
+   * Start a BROWSER call: the merchant talks to the agent through their mic
+   * instead of over the phone. Returns the session id plus the WebSocket the
+   * browser then streams audio over.
+   *
+   * Handshake (mirrors the Telenow dashboard's own widget):
+   *   1. POST /api/sessions/init-web-call  -> { sessionId, websocketUrl }
+   *   2. browser opens wss://<api-host>/ws/web-agent
+   *   3. browser sends { event: 'start', sessionId }
+   *   4. both sides exchange { event: 'media', data: <base64> }
+   *
+   * @param {object} opts
+   * @param {string} opts.agentId
+   * @param {object} [opts.variables]   {placeholder} values for the prompt.
+   * @param {string} [opts.identifier]  Free-form attribution string.
+   * @returns {Promise<{ sessionId: string, websocketUrl: string }>}
+   */
+  async initWebCall({ agentId, variables = {}, identifier }) {
+    if (!agentId) throw new TelenowError('initWebCall: agentId is required');
+    const res = await this.#request('POST', '/api/sessions/init-web-call', {
+      agentId,
+      variables,
+      identifier,
+    });
+    // Dashboard surface: { success, data: { sessionId, websocketUrl } }. Some
+    // failures arrive as 2xx with success:false, so check that explicitly.
+    if (res && res.success === false) {
+      throw new TelenowError(res.error || 'Telenow init-web-call failed', undefined, res);
+    }
+    const data = res?.data ?? res;
+    return {
+      sessionId: data?.sessionId || null,
+      // The backend may omit websocketUrl (the dashboard derives it same-origin);
+      // fall back to the API base with the ws scheme swapped in.
+      websocketUrl: data?.websocketUrl || this.base.replace(/^http/, 'ws') + '/ws/web-agent',
+    };
+  }
+
+  /**
+   * Recording metadata: { id, session_id, mime, duration_sec, size_bytes,
+   * sample_rate, channel, storage_kind, created_at }.
+   *
+   * Recordings live on the ORG-scoped Dashboard surface, so the org id is
+   * required; an API key is pinned to its own org and any other id gives 403.
+   * @param {string} orgId @param {string} recordingId
+   */
+  async getRecording(orgId, recordingId) {
+    if (!orgId || !recordingId) throw new TelenowError('getRecording: orgId and recordingId are required');
+    const res = await this.#request('GET',
+      '/api/orgs/' + encodeURIComponent(orgId) + '/recordings/' + encodeURIComponent(recordingId));
+    return res?.data ?? res;
+  }
+
+  /**
+   * Short-lived signed URL for the audio: { url, expiresAt }. The URL points
+   * straight at object storage and needs NO credential, so it can go into an
+   * <audio src> - which cannot send an Authorization header anyway.
+   *
+   * Deliberately the /call-audio/ alias rather than /recordings/: identical
+   * handler and auth, but the word "recordings" trips ad-blocker filter lists
+   * and the request never leaves the browser. See docs/api-recordings.
+   * @param {string} orgId @param {string} recordingId
+   */
+  async getRecordingUrl(orgId, recordingId) {
+    if (!orgId || !recordingId) throw new TelenowError('getRecordingUrl: orgId and recordingId are required');
+    const res = await this.#request('GET',
+      '/api/orgs/' + encodeURIComponent(orgId) + '/call-audio/' + encodeURIComponent(recordingId) + '/signed-url');
+    const d = res?.data ?? res;
+    return { url: d?.url || null, expiresAt: d?.expiresAt || null };
+  }
+
+  /**
+   * Every agent in the org, paging past the 200-per-request cap.
+   *
+   * listAgents() clamps limit to 200. An org with more agents than that would
+   * silently lose the tail — and because the saved-agent list is hydrated by
+   * filtering this array, a saved agent sitting past position 200 would vanish
+   * from the merchant's own page with no error. So page until exhausted.
+   * @param {number} [max=2000] Hard stop, so a bad `total` cannot spin forever.
+   * @returns {Promise<{ agents: Array<object>, total: number, truncated: boolean }>}
+   */
+  async listAllAgents(max = 2000) {
+    const out = [];
+    let offset = 0;
+    let total = 0;
+    for (;;) {
+      const page = await this.listAgents({ limit: 200, offset });
+      total = page.total || out.length + page.agents.length;
+      out.push(...page.agents);
+      if (page.agents.length < 200 || out.length >= total || out.length >= max) break;
+      offset += 200;
+    }
+    return { agents: out, total: total || out.length, truncated: out.length < total };
+  }
+
+  /** List the org phone numbers. */
+  async listNumbers() {
+    const res = await this.#request("GET", "/api/v1/numbers");
+    return res?.numbers ?? (Array.isArray(res) ? res : []);
   }
 }
 

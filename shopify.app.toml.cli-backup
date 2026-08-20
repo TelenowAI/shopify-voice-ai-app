@@ -1,0 +1,21 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+name = "telenowvoiceai"
+application_url = "https://shopify.dev/apps/default-app-home"
+embedded = true
+client_id = "5aef351a70518eb6484369ba20f78ecc"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = ""
+use_legacy_install_flow = true
+
+[auth]
+redirect_urls = [ "https://shopify.dev/apps/default-app-home/api/auth" ]
+
+[webhooks]
+api_version = "2026-10"
+
+[build]
+include_config_on_deploy = true
+automatically_update_urls_on_dev = true

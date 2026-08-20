@@ -1,381 +1,1814 @@
 <!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Telenow for Shopify — Settings</title>
+<title>Telenow for Shopify</title>
+
+<!-- App Bridge: required for the app to render embedded in the Shopify admin.
+     Must load before other scripts. data-api-key is filled in by GET /app. -->
+<script src="https://cdn.shopify.com/shopifycloud/app-bridge.js" data-api-key="{{SHOPIFY_API_KEY}}"></script>
+
 <style>
+  /* ── Telenow design tokens ────────────────────────────────────────────────
+     Light is the default; [data-theme="dark"] on <html> flips every token, so
+     no component below needs to know which theme is active. */
   :root {
-    --bg: #0f1115;
-    --card: #171a21;
-    --line: #262b35;
-    --text: #e7eaf0;
-    --muted: #9aa3b2;
-    --accent: #6c5ce7;
-    --ok: #2ecc71;
-    --err: #ff6b6b;
+    --bg: #f7f8fa;
+    --surface: #ffffff;
+    --surface-2: #f2f3f7;
+    --line: #e5e7eb;
+    --text: #111827;
+    --muted: #6b7280;
+    --accent: #6c2bd9;
+    --accent-soft: #f1ebfd;
+    --accent-text: #6c2bd9;
+    --ok: #16a34a;
+    --ok-soft: #dcfce7;
+    --warn: #b45309;
+    --warn-soft: #fef3c7;
+    --err: #dc2626;
+    --err-soft: #fee2e2;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .1);
+    --radius: 12px;
   }
+  html[data-theme="dark"] {
+    --bg: #0d0f14;
+    --surface: #151821;
+    --surface-2: #1b1f2a;
+    --line: #262b36;
+    --text: #e8eaf0;
+    --muted: #9aa3b2;
+    --accent: #8b5cf6;
+    --accent-soft: #241b3d;
+    --accent-text: #c4b5fd;
+    --ok: #4ade80;
+    --ok-soft: #12301f;
+    --warn: #fbbf24;
+    --warn-soft: #332612;
+    --err: #f87171;
+    --err-soft: #3b1517;
+    --shadow: none;
+  }
+
   * { box-sizing: border-box; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 820px; margin: 0 auto; padding: 28px 18px 80px; }
-  h1 { font-size: 22px; margin: 0 0 4px; }
-  .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  a { color: var(--accent-text); }
+  button { font: inherit; }
+  code { font-size: .92em; }
+
+  /* ── Layout ──────────────────────────────────────────────────────────────── */
+  .layout { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+  .sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--line);
+    padding: 18px 12px;
+    display: flex; flex-direction: column; gap: 4px;
+    position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  }
+  .brand { display: flex; align-items: center; gap: 6px; padding: 4px 8px 18px; }
+  .brand-mark {
+    background: var(--text); color: var(--surface);
+    font-weight: 800; font-size: 13px; letter-spacing: -.02em;
+    padding: 4px 7px; border-radius: 6px;
+  }
+  .brand-word { font-weight: 700; font-size: 16px; letter-spacing: -.02em; }
+  .nav-section {
+    color: var(--muted); font-size: 11px; font-weight: 700;
+    letter-spacing: .08em; padding: 16px 10px 6px;
+  }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border-radius: 8px;
+    color: var(--text); cursor: pointer; border: 0; background: none;
+    width: 100%; text-align: left;
+  }
+  .nav-item:hover { background: var(--surface-2); }
+  .nav-item.active { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+  .nav-item .ico { width: 16px; text-align: center; opacity: .9; }
+
+  .main { min-width: 0; display: flex; flex-direction: column; }
+  .topbar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 24px; border-bottom: 1px solid var(--line);
+    background: var(--surface); position: sticky; top: 0; z-index: 5;
+  }
+  .org-chip {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--surface-2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 12px; font-size: 13px; color: var(--muted);
+  }
+  .org-chip b { font-weight: 600; color: var(--text); }
+  .spacer { flex: 1; }
+  .icon-btn {
+    background: none; border: 1px solid var(--line); border-radius: 8px;
+    width: 34px; height: 34px; cursor: pointer; color: var(--text);
+  }
+  .icon-btn:hover { background: var(--surface-2); }
+  .avatar {
+    width: 34px; height: 34px; border-radius: 8px; background: var(--accent);
+    color: #fff; display: grid; place-items: center; font-weight: 700; font-size: 12px;
+    flex: 0 0 auto;
+  }
+  .content { padding: 24px; max-width: 1200px; width: 100%; }
+
+  /* ── Bits ────────────────────────────────────────────────────────────────── */
+  h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -.02em; }
+  h2 { font-size: 16px; margin: 0 0 2px; letter-spacing: -.01em; }
+  .page-sub { color: var(--muted); margin: 0 0 20px; }
   .card {
-    background: var(--card); border: 1px solid var(--line);
-    border-radius: 12px; padding: 18px; margin: 14px 0;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 16px; box-shadow: var(--shadow);
   }
-  .card h2 { font-size: 16px; margin: 0 0 2px; }
-  .card .hint { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; }
-  label { display: block; font-size: 12.5px; color: var(--muted); margin: 10px 0 4px; }
-  input[type="text"], input[type="password"], input[type="number"], select {
-    width: 100%; padding: 9px 11px; border-radius: 8px;
-    border: 1px solid var(--line); background: #0d0f14; color: var(--text); font-size: 14px;
-  }
+  .grid { display: grid; gap: 14px; }
+  .grid-3 { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+  .grid-4 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
   .row { display: flex; gap: 12px; flex-wrap: wrap; }
-  .row > div { flex: 1 1 160px; }
-  .toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
-  .toggle input { width: 18px; height: 18px; accent-color: var(--accent); }
-  button {
-    background: var(--accent); color: #fff; border: 0; padding: 11px 18px;
-    border-radius: 9px; font-size: 14px; font-weight: 600; cursor: pointer;
+  .row > * { flex: 1 1 200px; }
+  label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 5px; }
+  input, select, textarea {
+    width: 100%; padding: 9px 11px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
   }
-  button.secondary { background: #2a2f3a; }
-  button:disabled { opacity: 0.5; cursor: default; }
-  .bar {
-    position: sticky; bottom: 0; background: linear-gradient(180deg, transparent, var(--bg) 40%);
-    padding: 16px 0 0; display: flex; gap: 10px; align-items: center;
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .btn {
+    background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+    padding: 9px 16px; font-weight: 600; cursor: pointer;
   }
-  .pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); }
-  .pill.on { color: var(--ok); border-color: var(--ok); }
-  .pill.off { color: var(--muted); }
-  .msg { font-size: 13px; }
-  .msg.ok { color: var(--ok); }
-  .msg.err { color: var(--err); }
-  .quiet { margin-top: 6px; }
-  .quiet[hidden] { display: none; }
-  code { background: #0d0f14; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
-  a { color: var(--accent); }
-  table.leads { width: 100%; border-collapse: collapse; font-size: 13px; }
-  table.leads th, table.leads td {
-    text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px;
+  .btn:hover { filter: brightness(1.08); }
+  .btn.secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--line); }
+  .btn:disabled { opacity: .55; cursor: not-allowed; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    border-radius: 999px; padding: 2px 9px; font-size: 11.5px; font-weight: 600;
+    background: var(--surface-2); color: var(--muted);
   }
-  table.leads th { color: var(--muted); font-weight: 600; font-size: 12px; }
-  table.leads tr:last-child td { border-bottom: 0; }
-  .status { font-size: 11.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
-  .status.completed, .status.placed { color: var(--ok); border-color: var(--ok); }
-  .status.failed { color: var(--err); border-color: var(--err); }
-  .empty { color: var(--muted); font-size: 13px; }
+  .pill.ok { background: var(--ok-soft); color: var(--ok); }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.err { background: var(--err-soft); color: var(--err); }
+  .pill.accent { background: var(--accent-soft); color: var(--accent-text); }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat .n { font-size: 26px; font-weight: 700; letter-spacing: -.02em; }
+  .stat .l { color: var(--muted); font-size: 12px; }
+  .hint { color: var(--muted); font-size: 12.5px; }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .toolbar input, .toolbar select { width: auto; flex: 0 1 220px; }
+  .kv { display: grid; gap: 8px; margin-top: 10px; }
+  .kv .k { color: var(--muted); font-size: 12px; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  th { font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--surface-2); }
+  .table-wrap { overflow-x: auto; }
+
+  .empty { text-align: center; padding: 44px 20px; color: var(--muted); }
+  .empty .big { font-size: 30px; margin-bottom: 8px; }
+
+  .toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .toggle input { width: auto; }
+
+  .banner {
+    display: flex; align-items: center; gap: 10px; padding: 11px 14px;
+    border-radius: 10px; border: 1px solid var(--line); margin-bottom: 16px;
+  }
+  .banner.warn { background: var(--warn-soft); border-color: transparent; color: var(--warn); }
+  .banner.err { background: var(--err-soft); border-color: transparent; color: var(--err); }
+  .banner.ok { background: var(--ok-soft); border-color: transparent; color: var(--ok); }
+
+  /* ── Welcome modal ───────────────────────────────────────────────────────── */
+  .overlay {
+    position: fixed; inset: 0; background: rgba(9, 11, 16, .55);
+    display: grid; place-items: center; z-index: 50; padding: 20px;
+  }
+  .overlay[hidden] { display: none; }
+  .modal {
+    background: var(--surface); border-radius: 16px; max-width: 560px; width: 100%;
+    padding: 28px; border: 1px solid var(--line); max-height: 90vh; overflow-y: auto;
+  }
+  .modal h1 { font-size: 22px; }
+  .step { display: flex; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+  .step-n {
+    flex: 0 0 24px; height: 24px; border-radius: 50%;
+    background: var(--accent-soft); color: var(--accent-text);
+    display: grid; place-items: center; font-weight: 700; font-size: 12px;
+  }
+  .scenarios { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+  .scenario {
+    text-align: left; padding: 11px 13px; border-radius: 10px; cursor: pointer;
+    background: var(--card); border: 1.5px solid var(--line); color: var(--text); font: inherit;
+  }
+  .scenario.active { border-color: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 16%, transparent); }
+  .scenario.active > div:first-child { color: var(--ok); }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+
+  @media (max-width: 860px) {
+    .layout { grid-template-columns: 1fr; }
+    .sidebar {
+      position: static; height: auto; flex-direction: row;
+      overflow-x: auto; align-items: center;
+    }
+    .nav-section { display: none; }
+    .brand { padding: 4px 8px; }
+    .content { padding: 16px; }
+  }
 </style>
 
-<div class="wrap">
-  <h1>Telenow for Shopify</h1>
-  <p class="sub">Place automated AI voice calls on store events and write the outcome back onto orders. Shop: <code id="shopName">—</code></p>
-
-  <!-- Telenow connection -->
-  <div class="card">
-    <h2>Telenow connection</h2>
-    <p class="hint">Paste your Telenow API key (<code>vai_live_…</code>) from Telenow → Developers → API Keys. We validate it and show your org.</p>
-    <div class="row">
-      <div style="flex: 2 1 320px;">
-        <label>Telenow API key</label>
-        <input id="apiKey" type="password" placeholder="vai_live_…" autocomplete="off" />
-        <div id="keyStatus" class="msg" style="margin-top:6px;"></div>
-      </div>
-      <div style="display:flex; align-items:flex-end;">
-        <button class="secondary" type="button" id="validateKey">Validate key</button>
-      </div>
+<!-- ── Welcome / first run ───────────────────────────────────────────────────── -->
+<div class="overlay" id="welcome" hidden>
+  <div class="modal">
+    <div class="brand" style="padding-left:0;">
+      <span class="brand-mark">Tele</span><span class="brand-word">now</span>
     </div>
-  </div>
+    <h1>Welcome to Telenow Voice AI</h1>
+    <p class="page-sub" id="welcomeSub">Turn store events into real AI phone calls.</p>
 
-  <!-- Win-back threshold (global) -->
-  <div class="card">
-    <h2>Win-back threshold</h2>
-    <p class="hint">The scheduled win-back job calls customers whose last order is older than this many days.</p>
-    <div style="max-width: 220px;">
-      <label>Days since last order</label>
-      <input id="winBackDays" type="number" min="1" max="3650" />
-    </div>
-  </div>
-
-  <!-- Automations render here -->
-  <div id="automations"></div>
-
-  <!-- Recent leads -->
-  <div class="card">
-    <div style="display:flex; justify-content:space-between; align-items:center;">
+    <div class="step">
+      <div class="step-n">1</div>
       <div>
-        <h2>Recent leads</h2>
-        <p class="hint" style="margin-bottom:0;">New customers captured from <code>customers/create</code> and the callback we placed.</p>
+        <h2>Connect your Telenow account</h2>
+        <div class="hint">Paste your <code>vai_live_…</code> API key from Telenow → Developers → API Keys.</div>
       </div>
-      <button class="secondary" type="button" id="refreshLeads">Refresh</button>
     </div>
-    <div id="leads" style="margin-top:12px;"></div>
-  </div>
+    <div class="step">
+      <div class="step-n">2</div>
+      <div>
+        <h2>Pick a voice agent</h2>
+        <div class="hint">Connect your key, then fetch your Telenow agents and add the ones this store should use.</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-n">3</div>
+      <div>
+        <h2>Track calls and leads</h2>
+        <div class="hint">Every call and captured lead appears here with its outcome and transcript.</div>
+      </div>
+    </div>
 
-  <div class="bar">
-    <button type="button" id="save">Save settings</button>
-    <span id="saveMsg" class="msg"></span>
+    <div class="modal-actions">
+      <button class="btn secondary" id="welcomeSkip">Skip for now</button>
+      <button class="btn" id="welcomeStart">Connect Telenow</button>
+    </div>
   </div>
+</div>
 
-  <footer style="margin-top:28px; padding-top:14px; border-top:1px solid var(--line); color:var(--muted); font-size:12.5px;">
-    <a href="https://telenow.ai/privacy" target="_blank" rel="noopener">Privacy Policy</a>
-    &nbsp;·&nbsp;
-    <a href="https://telenow.ai/terms" target="_blank" rel="noopener">Terms of Service</a>
-    &nbsp;·&nbsp;
-    <a href="https://telenow.ai/#pricing" target="_blank" rel="noopener">Pricing</a>
-    &nbsp;·&nbsp;
-    <a href="mailto:support@telenow.ai">Support</a>
-    <div style="margin-top:6px;">Free app — voice calls are billed by your Telenow account, not through Shopify. © Telenow AI.</div>
-  </footer>
+<!-- ── App shell ─────────────────────────────────────────────────────────────── -->
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark">Tele</span><span class="brand-word">now</span>
+    </div>
+
+    <button class="nav-item active" data-view="home"><span class="ico">⌂</span> Home</button>
+
+    <div class="nav-section">BUILD</div>
+    <button class="nav-item" data-view="agents"><span class="ico">◉</span> Agents</button>
+
+    <div class="nav-section">RUN</div>
+    <button class="nav-item" data-view="calls"><span class="ico">☏</span> Calls</button>
+    <button class="nav-item" data-view="leads"><span class="ico">☰</span> Leads</button>
+
+    <div class="nav-section">ACCOUNT</div>
+    <button class="nav-item" data-view="settings"><span class="ico">⚙</span> Settings</button>
+    <button class="nav-item" data-view="store"><span class="ico">🛍</span> Store</button>
+  </aside>
+
+  <div class="main">
+    <div class="topbar">
+      <div class="org-chip">Organization <b id="orgName">—</b></div>
+      <div class="org-chip" id="shopChip" hidden>Store <b id="shopChipName">—</b></div>
+      <div class="spacer"></div>
+      <span class="pill" id="connPill">—</span>
+      <button class="icon-btn" id="themeBtn" title="Toggle light / dark">◐</button>
+      <div class="avatar" id="avatar">TN</div>
+    </div>
+
+    <div class="content" id="content"><div class="empty">Loading…</div></div>
+  </div>
 </div>
 
 <script type="module">
-  // The shop is passed as ?shop= for display only. AUTH comes from a signed
-  // session token delivered in the URL FRAGMENT (#t=…) by the OAuth callback —
-  // we keep it in memory and send it as a Bearer token on every /api/* call.
-  // Never rely on the query param for auth.
+  // ── Auth ────────────────────────────────────────────────────────────────────
+  // Two ways in, depending on how the app was opened:
+  //  - embedded in the admin: App Bridge mints a short-lived session token per
+  //    call (window.shopify.idToken), so it is fetched fresh on every request;
+  //  - standalone/new tab: /auth/callback put a long-lived token in the fragment.
   const params = new URLSearchParams(location.search);
   const shop = params.get('shop') || '';
-  const TOKEN = new URLSearchParams(location.hash.slice(1)).get('t') || '';
-  document.getElementById('shopName').textContent = shop || '(missing ?shop=)';
+  const FRAGMENT_TOKEN = new URLSearchParams(location.hash.slice(1)).get('t') || '';
 
-  const qs = (s) => document.querySelector(s);
-  const apiKeyEl = qs('#apiKey');
-  const winBackEl = qs('#winBackDays');
-  const automationsEl = qs('#automations');
-  const leadsEl = qs('#leads');
+  async function sessionToken() {
+    if (window.shopify && typeof window.shopify.idToken === 'function') {
+      try {
+        return await window.shopify.idToken();
+      } catch (err) {
+        console.warn('App Bridge idToken() failed; falling back to fragment token', err);
+      }
+    }
+    return FRAGMENT_TOKEN;
+  }
 
-  let MODEL = null; // server-provided settings (redacted key)
-  let CATALOG = []; // automation definitions (key/label/triggers)
-
-  function api(path, opts = {}) {
+  async function api(path, opts = {}) {
     const url = new URL(path, location.origin);
     if (shop) url.searchParams.set('shop', shop); // display/back-compat only — NOT auth
-    return fetch(url, {
+    const token = await sessionToken();
+    const r = await fetch(url, {
       ...opts,
       headers: {
         'Content-Type': 'application/json',
-        ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(opts.headers || {}),
       },
-    }).then(async (r) => {
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
-      return data;
     });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // The server's catch-all 404 ({error:'not found', path}) means the route
+      // is missing from the RUNNING build — /app re-reads app.html from disk on
+      // every request, so a new UI can be served by an older server process.
+      const stale = r.status === 404 && data.error === 'not found' && data.path;
+      const err = new Error(stale
+        ? 'This build of the app has no ' + data.path + " route — restart 'shopify app dev' to pick up server changes."
+        : (data.message || data.error || `HTTP ${r.status}`));
+      err.status = r.status;
+      err.code = data.error;
+      throw err;
+    }
+    return data;
   }
 
-  function automationCard(def, cfg) {
-    const q = cfg.quietHours || {};
+  // ── State ───────────────────────────────────────────────────────────────────
+  // `null` means "not loaded yet"; `[]` means "loaded and empty". The views rely
+  // on that distinction to show a spinner rather than an empty state.
+  const S = {
+    settings: null,
+    agent: null,
+    agentStats: null,
+    agentId: null,
+    agentErr: '',
+    catalog: null,
+    test: {},
+    webCall: {},
+    call: null,
+    callId: null,
+    callErr: '',
+    recording: null,
+    picker: { open: false },
+    missingAgents: [],
+    pickerScroll: 0,
+    pickerToken: 0,
+    numbers: null,
+    agents: null,
+    calls: null,
+    leads: null,
+    profile: null,
+    view: 'home',
+    error: '',
+  };
+
+  const $ = (s) => document.querySelector(s);
+  const contentEl = $('#content');
+  const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const connected = () => Boolean(S.settings && S.settings.telenowApiKeySet);
+
+  function fmtDate(v) {
+    if (!v) return '—';
+    const d = new Date(v);
+    return isNaN(d.getTime()) ? '—' : d.toLocaleString();
+  }
+  function fmtDuration(sec) {
+    if (sec == null) return '—';
+    const s = Math.max(0, Math.round(Number(sec) || 0));
+    return Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's';
+  }
+
+  // ── Theme ───────────────────────────────────────────────────────────────────
+  const savedTheme = localStorage.getItem('telenow-theme');
+  if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
+  $('#themeBtn').addEventListener('click', () => {
+    const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('telenow-theme', next);
+  });
+
+  // ── Views ───────────────────────────────────────────────────────────────────
+  function notConnected(what) {
+    return `<div class="card empty">
+      <div class="big">🔌</div>
+      <h2>Connect Telenow to see ${esc(what)}</h2>
+      <p class="hint">Add your <code>vai_live_…</code> API key in Settings and this page fills in automatically.</p>
+      <p><button class="btn" data-go="settings">Go to Settings</button></p>
+    </div>`;
+  }
+
+  function viewHome() {
+    const p = S.profile;
+    const num = (v) => (v === null ? '—' : v.length);
+
     return `
-      <div class="card" data-key="${def.key}">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-          <div>
-            <h2>${def.label}</h2>
-            <p class="hint">Triggers: ${def.triggers.join(', ')}</p>
-          </div>
-          <label class="toggle">
-            <input type="checkbox" data-field="enabled" ${cfg.enabled ? 'checked' : ''}/>
-            <span>Enabled</span>
-          </label>
+      <h1>Home</h1>
+      <p class="page-sub">Your Telenow voice AI, wired into ${esc(p?.name || shop)}.</p>
+
+      ${connected() ? '' : `<div class="banner warn">
+        <span>⚠</span><div><b>Telenow not connected.</b> Add your API key in Settings to place calls.</div>
+      </div>`}
+
+      <div class="grid grid-3" style="margin-bottom:18px;">
+        <div class="card stat"><span class="n">${esc(num(S.agents))}</span><span class="l">Agents added</span></div>
+        <div class="card stat"><span class="n">${esc(num(S.calls))}</span><span class="l">Recent calls</span></div>
+        <div class="card stat"><span class="n">${esc(num(S.leads))}</span><span class="l">Leads captured</span></div>
+      </div>
+
+      <div class="grid grid-3">
+        <div class="card">
+          <h2>Store</h2>
+          <p class="hint">Synced from Shopify.</p>
+          ${p ? `<div class="kv">
+              <div><div class="k">Name</div>${esc(p.name)}</div>
+              <div><div class="k">Owner</div>${esc(p.shop_owner || '—')}</div>
+              <div><div class="k">Email</div>${esc(p.email || '—')}</div>
+              <div><div class="k">Plan</div>${esc(p.plan_display_name || '—')}</div>
+            </div>` : '<p class="hint">Store details unavailable.</p>'}
         </div>
-        <div class="row">
-          <div style="flex: 2 1 280px;">
-            <label>Telenow agent ID (UUID)</label>
-            <input type="text" data-field="agentId" value="${cfg.agentId || ''}" placeholder="agent uuid"/>
-          </div>
-          <div>
-            <label>Delay (minutes)</label>
-            <input type="number" min="0" max="10080" data-field="delayMinutes" value="${cfg.delayMinutes ?? 0}"/>
+        <div class="card">
+          <h2>Telenow</h2>
+          <p class="hint">Voice calling account.</p>
+          <div class="kv">
+            <div><div class="k">Status</div>
+              ${connected() ? '<span class="pill ok"><span class="dot"></span>Connected</span>'
+                            : '<span class="pill err"><span class="dot"></span>Not connected</span>'}</div>
+            <div><div class="k">API key</div>${esc(S.settings?.telenowApiKey || '—')}</div>
           </div>
         </div>
-        <label class="toggle quiet-toggle" style="margin-top:12px;">
-          <input type="checkbox" data-field="quietEnabled" ${q.enabled ? 'checked' : ''}/>
-          <span>Quiet hours (don't call inside this local window)</span>
-        </label>
-        <div class="row quiet" ${q.enabled ? '' : 'hidden'}>
-          <div><label>From</label><input type="text" data-field="quietStart" value="${q.start || '21:00'}" placeholder="21:00"/></div>
-          <div><label>To</label><input type="text" data-field="quietEnd" value="${q.end || '09:00'}" placeholder="09:00"/></div>
-          <div><label>Timezone (IANA)</label><input type="text" data-field="quietTz" value="${q.timezone || 'Asia/Kolkata'}"/></div>
+        <div class="card">
+          <h2>Next step</h2>
+          <p class="hint">${connected()
+            ? 'Browse your voice agents and review recent calls.'
+            : 'Connect your Telenow API key to get started.'}</p>
+          <p><button class="btn" data-go="${connected() ? 'agents' : 'settings'}">
+            ${connected() ? 'Open Agents' : 'Connect Telenow'}</button></p>
         </div>
       </div>`;
   }
 
-  function render() {
-    automationsEl.innerHTML = CATALOG.map((def) =>
-      automationCard(def, MODEL.automations[def.key] || {}),
-    ).join('');
-    // Wire quiet-hours show/hide.
-    automationsEl.querySelectorAll('.card').forEach((card) => {
-      const qt = card.querySelector('[data-field="quietEnabled"]');
-      const quiet = card.querySelector('.quiet');
-      qt.addEventListener('change', () => (quiet.hidden = !qt.checked));
-    });
+  function agentCard(a) {
+    const initial = (a.name || '?').trim().charAt(0).toUpperCase();
+    // The whole card stays clickable, and the button is the explicit affordance
+    // for anyone who does not think to click a card. Both go the same place;
+    // the button stops propagation so the handler does not fire twice.
+    return `<div class="card" data-agent-id="${esc(a.id)}" style="cursor:pointer;display:flex;flex-direction:column;"
+                 data-agent-name="${esc((a.name || '').toLowerCase())}"
+                 data-agent-desc="${esc((a.description || '').toLowerCase())}">
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;">
+        <div class="avatar" style="background:var(--accent-soft);color:var(--accent-text);">${esc(initial)}</div>
+        <div style="min-width:0;">
+          <h2 style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(a.name || 'Untitled')}</h2>
+          <span class="pill ${a.is_active ? 'ok' : ''}"><span class="dot"></span>${a.is_active ? 'Active' : 'Inactive'}</span>
+        </div>
+      </div>
+      <p class="hint" style="min-height:38px;">${esc(a.description || 'No description.')}</p>
+      <div style="border-top:1px solid var(--line);padding-top:10px;margin-top:auto;display:flex;gap:8px;align-items:center;justify-content:space-between;">
+        <code class="hint" style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(a.id)}</code>
+        <button class="btn secondary" data-view-agent="${esc(a.id)}" style="flex:0 0 auto;padding:7px 13px;">
+          View details</button>
+      </div>
+    </div>`;
   }
 
-  // Mask the middle of a phone number so we don't render full PII in the table.
-  function maskPhone(p) {
-    if (!p) return '—';
-    return p.length < 6 ? '•••' : `${p.slice(0, 3)}•••${p.slice(-3)}`;
+  function viewAgents() {
+    if (!connected()) return notConnected('your agents');
+    if (S.agents === null) return '<div class="empty">Loading agents…</div>' + agentPicker();
+
+    // The fetch action lives top-right on every state, so it is in the same
+    // place whether the list is empty or full.
+    const header = `
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
+        <div>
+          <h1 style="margin:0;">Agents</h1>
+          <p class="page-sub" style="margin:4px 0 0;">
+            ${S.agents.length
+              ? esc(String(S.agents.length)) + ' agent' + (S.agents.length === 1 ? '' : 's') + ' added to this store.'
+              : 'Add the Telenow agents you want to use with this store.'}
+          </p>
+        </div>
+        <button class="btn" id="fetchAgentsBtn" style="flex:0 0 auto;">
+          <span style="margin-right:6px;">⟳</span>Fetch agents from Telenow
+        </button>
+      </div>`;
+
+    if (!S.agents.length) {
+      return `${header}
+        <div class="card empty" style="margin-top:18px;">
+          <div class="big">◉</div>
+          <h2>No agents added yet</h2>
+          <p class="hint">Pull in the voice agents from your Telenow organization,<br/>then pick the ones this store should use.</p>
+          <p><button class="btn" id="fetchAgentsEmpty">Fetch agents from Telenow</button></p>
+        </div>
+        ${agentPicker()}`;
+    }
+
+    return `${header}
+      <div class="toolbar" style="margin-top:16px;">
+        <input id="agentSearch" placeholder="Search name or description…" />
+        <button class="btn secondary" data-refresh="agents">Refresh</button>
+      </div>
+      ${(S.missingAgents || []).length ? `<div class="banner warn" style="margin-bottom:14px;"><span>⚠</span>
+        <div>${esc(String(S.missingAgents.length))} added agent(s) no longer exist in Telenow.
+        <button class="btn secondary" id="clearMissing" style="margin-left:8px;">Remove them</button></div></div>` : ''}
+      <div class="grid grid-3" id="agentGrid">${S.agents.map(agentCard).join('')}</div>
+      ${agentPicker()}`;
   }
 
-  function fmtDate(iso) {
-    if (!iso) return '—';
-    const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+  /**
+   * The "Fetch agents from Telenow" picker. Rendered inline (hidden) rather than
+   * as a separate view so opening it does not lose the page behind it.
+   */
+  /**
+   * The "Fetch agents from Telenow" picker.
+   *
+   * Two rules learned the hard way:
+   *  - the list is NEVER replaced by an error. An error is a banner ABOVE the
+   *    list, so a failed Add does not throw away the fetched agents and leave
+   *    the merchant with no way back except reopening.
+   *  - the scroll position is stashed before each render and restored after,
+   *    because render() rebuilds this subtree wholesale.
+   */
+  function agentPicker() {
+    const p = S.picker || {};
+    if (!p.open) return '';
+
+    let body;
+    if (p.loading) {
+      body = '<div class="empty">Fetching agents from Telenow…</div>';
+    } else if (!p.agents) {
+      body = `<div class="empty"><h2>Could not load agents</h2>
+        <p><button class="btn secondary" id="pickerRetry">Try again</button></p></div>`;
+    } else if (!p.agents.length) {
+      body = `<div class="empty"><h2>No agents found</h2>
+        <p class="hint">Create an agent in the Telenow dashboard first, then fetch again.</p></div>`;
+    } else {
+      const q = (p.query || '').trim().toLowerCase();
+      const list = q
+        ? p.agents.filter((a) => (a.name || '').toLowerCase().includes(q)
+            || (a.description || '').toLowerCase().includes(q))
+        : p.agents;
+      body = list.length
+        ? `<div id="pickerList" style="max-height:52vh;overflow:auto;margin-top:4px;">${list.map(pickerRow).join('')}</div>`
+        : '<div class="empty"><p class="hint">No agent matches that search.</p></div>';
+    }
+
+    const addedCount = (p.agents || []).filter((a) => a.added).length;
+
+    return `
+      <div class="overlay" id="pickerOverlay">
+        <div class="modal" style="max-width:640px;" role="dialog" aria-modal="true" aria-label="Agents in Telenow">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+            <div>
+              <h1 style="margin:0;">Agents in Telenow</h1>
+              <p class="hint" style="margin:4px 0 0;">
+                ${p.agents ? esc(String(p.agents.length)) + ' available · ' + esc(String(addedCount)) + ' added' : 'Loading…'}
+              </p>
+            </div>
+            <button class="btn secondary" id="pickerClose" style="flex:0 0 auto;">Close</button>
+          </div>
+          ${p.truncated ? `<div class="banner warn" style="margin-top:12px;"><span>⚠</span>
+            <div>Showing the first ${esc(String((p.agents || []).length))} of ${esc(String(p.orgTotal || '?'))} agents. Search to narrow it down.</div></div>` : ''}
+          ${p.error ? `<div class="banner err" style="margin-top:12px;"><span>✕</span><div>${esc(p.error)}</div></div>` : ''}
+          ${p.agents && p.agents.length
+            ? '<input id="pickerSearch" placeholder="Search agents…" style="margin-top:12px;width:100%;" value="' + esc(p.query || '') + '" />'
+            : ''}
+          ${body}
+        </div>
+      </div>`;
   }
 
-  // Build the leads table with DOM nodes + textContent (never innerHTML for data).
-  function renderLeads(leads) {
-    leadsEl.textContent = '';
-    if (!leads || leads.length === 0) {
-      const p = document.createElement('p');
-      p.className = 'empty';
-      p.textContent = 'No leads yet. They appear here when a customer is created in your store.';
-      leadsEl.appendChild(p);
+  function pickerRow(a) {
+    const initial = (a.name || '?').trim().charAt(0).toUpperCase();
+    // busyIds is a Set: several rows can legitimately be in flight at once, and
+    // a single scalar would let one row's completion re-enable another's button
+    // mid-request.
+    const busy = S.picker && S.picker.busyIds && S.picker.busyIds.has(a.id);
+    return `<div style="display:flex;gap:12px;align-items:center;padding:11px 2px;border-bottom:1px solid var(--line);">
+      <div class="avatar" style="flex:0 0 auto;width:34px;height:34px;font-size:14px;background:var(--accent-soft);color:var(--accent-text);">
+        ${esc(initial)}
+      </div>
+      <div style="min-width:0;flex:1;">
+        <div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+          ${esc(a.name || 'Untitled')}
+        </div>
+        <div class="hint" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+          ${esc(a.description || 'No description.')}
+        </div>
+      </div>
+      <span class="pill ${a.is_active ? 'ok' : ''}" style="flex:0 0 auto;">
+        <span class="dot"></span>${a.is_active ? 'Active' : 'Inactive'}
+      </span>
+      <button class="btn ${a.added ? 'secondary' : ''}" data-add-agent="${esc(a.id)}"
+              title="${a.added ? 'Remove from this store' : 'Add to this store'}"
+              style="flex:0 0 auto;min-width:92px;"${busy ? ' disabled' : ''}>
+        ${busy ? '…' : (a.added ? '✓ Added' : 'Add')}
+      </button>
+    </div>`;
+  }
+
+  /** Open the picker and pull the org's agents. */
+  async function openPicker() {
+    // Bump a token so a slow earlier fetch cannot overwrite a newer one.
+    const token = (S.pickerToken = (S.pickerToken || 0) + 1);
+    S.picker = { open: true, loading: true, agents: null, error: '', query: '', busyIds: new Set() };
+    render();
+    try {
+      const r = await api('/api/agents/available');
+      if (S.pickerToken !== token || !S.picker.open) return;
+      S.picker = {
+        ...S.picker, loading: false, agents: r.agents || [],
+        truncated: Boolean(r.truncated), orgTotal: r.orgTotal,
+      };
+    } catch (err) {
+      if (S.pickerToken !== token || !S.picker.open) return;
+      S.picker = { ...S.picker, loading: false, agents: null, error: 'Could not fetch agents: ' + err.message };
+    }
+    render();
+  }
+
+  function closePicker() {
+    S.picker = { open: false };
+    render();
+  }
+
+  /**
+   * Add or remove one agent.
+   *
+   * The server returns the authoritative saved-id list on both verbs, so the
+   * flags are rebuilt from that rather than toggled locally — a local flip gets
+   * out of sync the moment two requests overlap.
+   */
+  async function toggleAgent(agentId) {
+    const p = S.picker || {};
+    const row = (p.agents || []).find((a) => a.id === agentId);
+    if (!row || (p.busyIds && p.busyIds.has(agentId))) return;
+
+    const busyIds = new Set(p.busyIds || []);
+    busyIds.add(agentId);
+    S.picker = { ...p, busyIds, error: '' };
+    render();
+
+    try {
+      const r = row.added
+        ? await api('/api/agents/saved/' + encodeURIComponent(agentId), { method: 'DELETE' })
+        : await api('/api/agents/saved', { method: 'POST', body: JSON.stringify({ agentId }) });
+
+      // Rebuild every flag from the server's list — self-healing under overlap.
+      const saved = new Set(r.saved || []);
+      for (const a of (S.picker.agents || [])) a.added = saved.has(a.id);
+    } catch (err) {
+      S.picker = { ...S.picker, error: 'Could not update: ' + err.message };
+    }
+
+    const done = new Set(S.picker.busyIds || []);
+    done.delete(agentId);
+    S.picker = { ...S.picker, busyIds: done };
+    render();
+
+    // Refresh the grid behind the modal WITHOUT nulling S.agents: the null
+    // sentinel makes viewAgents short-circuit to "Loading…", which would unmount
+    // the open modal for the length of a Telenow round-trip.
+    try {
+      await loadAgents();
+    } catch (e) { /* the picker already showed any error worth showing */ }
+    render();
+  }
+
+
+
+
+
+  function callRow(c) {
+    const disp = c.disposition || c.wrapup_disposition || '';
+    const cls = disp === 'answered' ? 'ok' : (disp ? 'warn' : '');
+    return `<tr data-call-id="${esc(c.id)}" style="cursor:pointer;">
+      <td>${esc(fmtDate(c.start_time))}</td>
+      <td>${esc(c.agent_name || '—')}</td>
+      <td>${esc(c.to_number || c.phone_number || '—')}</td>
+      <td><span class="pill">${esc(c.direction || '—')}</span></td>
+      <td><span class="pill ${c.status === 'ended' ? '' : 'accent'}">${esc(c.status || '—')}</span></td>
+      <td>${disp ? `<span class="pill ${cls}">${esc(disp)}</span>` : '—'}</td>
+      <td>${esc(fmtDuration(c.duration_sec))}</td>
+    </tr>`;
+  }
+
+  function viewCalls() {
+    if (!connected()) return notConnected('call history');
+    if (S.calls === null) return '<div class="empty">Loading calls…</div>';
+    return `
+      <h1>Call history</h1>
+      <p class="page-sub">Calls placed by your Telenow organization.</p>
+      <div class="toolbar">
+        <select id="callSort">
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="longest">Longest</option>
+          <option value="shortest">Shortest</option>
+        </select>
+        <select id="callStatus">
+          <option value="">All statuses</option>
+          <option value="active">Active</option>
+          <option value="ended">Ended</option>
+        </select>
+        <button class="btn secondary" data-refresh="calls">Refresh</button>
+      </div>
+      ${!S.calls.length ? `<div class="card empty"><div class="big">☏</div>
+        <h2>No calls yet</h2><p class="hint">Calls placed for this store will appear here.</p></div>`
+      : `<div class="card table-wrap" style="padding:0;"><table>
+          <thead><tr>
+            <th>When</th><th>Agent</th><th>To</th><th>Direction</th>
+            <th>Status</th><th>Outcome</th><th>Duration</th>
+          </tr></thead>
+          <tbody>${S.calls.map(callRow).join('')}</tbody>
+        </table></div>`}`;
+  }
+
+  function viewLeads() {
+    if (S.leads === null) return '<div class="empty">Loading leads…</div>';
+    return `
+      <h1>Leads</h1>
+      <p class="page-sub">New customers captured from Shopify, and the callback we placed.</p>
+      <div class="toolbar"><button class="btn secondary" data-refresh="leads">Refresh</button></div>
+      ${!S.leads.length ? `<div class="card empty"><div class="big">☰</div>
+        <h2>No leads yet</h2><p class="hint">Leads appear when a customer is created in your store.</p></div>`
+      : `<div class="card table-wrap" style="padding:0;"><table>
+          <thead><tr><th>Created</th><th>Name</th><th>Phone</th><th>Source</th>
+                     <th>Status</th><th>Outcome</th><th>Duration</th></tr></thead>
+          <tbody>${S.leads.map((l) => `<tr>
+            <td>${esc(fmtDate(l.createdAt))}</td>
+            <td>${esc(l.name || '—')}</td>
+            <td>${esc(l.phone || '—')}</td>
+            <td>${esc(l.source || '—')}</td>
+            <td><span class="pill ${l.status === 'completed' ? 'ok' : 'accent'}">${esc(l.status)}</span></td>
+            <td>${l.disposition ? `<span class="pill">${esc(l.disposition)}</span>` : '—'}</td>
+            <td>${esc(fmtDuration(l.duration))}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>`}`;
+  }
+
+  function viewStore() {
+    const p = S.profile;
+    if (!p) {
+      return `<h1>Store</h1><p class="page-sub">Details synced from Shopify.</p>
+        <div class="card empty"><div class="big">🛍</div><h2>Store details unavailable</h2>
+        <p class="hint">The Admin API did not return a profile for this shop.</p></div>`;
+    }
+    const rows = [
+      ['Store name', p.name], ['Owner', p.shop_owner], ['Contact email', p.email],
+      ['Primary domain', p.domain], ['Shopify domain', p.myshopify_domain],
+      ['Plan', p.plan_display_name], ['Currency', p.currency],
+      ['Timezone', p.iana_timezone], ['Country', p.country_name],
+      ['Phone', p.phone], ['Locale', p.primary_locale], ['On Shopify since', fmtDate(p.created_at)],
+    ];
+    return `
+      <h1>Store</h1>
+      <p class="page-sub">Synced from Shopify for ${esc(p.myshopify_domain || shop)}.</p>
+      <div class="card table-wrap" style="padding:0;"><table><tbody>
+        ${rows.map(([k, v]) => `<tr><th style="width:220px;">${esc(k)}</th><td>${esc(v || '—')}</td></tr>`).join('')}
+      </tbody></table></div>`;
+  }
+
+  function viewSettings() {
+    if (!S.settings) return '<div class="empty">Loading…</div>';
+    return `
+      <h1>Settings</h1>
+      <p class="page-sub">Connect Telenow and tune the scheduled jobs.</p>
+      <div class="grid grid-3">
+        <div class="card" style="grid-column:1/-1;">
+          <h2>Telenow connection</h2>
+          <p class="hint">Your <code>vai_live_…</code> key from Telenow → Developers → API Keys.
+             Stored per store and never shown again.</p>
+          <div class="row" style="margin-top:12px;">
+            <div style="flex:3 1 320px;"><label>API key</label>
+              <input type="password" id="apiKey" placeholder="${esc(S.settings.telenowApiKey || 'vai_live_…')}" /></div>
+            <div style="flex:0 0 auto;align-self:flex-end;">
+              <button class="btn" id="validateBtn">Validate &amp; save</button></div>
+          </div>
+          <p id="keyMsg" class="hint" style="margin-top:10px;"></p>
+        </div>
+        <div class="card">
+          <h2>Win-back threshold</h2>
+          <p class="hint">The scheduled win-back job calls customers whose last order is older than this.</p>
+          <div style="margin-top:10px;"><label>Days since last order</label>
+            <input type="number" min="1" max="3650" id="winBackDays" value="${esc(S.settings.winBackDays ?? 60)}" /></div>
+          <p style="margin-top:12px;display:flex;gap:10px;align-items:center;">
+            <button class="btn secondary" id="saveWinBack">Save</button>
+            <span id="winBackMsg" class="hint"></span></p>
+        </div>
+      </div>`;
+  }
+
+  // ── Agent detail ────────────────────────────────────────────────────────────
+  // The Agents grid is fed by /api/v1/agents, a deliberately slim projection
+  // (no prompt, no provider config). Opening a card fetches the full object
+  // from the Dashboard surface through our own /api/agents/:id.
+  //
+  // Wire casing is inconsistent upstream and is NOT normalised here: top-level
+  // fields are snake_case (llm_provider, tts_voice, system_prompt) while nested
+  // config keys are mostly camelCase (session_config.bargeInSensitivity) with a
+  // few snake_case exceptions (stt_config.smart_format, session_config.memory_type).
+  // Every lookup below binds to the exact key the API returns.
+
+  /** Look up a provider entry in a catalog section ("llm"|"stt"|"tts"|"telephony"). */
+  function catProvider(section, id) {
+    const list = S.catalog && S.catalog[section];
+    if (!Array.isArray(list) || !id) return null;
+    return list.find((p) => p.id === id) || null;
+  }
+
+  /** Human label for a provider id, falling back to the raw id. */
+  function providerName(section, id) {
+    if (!id) return '—';
+    const p = catProvider(section, id);
+    return p ? (p.name || id) : id;
+  }
+
+  /**
+   * Human label for a value inside a provider's configFields — turns
+   * "lightning_v3.1_pro" into "Lightning v3.1 Pro" when the catalog knows it.
+   */
+  function configLabel(section, providerId, fieldKey, value) {
+    if (value === undefined || value === null || value === '') return '—';
+    const p = catProvider(section, providerId);
+    const field = p && Array.isArray(p.configFields)
+      ? p.configFields.find((f) => f.key === fieldKey) : null;
+    const opt = field && Array.isArray(field.options)
+      ? field.options.find((o) => o.value === value) : null;
+    return opt ? opt.label : String(value);
+  }
+
+  /**
+   * Voice id to a readable name. The catalog hangs voices off the TTS provider
+   * row as voices[] = { id, name, gender, language }.
+   */
+  function voiceName(providerId, voiceId) {
+    if (!voiceId) return '—';
+    const p = catProvider('tts', providerId);
+    const v = p && Array.isArray(p.voices) ? p.voices.find((x) => x.id === voiceId) : null;
+    if (!v) return voiceId;
+    const bits = [v.name];
+    if (v.language) bits.push(v.language);
+    if (v.gender) bits.push(v.gender);
+    return bits.join(' · ');
+  }
+
+  /** Model id to its catalog display name (models[] = { id, name, latency }). */
+  function modelEntry(section, providerId, modelId) {
+    const p = catProvider(section, providerId);
+    if (!p || !Array.isArray(p.models) || !modelId) return null;
+    return p.models.find((m) => m.id === modelId) || null;
+  }
+  function modelName(section, providerId, modelId) {
+    if (!modelId) return '—';
+    const m = modelEntry(section, providerId, modelId);
+    return m ? (m.name || modelId) : modelId;
+  }
+
+  /** Milliseconds → "230 ms" / "1.2 s". */
+  function ms(v) {
+    if (v === null || v === undefined || Number.isNaN(Number(v))) return '—';
+    const n = Number(v);
+    return n >= 1000 ? (n / 1000).toFixed(1) + ' s' : Math.round(n) + ' ms';
+  }
+
+  /** Seconds → "3m 04s". */
+  function dur(sec) {
+    const n = Number(sec);
+    if (!n || Number.isNaN(n)) return '—';
+    const m = Math.floor(n / 60);
+    const s = Math.round(n % 60);
+    return m ? m + 'm ' + String(s).padStart(2, '0') + 's' : s + 's';
+  }
+
+  /** A labelled key/value row. */
+  function kv(label, value) {
+    const shown = (value === undefined || value === null || value === '') ? '—' : String(value);
+    return '<div><div class="k">' + esc(label) + '</div>' + esc(shown) + '</div>';
+  }
+
+  /** On/off chip for a boolean behaviour flag. */
+  function flag(label, on) {
+    return '<span class="pill ' + (on ? 'ok' : '') + '" style="margin:0 6px 6px 0;">'
+      + '<span class="dot"></span>' + esc(label) + '</span>';
+  }
+
+  function viewAgent() {
+    if (S.agentErr) {
+      return `<p><button class="btn secondary" data-go="agents">&larr; Back to agents</button></p>
+        <div class="banner err"><span>✕</span><div>${esc(S.agentErr)}</div></div>`;
+    }
+    if (!S.agent) {
+      return `<p><button class="btn secondary" data-go="agents">&larr; Back to agents</button></p>
+        <div class="empty">Loading agent…</div>`;
+    }
+
+    const a = S.agent;
+    const st = S.agentStats || {};
+    const meta = a.metadata || {};
+    const sc = a.session_config || {};
+    const beh = sc.behavior || {};
+    const tel = a.telephony_config || {};
+    const vars = Array.isArray(meta.variables) ? meta.variables : [];
+    const isFlow = Boolean(meta.flow);
+
+    // Catalog latency, so the strip reads like the dashboard's even before this
+    // agent has calls of its own to average.
+    const latOf = (section, id) => {
+      const p = catProvider(section, id);
+      return p && p.latency ? p.latency.ms : null;
+    };
+    const llmModel = modelEntry('llm', a.llm_provider, a.llm_model);
+    const llmLat = llmModel && llmModel.latency ? llmModel.latency.ms : latOf('llm', a.llm_provider);
+    const cl = [latOf('stt', a.stt_provider), llmLat, latOf('tts', a.tts_provider)];
+    const clTotal = cl.every((v) => v !== null) ? cl.reduce((x, y) => x + y, 0) : null;
+
+    return `
+      <p><button class="btn secondary" data-go="agents">&larr; Back to agents</button></p>
+
+      <div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:6px;">
+        <div class="avatar" style="background:var(--accent-soft);color:var(--accent-text);width:44px;height:44px;font-size:18px;">
+          ${esc((a.name || '?').trim().charAt(0).toUpperCase())}
+        </div>
+        <div style="min-width:0;flex:1;">
+          <h1 style="margin:0;">${esc(a.name || 'Untitled')}</h1>
+          <div style="margin-top:6px;">
+            <span class="pill ${a.is_active ? 'ok' : ''}"><span class="dot"></span>${a.is_active ? 'Active' : 'Inactive'}</span>
+            ${meta.environment ? `<span class="pill"><span class="dot"></span>${esc(meta.environment)}</span>` : ''}
+            <span class="pill"><span class="dot"></span>${isFlow ? 'Flow' : 'Single-context'}</span>
+            ${a.is_public ? '<span class="pill"><span class="dot"></span>Public</span>' : ''}
+          </div>
+        </div>
+      </div>
+      <p class="page-sub">${esc(a.description || 'No description.')}</p>
+
+      <div class="grid grid-3" style="margin-bottom:18px;">
+        <div class="card">
+          <h2>Language model</h2>
+          <div class="kv">
+            ${kv('Provider', providerName('llm', a.llm_provider))}
+            ${kv('Model', modelName('llm', a.llm_provider, a.llm_model))}
+            ${kv('Temperature', a.llm_config && a.llm_config.temperature)}
+          </div>
+        </div>
+        <div class="card">
+          <h2>Speech to text</h2>
+          <div class="kv">
+            ${kv('Provider', providerName('stt', a.stt_provider))}
+            ${kv('Model', configLabel('stt', a.stt_provider, 'model', a.stt_config && a.stt_config.model))}
+            ${kv('Language', a.stt_config && a.stt_config.language)}
+          </div>
+        </div>
+        <div class="card">
+          <h2>Text to speech</h2>
+          <div class="kv">
+            ${kv('Provider', providerName('tts', a.tts_provider))}
+            ${kv('Model', configLabel('tts', a.tts_provider, 'model', a.tts_config && a.tts_config.model))}
+            ${kv('Voice', voiceName(a.tts_provider, a.tts_voice || (a.tts_config && a.tts_config.voice)))}
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-3" style="margin-bottom:18px;">
+        <div class="card stat"><span class="n">${esc(String(st.totalSessions ?? a.total_sessions ?? 0))}</span><span class="l">Sessions</span></div>
+        <div class="card stat"><span class="n">${esc(String(st.totalMessages ?? a.total_messages ?? 0))}</span><span class="l">Messages</span></div>
+        <div class="card stat"><span class="n">${esc(dur(st.totalDuration ?? a.total_duration))}</span><span class="l">Talk time</span></div>
+      </div>
+
+      <div class="grid grid-2" style="margin-bottom:18px;">
+        ${webCallPanel(a)}
+        ${testPanel(a, vars)}
+      </div>
+
+      <div class="grid grid-2" style="margin-bottom:18px;">
+        <div class="card">
+          <h2>Measured latency</h2>
+          <p class="hint">Averaged from this agent's own calls${st.latencySamples ? ' (' + esc(String(st.latencySamples)) + ' samples)' : ''}.</p>
+          <div class="kv">
+            ${kv('Speech to text', ms(st.avgSttMs))}
+            ${kv('Language model', ms(st.avgLlmMs))}
+            ${kv('Text to speech', ms(st.avgTtsMs))}
+            ${kv('Server', ms(st.avgServerMs))}
+            ${kv('Network RTT', ms(st.avgNetRttMs))}
+            ${kv('Avg call', dur(st.avgSessionDuration))}
+          </div>
+        </div>
+        <div class="card">
+          <h2>Expected latency</h2>
+          <p class="hint">Typical figures for this stack, from the provider catalog.</p>
+          <div class="kv">
+            ${kv(providerName('stt', a.stt_provider), cl[0] === null ? '—' : ms(cl[0]))}
+            ${kv(llmModel ? llmModel.name : providerName('llm', a.llm_provider), cl[1] === null ? '—' : ms(cl[1]))}
+            ${kv(providerName('tts', a.tts_provider), cl[2] === null ? '—' : ms(cl[2]))}
+            ${kv('Total', clTotal === null ? '—' : ms(clTotal))}
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:18px;">
+        <h2>Context</h2>
+        <p class="hint">The system prompt this agent runs on.</p>
+        ${a.system_prompt
+          ? `<pre style="white-space:pre-wrap;word-break:break-word;max-height:300px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;font-size:12px;line-height:1.55;margin:0;">${esc(a.system_prompt)}</pre>`
+          : '<p class="hint">No system prompt set.</p>'}
+      </div>
+
+      ${vars.length ? `<div class="card" style="margin-bottom:18px;">
+        <h2>Context variables</h2>
+        <p class="hint">Placeholders substituted into the prompt when a call starts.</p>
+        <div>${vars.map((v) => `<span class="pill" style="margin:0 6px 6px 0;"><span class="dot"></span>{${esc(v.name)}}${v.required ? ' *' : ''}</span>`).join('')}</div>
+      </div>` : ''}
+
+      <div class="grid grid-2" style="margin-bottom:18px;">
+        <div class="card">
+          <h2>Conversation</h2>
+          <div class="kv">
+            ${kv('Tone', beh.tone)}
+            ${kv('Context mode', sc.contextMode)}
+            ${kv('Context window', sc.contextWindow)}
+            ${kv('Max duration', dur(sc.maxDuration))}
+            ${kv('Barge-in sensitivity', sc.bargeInSensitivity)}
+            ${kv('Memory', sc.memory_type)}
+          </div>
+          <div style="margin-top:12px;">
+            ${flag('Natural fillers', beh.naturalFillers)}
+            ${flag('High empathy', beh.highEmpathy)}
+            ${flag('Echo verification', beh.echoVerification)}
+            ${flag('Scope boundaries', beh.scopeBoundaries)}
+            ${flag('AI disclosure', beh.aiDisclosureWhenAsked)}
+            ${flag('Backchannel', sc.backchannel && sc.backchannel.enabled)}
+          </div>
+        </div>
+        <div class="card">
+          <h2>Telephony</h2>
+          <div class="kv">
+            ${kv('Provider', a.telephony_provider ? providerName('telephony', a.telephony_provider) : 'Default')}
+            ${kv('Speaks first', tel.firstResponseOutbound || tel.firstResponse)}
+            ${kv('Recording', tel.recording === undefined ? '—' : (tel.recording ? 'On' : 'Off'))}
+          </div>
+          ${(tel.agentMsgOutbound || tel.agentMsg) ? `<div style="margin-top:12px;">
+            <div class="k">Opening line</div>
+            <p class="hint" style="margin-top:4px;">${esc(tel.agentMsgOutbound || tel.agentMsg)}</p>
+          </div>` : ''}
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Details</h2>
+        <div class="kv">
+          ${kv('Agent ID', a.id)}
+          ${kv('Created', a.created_at ? new Date(a.created_at).toLocaleString() : '—')}
+          ${kv('Updated', a.updated_at ? new Date(a.updated_at).toLocaleString() : '—')}
+          ${kv('Channels', Array.isArray(meta.channels) ? meta.channels.join(', ') : '—')}
+        </div>
+      </div>`;
+  }
+
+  /**
+   * Test panel — places a REAL outbound call through the agent.
+   *
+   * Telephony rather than a browser web call on purpose: the app runs in an
+   * iframe inside admin.shopify.com, so a web call would need microphone
+   * permission plus a WebRTC/LiveKit stack inside that frame. An outbound call
+   * is a single server-side POST and the merchant just answers their phone.
+   */
+  /**
+   * Browser call — the merchant talks to the agent through their microphone,
+   * the way the Telenow dashboard does.
+   *
+   * The call runs in its OWN WINDOW, not here: microphone access inside an
+   * iframe needs the embedder to set allow="microphone", and the Shopify
+   * admin owns that iframe. A top-level window always has it.
+   */
+  function webCallPanel(a) {
+    const w = S.webCall || {};
+    return `
+      <div class="card" style="margin-bottom:18px;">
+        <h2>Talk to ${esc(a.name || "your agent")} live</h2>
+        <p class="hint">Speak to the agent through your browser. Opens in a new window so it can use your microphone.</p>
+        ${a.is_active ? '' : '<div class="banner warn"><span>⚠</span><div>This agent is inactive — activate it in Telenow before testing.</div></div>'}
+        <div style="margin-top:12px;display:flex;gap:10px;align-items:center;">
+          <button class="btn" id="webCallBtn"${a.is_active ? '' : ' disabled'}>
+            ${w.status === 'starting' ? 'Starting…' : '&#9742; Start call'}</button>
+          <span id="webCallMsg" class="hint">${esc(w.message || '')}</span>
+        </div>
+      </div>`;
+  }
+
+  /** Mint a web-call session, then hand it to the call window. */
+  async function startWebCall() {
+    const a = S.agent;
+    if (!a) return;
+    // Open the window BEFORE the await: a popup opened later is not tied to the
+    // click and browsers block it.
+    const win = window.open('', 'telenow-web-call', 'width=460,height=620');
+    if (!win) {
+      S.webCall = { status: 'error', message: 'Allow pop-ups for this page, then try again.' };
+      render();
       return;
     }
-    const table = document.createElement('table');
-    table.className = 'leads';
-    const thead = document.createElement('thead');
-    const htr = document.createElement('tr');
-    for (const h of ['Created', 'Name', 'Phone', 'Status', 'Disposition']) {
-      const th = document.createElement('th');
-      th.textContent = h;
-      htr.appendChild(th);
-    }
-    thead.appendChild(htr);
-    table.appendChild(thead);
-
-    const tbody = document.createElement('tbody');
-    for (const lead of leads) {
-      const tr = document.createElement('tr');
-      const cells = [
-        fmtDate(lead.createdAt),
-        lead.name || '—',
-        maskPhone(lead.phone),
-        null, // status pill
-        lead.disposition || '—',
-      ];
-      cells.forEach((val, i) => {
-        const td = document.createElement('td');
-        if (i === 3) {
-          const span = document.createElement('span');
-          const status = String(lead.status || 'queued');
-          span.className = `status ${status}`;
-          span.textContent = status;
-          td.appendChild(span);
-        } else {
-          td.textContent = val;
-          td.title = val; // full value on hover (cells are ellipsized)
-        }
-        tr.appendChild(td);
+    S.webCall = { status: 'starting', message: 'Starting the call…' };
+    render();
+    try {
+      const r = await api('/api/web-call', {
+        method: 'POST',
+        body: JSON.stringify({ agentId: a.id }),
       });
-      tbody.appendChild(tr);
+      const frag = new URLSearchParams({ s: r.sessionId || '', u: r.websocketUrl || '', n: a.name || '' });
+      // Session id travels in the fragment: never sent to a server, never logged.
+      win.location.href = '/web-call#' + frag.toString();
+      S.webCall = { status: 'open', message: 'Call window opened — click Start there to allow your microphone.' };
+    } catch (err) {
+      try { win.close(); } catch (e) {}
+      S.webCall = { status: 'error', message: 'Could not start the call: ' + err.message };
     }
-    table.appendChild(tbody);
-    leadsEl.appendChild(table);
+    render();
+  }
+
+  /**
+   * Telephony test — places a REAL outbound call through the agent, or shows
+   * the numbers to dial for an inbound test.
+   *
+   * Needs a purchased number to call FROM. With none, there is nothing useful to
+   * render, so the panel becomes a link to buy one rather than a broken form.
+   */
+  function testPanel(a, vars) {
+    const t = S.test || {};
+    const nums = S.numbers;
+    const scenario = t.scenario || 'outbound';
+
+    // Numbers still loading.
+    if (nums === null) {
+      return `<div class="card">
+        <h2>&#9990; Test over telephony</h2>
+        <p class="hint">Loading your phone numbers…</p></div>`;
+    }
+
+    // No number bought yet — send them to Telenow to get one.
+    if (!nums.length) {
+      return `<div class="card">
+        <h2>&#9990; Test over telephony</h2>
+        <p class="hint">You need a phone number before the agent can place or receive calls.</p>
+        <div class="banner warn" style="margin-top:12px;"><span>⚠</span>
+          <div>No phone number on this Telenow account yet.</div></div>
+        <p style="margin-top:12px;">
+          <a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">
+            Buy a number on Telenow &#8599;</a>
+        </p>
+        <p class="hint" style="margin-top:8px;">Once you have one, reopen this agent and it will appear here.</p>
+      </div>`;
+    }
+
+    const tab = (key, title, sub) => `
+      <button class="scenario${scenario === key ? ' active' : ''}" data-scenario="${key}">
+        <div style="font-weight:600;">${title}</div>
+        <div class="hint" style="margin-top:2px;">${sub}</div>
+      </button>`;
+
+    const body = scenario === 'inbound'
+      ? `<div style="margin-top:14px;">
+          <label>Call one of these numbers</label>
+          <p class="hint" style="margin-bottom:8px;">Dial from your phone to reach this agent.</p>
+          ${nums.map((n) => `<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);">
+            <div><code style="font-size:13px;">${esc(n.phone_number)}</code>
+              <span class="hint"> · ${esc(n.provider || '—')}${n.country ? ' · ' + esc(n.country) : ''}</span></div>
+            <span class="pill ${n.agent_id === a.id ? 'ok' : ''}"><span class="dot"></span>
+              ${n.agent_id === a.id ? 'This agent' : 'Other agent'}</span>
+          </div>`).join('')}
+          ${nums.some((n) => n.agent_id === a.id) ? '' : `<div class="banner warn" style="margin-top:12px;"><span>⚠</span>
+            <div>None of your numbers routes to this agent. Assign one in Telenow, or it will answer as a different agent.</div></div>`}
+        </div>`
+      : `<div style="margin-top:14px;">
+          <label>Call from</label>
+          <select id="testFrom">
+            ${nums.map((n) => `<option value="${esc(n.id)}"${t.fromId === n.id ? ' selected' : ''}>
+              ${esc(n.phone_number)} (${esc(n.provider || '—')})</option>`).join('')}
+          </select>
+
+          <label style="margin-top:12px;display:block;">To</label>
+          <input type="tel" id="testNumber" placeholder="+919876543210" value="${esc(t.number || '')}" />
+          <div class="hint" style="margin-top:4px;">Your own number, with the country code.</div>
+
+          <label style="margin-top:12px;display:block;">Answering-machine detection</label>
+          <select id="testAmd">
+            <option value="agent"${t.amd === 'agent' || !t.amd ? ' selected' : ''}>Use the agent's own setting</option>
+            <option value="true"${t.amd === 'true' ? ' selected' : ''}>Leave a voicemail</option>
+            <option value="hangup"${t.amd === 'hangup' ? ' selected' : ''}>Hang up on a machine</option>
+          </select>
+          <div class="hint" style="margin-top:4px;">Follows whatever the agent has configured.</div>
+
+          ${vars.length ? `<div style="margin-top:14px;">
+            <div class="k">Test variables</div>
+            <div class="row">
+              ${vars.map((v) => `<div style="flex:1 1 190px;">
+                <label>{${esc(v.name)}}${v.required ? ' *' : ''}</label>
+                <input type="text" data-testvar="${esc(v.name)}" value="${esc((t.vars && t.vars[v.name]) || '')}" placeholder="Optional" />
+              </div>`).join('')}
+            </div>
+          </div>` : ''}
+
+          <div style="margin-top:14px;display:flex;gap:10px;align-items:center;">
+            <button class="btn" id="testCallBtn"${a.is_active ? '' : ' disabled'}>
+              ${t.status === 'calling' ? 'Calling…' : '&#9990; Call now'}</button>
+            <span id="testMsg" class="hint">${esc(t.message || '')}</span>
+          </div>
+        </div>`;
+
+    return `<div class="card">
+      <h2>&#9990; Test over telephony</h2>
+      <p class="hint">Select a scenario to test real-time conversations.</p>
+      ${a.is_active ? '' : '<div class="banner warn" style="margin-top:10px;"><span>⚠</span><div>This agent is inactive — activate it in Telenow before testing.</div></div>'}
+      <div class="scenarios">
+        ${tab('outbound', '&#8599; Outbound Call', 'Make a call from agent')}
+        ${tab('inbound', '&#8600; Inbound Call', 'Receive a call for agent')}
+      </div>
+      ${body}
+    </div>`;
+  }
+
+  /** Open one agent's detail view. */
+  function openAgent(id) {
+    S.view = 'agent';
+    S.agentId = id;
+    S.agent = null;
+    S.agentStats = null;
+    S.agentErr = '';
+    S.test = {};
+    S.webCall = {};
+    // Numbers are org-wide, so fetch once and reuse across agents.
+    if (S.numbers === null) loadNumbers().then(render);
+    S.error = '';
+    render();
+    loadAgent(id);
+  }
+
+  /** Fetch the full agent + stats, and the catalog used for display names. */
+  async function loadAgent(id) {
+    try {
+      // The catalog is a large, near-static payload the server caches per shop;
+      // fetch it alongside but never let it fail the view.
+      const [detail] = await Promise.all([
+        api('/api/agents/' + encodeURIComponent(id)),
+        S.catalog ? Promise.resolve(null) : api('/api/catalog').then((c) => { S.catalog = c; }).catch(() => null),
+      ]);
+      // Ignore a response that arrived after the user navigated elsewhere.
+      if (S.agentId !== id) return;
+      S.agent = detail.agent;
+      S.agentStats = detail.stats;
+    } catch (err) {
+      if (S.agentId !== id) return;
+      S.agentErr = 'Could not load agent: ' + err.message;
+    }
+    render();
+  }
+
+  /** Place the test call. */
+  async function runTestCall() {
+    const numEl = $('#testNumber');
+    const number = (numEl && numEl.value.trim()) || '';
+    const fromId = ($('#testFrom') || {}).value || '';
+    const amd = ($('#testAmd') || {}).value || 'agent';
+    const vars = {};
+    document.querySelectorAll('[data-testvar]').forEach((el) => {
+      if (el.value.trim()) vars[el.dataset.testvar] = el.value.trim();
+    });
+
+    const keep = { number, vars, fromId, amd, scenario: 'outbound' };
+    if (!/^\+[1-9]\d{6,14}$/.test(number)) {
+      S.test = { ...keep, status: 'error', message: 'Enter a number in E.164 form, e.g. +919876543210.' };
+      render();
+      return;
+    }
+
+    S.test = { ...keep, status: 'calling', message: 'Requesting the call…' };
+    render();
+    try {
+      const r = await api('/api/test-call', {
+        method: 'POST',
+        body: JSON.stringify({
+          agentId: S.agentId,
+          mobileNumber: number,
+          variables: vars,
+          fromNumberId: fromId,
+          machineDetection: amd,
+        }),
+      });
+      S.test = { ...keep, status: 'placed',
+        message: 'Calling ' + number + ' now — answer to talk to the agent.' + (r.sessionId ? ' Session ' + r.sessionId : '') };
+    } catch (err) {
+      S.test = { ...keep, status: 'error', message: 'Call failed: ' + err.message };
+    }
+    render();
+  }
+
+  /** Load the org's purchased numbers once per session. */
+  async function loadNumbers() {
+    try {
+      const r = await api('/api/numbers');
+      S.numbers = r.numbers || [];
+    } catch (err) {
+      // An empty list and a failed fetch look the same to the panel, which is
+      // the safe direction: it offers the "buy a number" route either way.
+      S.numbers = [];
+    }
+  }
+
+
+  // ── Call detail ─────────────────────────────────────────────────────────────
+  // /api/v1/calls/{id} returns the whole conversation: transcript[], the
+  // per-turn latency aggregates, the context variables the call ran with, and a
+  // recording_id. The audio itself is fetched separately as a signed URL.
+
+  /** Bytes → "1.2 MB". */
+  function bytes(n) {
+    const v = Number(n);
+    if (!v || Number.isNaN(v)) return '—';
+    if (v < 1024) return v + ' B';
+    if (v < 1024 * 1024) return (v / 1024).toFixed(0) + ' KB';
+    return (v / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  /** Seconds offset within a call → "1:04". */
+  function stamp(sec) {
+    const n = Number(sec);
+    if (Number.isNaN(n)) return '';
+    const m = Math.floor(n / 60);
+    return m + ':' + String(Math.floor(n % 60)).padStart(2, '0');
+  }
+
+  function transcriptRow(t, startedAt) {
+    const isAgent = String(t.role || '').toLowerCase() === 'agent'
+      || String(t.role || '').toLowerCase() === 'assistant';
+    // `at` is an absolute timestamp; show it as an offset from the call start so
+    // it lines up with the audio player's position.
+    let off = '';
+    if (t.at && startedAt) {
+      const d = (new Date(t.at) - new Date(startedAt)) / 1000;
+      if (!Number.isNaN(d) && d >= 0) off = stamp(d);
+    }
+    return `<div style="display:flex;gap:10px;margin-bottom:12px;${isAgent ? '' : 'flex-direction:row-reverse;'}">
+      <div class="avatar" style="flex:0 0 auto;width:28px;height:28px;font-size:12px;background:${isAgent ? 'var(--accent-soft)' : 'var(--soft, var(--line))'};color:${isAgent ? 'var(--accent-text)' : 'var(--text)'};">
+        ${isAgent ? 'A' : 'U'}
+      </div>
+      <div style="max-width:78%;">
+        <div class="hint" style="font-size:11px;margin-bottom:2px;${isAgent ? '' : 'text-align:right;'}">
+          ${esc(isAgent ? 'Agent' : 'Caller')}${off ? ' · ' + esc(off) : ''}
+        </div>
+        <div style="background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 11px;white-space:pre-wrap;word-break:break-word;">
+          ${esc(t.text || '')}
+        </div>
+      </div>
+    </div>`;
+  }
+
+  function viewCall() {
+    if (S.callErr) {
+      return `<p><button class="btn secondary" data-go="calls">&larr; Back to calls</button></p>
+        <div class="banner err"><span>✕</span><div>${esc(S.callErr)}</div></div>`;
+    }
+    if (!S.call) {
+      return `<p><button class="btn secondary" data-go="calls">&larr; Back to calls</button></p>
+        <div class="empty">Loading call…</div>`;
+    }
+
+    const c = S.call;
+    const rec = S.recording;
+    const tr = Array.isArray(c.transcript) ? c.transcript : [];
+    const vars = c.variables && typeof c.variables === 'object' ? Object.entries(c.variables) : [];
+    const disp = c.disposition || c.wrapup_disposition || '';
+
+    return `
+      <p><button class="btn secondary" data-go="calls">&larr; Back to calls</button></p>
+
+      <h1 style="margin-bottom:6px;">${esc(c.agent_name || 'Call')}</h1>
+      <div style="margin-bottom:10px;">
+        <span class="pill ${c.status === 'ended' ? '' : 'accent'}"><span class="dot"></span>${esc(c.status || '—')}</span>
+        <span class="pill"><span class="dot"></span>${esc(c.direction || '—')}</span>
+        ${c.channel ? `<span class="pill"><span class="dot"></span>${esc(c.channel)}</span>` : ''}
+        ${disp ? `<span class="pill ${disp === 'answered' ? 'ok' : 'warn'}"><span class="dot"></span>${esc(disp)}</span>` : ''}
+      </div>
+      <p class="page-sub">${esc(fmtDate(c.start_time))} · ${esc(fmtDuration(c.duration_sec))}</p>
+
+      <div class="card" style="margin-bottom:18px;">
+        <h2>Recording</h2>
+        ${recordingBlock(c, rec)}
+      </div>
+
+      <div class="grid grid-4" style="margin-bottom:18px;">
+        <div class="card stat"><span class="n">${esc(fmtDuration(c.duration_sec))}</span><span class="l">Duration</span></div>
+        <div class="card stat"><span class="n">${esc(String(tr.length))}</span><span class="l">Turns</span></div>
+        <div class="card stat"><span class="n">${esc(ms(c.resp_ms_avg))}</span><span class="l">Avg response</span></div>
+        <div class="card stat"><span class="n">${esc(ms(c.resp_ms_max))}</span><span class="l">Slowest response</span></div>
+      </div>
+
+      <div class="card" style="margin-bottom:18px;">
+        <h2>Transcript</h2>
+        ${tr.length
+          ? `<div style="margin-top:12px;">${tr.map((t) => transcriptRow(t, c.start_time)).join('')}</div>`
+          : '<p class="hint">No transcript for this call.</p>'}
+      </div>
+
+      <div class="grid grid-2" style="margin-bottom:18px;">
+        <div class="card">
+          <h2>Latency</h2>
+          <p class="hint">Averages across this call's turns.</p>
+          <div class="kv">
+            ${kv('Speech to text', ms(c.stt_ms_avg))}
+            ${kv('Language model', ms(c.llm_ms_avg))}
+            ${kv('Text to speech', ms(c.tts_ms_avg))}
+            ${kv('Flow', ms(c.flow_ms_avg))}
+            ${kv('Network RTT', ms(c.net_rtt_ms_avg))}
+            ${kv('Turn hold', ms(c.turn_hold_ms_avg))}
+            ${kv('Samples', c.resp_samples)}
+            ${kv('Audio gaps', c.audio_gap_count)}
+          </div>
+        </div>
+        <div class="card">
+          <h2>Call</h2>
+          <div class="kv">
+            ${kv('From', c.from_number)}
+            ${kv('To', c.to_number || c.phone_number)}
+            ${kv('Started', c.start_time ? new Date(c.start_time).toLocaleString() : '—')}
+            ${kv('Ended', c.end_time ? new Date(c.end_time).toLocaleString() : '—')}
+            ${kv('Answered by', c.answered_by)}
+            ${kv('Started by', c.initiated_by_name || c.initiated_by_email || c.initiated_via)}
+          </div>
+        </div>
+      </div>
+
+      ${vars.length ? `<div class="card" style="margin-bottom:18px;">
+        <h2>Context variables</h2>
+        <p class="hint">The values this call ran with.</p>
+        <div class="kv">${vars.map(([k, v]) => kv(k, typeof v === 'string' ? v : JSON.stringify(v))).join('')}</div>
+      </div>` : ''}
+
+      <div class="card">
+        <h2>Details</h2>
+        <div class="kv">
+          ${kv('Call ID', c.id)}
+          ${kv('Agent ID', c.agent_id)}
+          ${kv('Recording ID', c.recording_id)}
+          ${kv('Call SID', c.call_sid)}
+        </div>
+      </div>`;
+  }
+
+  /** The audio player, or an explanation of why there isn't one. */
+  function recordingBlock(c, rec) {
+    if (!c.recording_id) {
+      return '<p class="hint">This call was not recorded.</p>';
+    }
+    if (rec === null) {
+      return '<p class="hint">Loading the recording…</p>';
+    }
+    if (rec && rec.error) {
+      return `<div class="banner warn"><span>⚠</span><div>${esc(rec.error)}</div></div>`;
+    }
+    if (!rec || !rec.url) {
+      return '<p class="hint">The recording is not available.</p>';
+    }
+    // The signed URL is short-lived and points straight at object storage; it
+    // needs no credential, which is the only way <audio> can play it.
+    return `
+      <audio controls preload="none" src="${esc(rec.url)}" style="width:100%;margin-top:10px;"></audio>
+      <div class="hint" style="margin-top:8px;">
+        ${esc(rec.mime || 'audio/wav')}
+        ${rec.durationSec ? ' · ' + esc(fmtDuration(rec.durationSec)) : ''}
+        ${rec.sizeBytes ? ' · ' + esc(bytes(rec.sizeBytes)) : ''}
+        ${rec.sampleRate ? ' · ' + esc(String(rec.sampleRate)) + ' Hz' : ''}
+        · <a href="${esc(rec.url)}" target="_blank" rel="noopener">Open in a new tab</a>
+      </div>`;
+  }
+
+  /** Open one call's detail view. */
+  function openCall(id) {
+    S.view = 'call';
+    S.callId = id;
+    S.call = null;
+    S.callErr = '';
+    S.recording = null;
+    S.error = '';
+    render();
+    loadCall(id);
+  }
+
+  /** Fetch the call, then its recording URL if it has one. */
+  async function loadCall(id) {
+    try {
+      const call = await api('/api/calls/' + encodeURIComponent(id));
+      if (S.callId !== id) return; // navigated away mid-flight
+      S.call = call;
+    } catch (err) {
+      if (S.callId !== id) return;
+      S.callErr = 'Could not load call: ' + err.message;
+      render();
+      return;
+    }
+    render();
+
+    if (!S.call.recording_id) { S.recording = { url: null }; render(); return; }
+    try {
+      const rec = await api('/api/calls/' + encodeURIComponent(id) + '/recording');
+      if (S.callId !== id) return;
+      S.recording = rec;
+    } catch (err) {
+      if (S.callId !== id) return;
+      S.recording = { error: 'Could not load the recording: ' + err.message };
+    }
+    render();
+  }
+
+
+  const VIEWS = {
+    home: viewHome, agents: viewAgents, calls: viewCalls, leads: viewLeads,
+    agent: viewAgent,
+    call: viewCall,
+    settings: viewSettings, store: viewStore,
+  };
+
+  function render() {
+    contentEl.innerHTML =
+      (S.error ? `<div class="banner err"><span>✕</span><div>${esc(S.error)}</div></div>` : '') +
+      (VIEWS[S.view] || viewHome)();
+
+    document.querySelectorAll('.nav-item').forEach((b) =>
+      b.classList.toggle('active', b.dataset.view === ({ agent: 'agents', call: 'calls' }[S.view] || S.view)));
+
+    const pill = $('#connPill');
+    pill.className = 'pill ' + (connected() ? 'ok' : 'err');
+    pill.innerHTML = '<span class="dot"></span>' + (connected() ? 'Connected' : 'Not connected');
+
+    // The picker list is rebuilt by every render; put it back where it was.
+    const pl = $('#pickerList');
+    if (pl && S.pickerScroll) pl.scrollTop = S.pickerScroll;
+    if (pl) pl.addEventListener('scroll', () => { S.pickerScroll = pl.scrollTop; });
+
+    wireView();
+  }
+
+  function go(view) {
+    S.view = view;
+    S.error = '';
+    render();
+    ensureData(view);
+  }
+
+  // ── Per-view wiring (re-run after every render) ──────────────────────────────
+  function wireView() {
+    document.querySelectorAll('[data-go]').forEach((b) =>
+      b.addEventListener('click', () => go(b.dataset.go)));
+
+    document.querySelectorAll('[data-refresh]').forEach((b) =>
+      b.addEventListener('click', () => {
+        S[b.dataset.refresh] = null;
+        render();
+        ensureData(S.view, true);
+      }));
+
+    const clearMissing = $('#clearMissing');
+    if (clearMissing) clearMissing.addEventListener('click', async () => {
+      clearMissing.disabled = true;
+      for (const id of (S.missingAgents || [])) {
+        try { await api('/api/agents/saved/' + encodeURIComponent(id), { method: 'DELETE' }); } catch (e) {}
+      }
+      await loadAgents();
+      render();
+    });
+
+    const fetchBtn = $('#fetchAgentsBtn');
+    if (fetchBtn) fetchBtn.addEventListener('click', openPicker);
+    const fetchEmpty = $('#fetchAgentsEmpty');
+    if (fetchEmpty) fetchEmpty.addEventListener('click', openPicker);
+    const pickerClose = $('#pickerClose');
+    if (pickerClose) pickerClose.addEventListener('click', closePicker);
+    // Click the backdrop (not the modal) to dismiss.
+    const overlay = $('#pickerOverlay');
+    if (overlay) overlay.addEventListener('click', (ev) => { if (ev.target === overlay) closePicker(); });
+    const pickerRetry = $('#pickerRetry');
+    if (pickerRetry) pickerRetry.addEventListener('click', openPicker);
+    const pickerSearch = $('#pickerSearch');
+    if (pickerSearch) {
+      // Do not re-render mid-composition: an IME (Hindi, CJK) commits on
+      // compositionend, and rebuilding the input before then drops the buffer.
+      let composing = false;
+      pickerSearch.addEventListener('compositionstart', () => { composing = true; });
+      pickerSearch.addEventListener('compositionend', () => { composing = false; pickerSearch.dispatchEvent(new Event('input')); });
+      pickerSearch.addEventListener('input', () => {
+        if (composing) return;
+        const caret = pickerSearch.selectionStart;
+        S.picker = { ...S.picker, query: pickerSearch.value };
+        render();
+        const el = $('#pickerSearch');
+        if (el) { el.focus(); try { el.setSelectionRange(caret, caret); } catch (e) {} }
+      });
+    }
+    document.querySelectorAll('[data-add-agent]').forEach((b) =>
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); toggleAgent(b.dataset.addAgent); }));
+
+    document.querySelectorAll('[data-view-agent]').forEach((b) =>
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); openAgent(b.dataset.viewAgent); }));
+
+    document.querySelectorAll('#agentGrid .card[data-agent-id]').forEach((c) =>
+      c.addEventListener('click', () => openAgent(c.dataset.agentId)));
+
+    document.querySelectorAll('tr[data-call-id]').forEach((r) =>
+      r.addEventListener('click', () => openCall(r.dataset.callId)));
+
+    const webBtn = $('#webCallBtn');
+    if (webBtn) webBtn.addEventListener('click', startWebCall);
+
+    document.querySelectorAll('[data-scenario]').forEach((b) =>
+      b.addEventListener('click', () => {
+        S.test = { ...(S.test || {}), scenario: b.dataset.scenario };
+        render();
+      }));
+
+    const testBtn = $('#testCallBtn');
+    if (testBtn) testBtn.addEventListener('click', runTestCall);
+
+    const search = $('#agentSearch');
+    if (search) {
+      search.addEventListener('input', () => {
+        const q = search.value.trim().toLowerCase();
+        document.querySelectorAll('#agentGrid .card').forEach((c) => {
+          c.hidden = Boolean(q) && !c.dataset.agentName.includes(q) && !c.dataset.agentDesc.includes(q);
+        });
+      });
+    }
+
+    const sort = $('#callSort');
+    const status = $('#callStatus');
+    if (sort) sort.addEventListener('change', loadCalls);
+    if (status) status.addEventListener('change', loadCalls);
+
+    const validateBtn = $('#validateBtn');
+    if (validateBtn) validateBtn.addEventListener('click', validateKey);
+
+    const saveWinBack = $('#saveWinBack');
+    if (saveWinBack) saveWinBack.addEventListener('click', saveWinBackDays);
+  }
+
+  // ── Actions ─────────────────────────────────────────────────────────────────
+  async function saveWinBackDays() {
+    const msg = $('#winBackMsg');
+    msg.textContent = 'Saving…';
+    try {
+      const r = await api('/api/settings', {
+        method: 'POST',
+        body: JSON.stringify({ winBackDays: Number($('#winBackDays').value) }),
+      });
+      S.settings = r.settings;
+      msg.textContent = 'Saved.';
+    } catch (err) {
+      msg.textContent = 'Failed: ' + err.message;
+    }
+  }
+
+  async function validateKey() {
+    const msg = $('#keyMsg');
+    const key = $('#apiKey').value.trim();
+    msg.textContent = 'Validating…';
+    try {
+      const r = await api('/api/validate-key', {
+        method: 'POST',
+        body: JSON.stringify(key ? { telenowApiKey: key } : {}),
+      });
+      const org = r.org || r.me || r || {};
+      if (org.org_name) $('#orgName').textContent = org.org_name;
+      msg.textContent = 'Connected' + (org.org_name ? ' to ' + org.org_name : '') + '.';
+      await loadSettings();
+      await loadAgents();
+      render();
+    } catch (err) {
+      msg.textContent = 'Failed: ' + err.message;
+    }
+  }
+
+  // ── Data loading ────────────────────────────────────────────────────────────
+  async function loadSettings() {
+    const r = await api('/api/settings');
+    S.settings = r.settings;
+  }
+
+  async function loadAgents() {
+    if (!connected()) { S.agents = []; return; }
+    try {
+      const r = await api('/api/agents');
+      S.agents = r.agents || [];
+      S.missingAgents = r.missing || [];
+    } catch (err) {
+      S.agents = [];
+      if (err.code !== 'no_api_key') S.error = 'Could not load agents: ' + err.message;
+    }
+  }
+
+  async function loadCalls() {
+    if (!connected()) { S.calls = []; render(); return; }
+    const sort = $('#callSort') ? $('#callSort').value : 'newest';
+    const status = $('#callStatus') ? $('#callStatus').value : '';
+    try {
+      const q = new URLSearchParams({ limit: '50', sort });
+      if (status) q.set('status', status);
+      const r = await api('/api/calls?' + q.toString());
+      S.calls = r.calls || [];
+      S.error = '';
+    } catch (err) {
+      S.calls = [];
+      if (err.code !== 'no_api_key') S.error = 'Could not load calls: ' + err.message;
+    }
+    render();
   }
 
   async function loadLeads() {
     try {
-      const data = await api('/api/leads');
-      renderLeads(data.leads);
-    } catch (e) {
-      leadsEl.textContent = '';
-      const p = document.createElement('p');
-      p.className = 'empty';
-      p.textContent = `Failed to load leads: ${e.message}`;
-      leadsEl.appendChild(p);
+      const r = await api('/api/leads');
+      S.leads = r.leads || [];
+    } catch (err) {
+      S.leads = [];
+      S.error = 'Could not load leads: ' + err.message;
     }
   }
 
-  function collect() {
-    const automations = {};
-    automationsEl.querySelectorAll('.card[data-key]').forEach((card) => {
-      const key = card.getAttribute('data-key');
-      const get = (f) => card.querySelector(`[data-field="${f}"]`);
-      automations[key] = {
-        enabled: get('enabled').checked,
-        agentId: get('agentId').value.trim(),
-        delayMinutes: Number(get('delayMinutes').value) || 0,
-        quietHours: {
-          enabled: get('quietEnabled').checked,
-          start: get('quietStart').value.trim() || '21:00',
-          end: get('quietEnd').value.trim() || '09:00',
-          timezone: get('quietTz').value.trim() || 'Asia/Kolkata',
-        },
-      };
-    });
-    const patch = { winBackDays: Number(winBackEl.value) || 60, automations };
-    // Only send the API key if the merchant typed a new one (don't overwrite
-    // with the masked placeholder).
-    const typed = apiKeyEl.value.trim();
-    if (typed && !typed.includes('…')) patch.telenowApiKey = typed;
-    return patch;
+  async function loadProfile() {
+    try {
+      const r = await api('/api/shop');
+      S.profile = r.shop;
+      if (r.shop) {
+        $('#shopChip').hidden = false;
+        $('#shopChipName').textContent = r.shop.name || shop;
+        $('#avatar').textContent = (r.shop.name || 'TN').trim().slice(0, 2).toUpperCase();
+      }
+    } catch {
+      S.profile = null;
+    }
   }
 
-  async function load() {
-    if (!shop) {
-      qs('#saveMsg').textContent = 'Missing ?shop= — open this page from the app install link.';
-      qs('#saveMsg').className = 'msg err';
+  /** Fetch only what the current view needs, and only once unless forced. */
+  async function ensureData(view, force = false) {
+    if (view === 'agents' && (S.agents === null || force)) { await loadAgents(); render(); }
+    if (view === 'agent' && S.agentId && (S.agent === null || force)) { await loadAgent(S.agentId); }
+    if (view === 'call' && S.callId && (S.call === null || force)) { await loadCall(S.callId); }
+    if (view === 'calls' && (S.calls === null || force)) { await loadCalls(); }
+    if (view === 'leads' && (S.leads === null || force)) { await loadLeads(); render(); }
+  }
+
+  document.querySelectorAll('.nav-item').forEach((b) =>
+    b.addEventListener('click', () => go(b.dataset.view)));
+
+  // ── Welcome flow ────────────────────────────────────────────────────────────
+  async function finishWelcome(target) {
+    $('#welcome').hidden = true;
+    // Persist so it never shows again; a failure here is not worth blocking on.
+    try {
+      const r = await api('/api/onboarding/complete', { method: 'POST' });
+      if (S.settings) S.settings.onboardedAt = r.onboardedAt;
+    } catch { /* non-fatal */ }
+    if (target) go(target);
+  }
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && S.picker && S.picker.open) closePicker();
+  });
+  $('#welcomeSkip').addEventListener('click', () => finishWelcome(null));
+  $('#welcomeStart').addEventListener('click', () => finishWelcome('settings'));
+
+  // ── Boot ────────────────────────────────────────────────────────────────────
+  (async function boot() {
+    try {
+      await loadSettings();
+    } catch (err) {
+      contentEl.innerHTML = `<div class="banner err"><span>✕</span>
+        <div>Could not load the app: ${esc(err.message)}</div></div>`;
       return;
     }
-    const data = await api('/api/settings');
-    MODEL = data.settings;
-    CATALOG = data.catalog;
-    winBackEl.value = MODEL.winBackDays;
-    if (MODEL.telenowApiKeySet) apiKeyEl.placeholder = MODEL.telenowApiKey || 'key set ••••';
+
+    // Independent fetches — run them together rather than in series.
+    await Promise.all([loadProfile(), loadLeads(), loadAgents()]);
+
+    if (connected()) {
+      try {
+        const r = await api('/api/validate-key', { method: 'POST', body: '{}' });
+        const org = r.org || r.me || r || {};
+        if (org.org_name) $('#orgName').textContent = org.org_name;
+      } catch { /* the pill already reflects connection state */ }
+    }
+
     render();
-    loadLeads();
-  }
 
-  qs('#refreshLeads').addEventListener('click', loadLeads);
-
-  qs('#validateKey').addEventListener('click', async () => {
-    const key = apiKeyEl.value.trim();
-    const status = qs('#keyStatus');
-    status.textContent = 'Validating…';
-    status.className = 'msg';
-    try {
-      // Save the key first (validation happens server-side against Telenow /me).
-      const patch = key && !key.includes('…') ? { telenowApiKey: key } : {};
-      const res = await api('/api/validate-key', { method: 'POST', body: JSON.stringify(patch) });
-      status.textContent = `Connected: ${res.org_name} (role ${res.key_role})`;
-      status.className = 'msg ok';
-    } catch (e) {
-      status.textContent = `Invalid: ${e.message}`;
-      status.className = 'msg err';
+    if (!S.settings.onboardedAt) {
+      $('#welcomeSub').textContent = S.profile
+        ? `Turn events in ${S.profile.name} into real AI phone calls.`
+        : 'Turn store events into real AI phone calls.';
+      $('#welcome').hidden = false;
     }
-  });
-
-  qs('#save').addEventListener('click', async () => {
-    const btn = qs('#save');
-    const msg = qs('#saveMsg');
-    btn.disabled = true;
-    msg.textContent = 'Saving…';
-    msg.className = 'msg';
-    try {
-      const res = await api('/api/settings', { method: 'POST', body: JSON.stringify(collect()) });
-      MODEL = res.settings;
-      msg.textContent = res.hookStatus
-        ? `Saved. ${res.hookStatus}`
-        : 'Saved.';
-      msg.className = 'msg ok';
-      apiKeyEl.value = ''; // clear typed key after save
-      if (MODEL.telenowApiKeySet) apiKeyEl.placeholder = MODEL.telenowApiKey || 'key set ••••';
-    } catch (e) {
-      msg.textContent = `Error: ${e.message}`;
-      msg.className = 'msg err';
-    } finally {
-      btn.disabled = false;
-    }
-  });
-
-  load().catch((e) => {
-    qs('#saveMsg').textContent = `Failed to load: ${e.message}`;
-    qs('#saveMsg').className = 'msg err';
-  });
+  })();
 </script>

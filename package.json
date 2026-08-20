@@ -13,7 +13,8 @@
     "dev": "node --watch src/server.js",
     "roundtrip": "node test/roundtrip.mjs",
     "dev:seed": "node scripts/seed-demo.js",
-    "dev:preview": "npm run dev:seed && SHOPIFY_API_KEY=dev SHOPIFY_API_SECRET=dev HOST=http://localhost:3000 PORT=3000 node src/server.js"
+    "dev:preview": "npm run dev:seed && SHOPIFY_API_KEY=dev SHOPIFY_API_SECRET=dev HOST=http://localhost:3000 PORT=3000 node src/server.js",
+    "dev:cli": "node scripts/dev-cli.js"
   },
   "dependencies": {
     "@shopify/shopify-api": "^13.1.0",

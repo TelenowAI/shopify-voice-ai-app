@@ -55,9 +55,10 @@ export const shopify = shopifyApi({
   hostScheme: isHttps ? 'https' : 'http',
   // Library version for OAuth + webhook HMAC. Use a current supported version.
   apiVersion: ApiVersion.January25,
-  // Non-embedded: we host our own settings page at /app rather than embedding in
-  // the Shopify admin iframe. Simpler for a self-contained reference app.
-  isEmbeddedApp: false,
+  // Embedded: the settings page renders inside the Shopify admin through App
+  // Bridge, which is what gives the app its entry in the admin nav. Requires the
+  // page to send App Bridge session tokens - see verifyAnySessionToken in session.js.
+  isEmbeddedApp: true,
   logger: { level: LogSeverity.Warning },
 });
 
@@ -168,4 +169,21 @@ export async function setOrderMetafield(shop, orderId, key, value, type = 'singl
   return adminRequest(shop, 'POST', `/orders/${orderId}/metafields.json`, {
     metafield: { namespace: 'telenow', key, type, value: String(value) },
   });
+}
+
+/**
+ * Fetch the merchant shop profile for display in the embedded UI (name, owner,
+ * contact email, plan, currency, timezone). Uses the offline token stored at
+ * install, so it works without a logged-in user.
+ * @param {string} shop
+ * @returns {Promise<object>} the Admin API `shop` object
+ */
+export async function getShopProfile(shop) {
+  const fields = [
+    "id", "name", "email", "domain", "myshopify_domain", "shop_owner",
+    "plan_display_name", "currency", "iana_timezone", "country_name",
+    "phone", "primary_locale", "created_at",
+  ].join(",");
+  const data = await adminRequest(shop, "GET", "/shop.json?fields=" + encodeURIComponent(fields));
+  return data?.shop ?? null;
 }

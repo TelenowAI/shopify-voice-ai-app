@@ -19,6 +19,8 @@
 
 import crypto from 'node:crypto';
 
+import { shopify } from './shopify.js';
+
 const TTL_SECONDS = 8 * 60 * 60; // 8h
 
 function appSecret() {
@@ -92,4 +94,36 @@ export function verifySessionToken(token) {
   if (Number(expPart) < Math.floor(Date.now() / 1000)) return null; // expired
 
   return shop;
+}
+
+/**
+ * Verify either credential the settings page can present, and return the shop:
+ *
+ *   1. Our own minted token (above) - used by the standalone/new-tab flow, where
+ *      /auth/callback hands it over in the URL fragment.
+ *   2. Shopify App Bridge session token - used when the app runs embedded in the
+ *      admin. It is an HS256 JWT signed with the same app secret, so the library
+ *      validates it for us; the `dest` claim carries the shop domain.
+ *
+ * Returns null when neither validates. Async because the library JWT check is.
+ * @param {string} token
+ * @returns {Promise<string|null>}
+ */
+export async function verifyAnySessionToken(token) {
+  if (!token) return null;
+
+  const own = verifySessionToken(token);
+  if (own) return own;
+
+  try {
+    const payload = await shopify.session.decodeSessionToken(token);
+    // `dest` looks like "https://shop.myshopify.com" - strip the scheme.
+    const dest = String(payload?.dest || "");
+    const shop = dest.startsWith("https://") ? dest.slice(8) : dest;
+    // [.] instead of an escaped dot so the pattern survives any quoting.
+    const valid = new RegExp("^[a-zA-Z0-9][a-zA-Z0-9-]*[.]myshopify[.]com$");
+    return valid.test(shop) ? shop : null;
+  } catch {
+    return null;
+  }
 }

@@ -85,6 +85,13 @@ export function defaultSettings(shop) {
     shop,
     telenowApiKey: '',
     winBackDays: 60, // call customers whose last order is older than N days
+    // Telenow agent ids the merchant has explicitly added to this store.
+    // Empty by design: the Agents page starts blank and the merchant pulls in
+    // only the agents they actually want, rather than every agent in the org.
+    savedAgents: [],
+    // Set the first time the merchant finishes (or skips) the welcome flow.
+    // Null means the embedded UI should show onboarding on open.
+    onboardedAt: null,
     automations,
     updatedAt: new Date().toISOString(),
   };
@@ -158,4 +165,36 @@ export function maskKey(key) {
   if (!key) return '';
   if (key.length <= 12) return '••••';
   return `${key.slice(0, 9)}…${key.slice(-4)}`;
+}
+
+
+/** Agent ids this shop has added. Always an array. */
+export function getSavedAgents(shop) {
+  const v = getSettings(shop).savedAgents;
+  return Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x) : [];
+}
+
+/**
+ * Add an agent id. Idempotent — adding twice is a no-op rather than an error,
+ * so a double-click cannot create a duplicate row in the list.
+ * @returns {string[]} the updated list
+ */
+export function addSavedAgent(shop, agentId) {
+  const id = String(agentId || '').trim();
+  if (!id) return getSavedAgents(shop);
+  const list = getSavedAgents(shop);
+  if (list.includes(id)) return list;
+  const next = [...list, id];
+  updateSettings(shop, { savedAgents: next });
+  return next;
+}
+
+/** Remove an agent id. Idempotent. @returns {string[]} the updated list */
+export function removeSavedAgent(shop, agentId) {
+  const id = String(agentId || '').trim();
+  const list = getSavedAgents(shop);
+  if (!id || !list.includes(id)) return list;
+  const next = list.filter((x) => x !== id);
+  updateSettings(shop, { savedAgents: next });
+  return next;
 }
