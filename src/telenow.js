@@ -47,7 +47,7 @@ export class TelenowClient {
   }
 
   /** Internal: perform an authenticated JSON request. */
-  async #request(method, path, body) {
+  async #request(method, path, body, extraHeaders) {
     const url = `${this.base}${path}`;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
@@ -59,6 +59,7 @@ export class TelenowClient {
           'X-API-Key': this.apiKey, // ← auth; never log this value
           'Content-Type': 'application/json',
           Accept: 'application/json',
+          ...(extraHeaders || {}),
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: ctrl.signal,
@@ -367,6 +368,63 @@ export class TelenowClient {
       offset += 200;
     }
     return { agents: out, total: total || out.length, truncated: out.length < total };
+  }
+
+  // ── Integration connectors ─────────────────────────────────────────────────
+  // Lets this app connect the merchant's Shopify store to their Telenow
+  // workspace on their behalf, using the Admin token it already holds from the
+  // Shopify OAuth install — so the merchant never pastes a token into Telenow.
+  // Key-authed under /api/v1; writes need an owner/admin/developer key.
+
+  /** Connector catalog: what each provider needs to connect. */
+  async listIntegrationProviders() {
+    const res = await this.#request('GET', '/api/v1/integrations/providers');
+    return res?.providers ?? [];
+  }
+
+  /** One provider's connect spec (credential + setting field keys). */
+  getIntegrationProvider(providerId) {
+    if (!providerId) throw new TelenowError('getIntegrationProvider: providerId is required');
+    return this.#request('GET', '/api/v1/integrations/providers/' + encodeURIComponent(providerId));
+  }
+
+  /** Existing connections, optionally for one provider. */
+  async listConnections(providerId) {
+    const q = providerId ? '?providerId=' + encodeURIComponent(providerId) : '';
+    const res = await this.#request('GET', '/api/v1/integrations/connections' + q);
+    return res?.connections ?? [];
+  }
+
+  /**
+   * Create a connection. Verifies against the vendor before answering.
+   *
+   * A failed verification still returns 201 with status "error" — the
+   * connection exists and holds the credentials, so re-posting would only leave
+   * a second broken one behind. Fix with updateConnection instead.
+   *
+   * The Idempotency-Key matters here: a retry with the same key and body
+   * replays the original 201 rather than creating a duplicate. Honoured 24h.
+   */
+  createConnection({ providerId, label, credentials = {}, settings = {}, verify = true, idempotencyKey }) {
+    if (!providerId) throw new TelenowError('createConnection: providerId is required');
+    const headers = idempotencyKey ? { 'Idempotency-Key': String(idempotencyKey) } : undefined;
+    return this.#request('POST', '/api/v1/integrations/connections',
+      { providerId, label, credentials, settings, verify }, headers);
+  }
+
+  /**
+   * Rotate credentials or repoint settings. Partial: an omitted field keeps its
+   * stored value, and sending the mask back means "keep the stored secret".
+   */
+  updateConnection(id, patch = {}) {
+    if (!id) throw new TelenowError('updateConnection: id is required');
+    return this.#request('PATCH', '/api/v1/integrations/connections/' + encodeURIComponent(id), patch);
+  }
+
+  /** Re-run the connector's own check. Always 200 — the answer is in `ok`. */
+  testConnection(id) {
+    if (!id) throw new TelenowError('testConnection: id is required');
+    return this.#request('POST', '/api/v1/integrations/connections/' + encodeURIComponent(id) + '/test');
   }
 
   /** List the org phone numbers. */

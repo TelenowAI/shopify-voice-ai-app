@@ -375,6 +375,124 @@ app.get('/api/calls/:id/recording', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Shopify → Telenow native integration
+//
+// Telenow ships a Shopify connector that lets an agent read the store MID-CALL
+// (order.lookup, customer.lookup, product.search, checkout.create_link,
+// order.update). It needs exactly two things: the Admin API token and the store
+// domain — both of which this app already holds from its own OAuth install.
+//
+// So the merchant never pastes a Shopify token into Telenow: the moment they
+// save a valid Telenow API key here, we connect the store on their behalf.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Connect (or repair) this shop's Shopify connector in Telenow.
+ *
+ * Idempotent by design, three ways: a stable Idempotency-Key derived from the
+ * shop replays the original create; an existing connection for the same store
+ * domain is PATCHed rather than duplicated; and a 409 (already connected) is
+ * resolved by looking the connection up and updating it.
+ *
+ * @returns {Promise<{connected: boolean, connectionId?: string, status?: string,
+ *                    verified?: boolean, error?: string}>}
+ */
+async function connectShopifyIntegration(shop, client) {
+  const session = getShop(shop);
+  const accessToken = session?.accessToken;
+  if (!accessToken) return { connected: false, error: 'No Shopify access token for this shop.' };
+  // The preview/demo seed uses a dummy token; connecting it would just store a
+  // credential that fails every verification.
+  if (String(accessToken).includes('dummy')) {
+    return { connected: false, error: 'This shop has a placeholder token (preview mode).' };
+  }
+
+  const settings = { store_domain: shop };
+  const credentials = { api_token: accessToken };
+
+  try {
+    // Reuse an existing connection for this store rather than making a second.
+    const existing = (await client.listConnections('shopify'))
+      .find((c) => c?.settings?.store_domain === shop);
+    if (existing) {
+      const updated = await client.updateConnection(existing.id, { credentials, settings });
+      const conn = updated?.connection ?? updated;
+      return {
+        connected: true, connectionId: conn?.id || existing.id,
+        status: conn?.status, verified: updated?.verification?.ok !== false,
+        error: updated?.verification?.error || conn?.lastError,
+      };
+    }
+
+    const created = await client.createConnection({
+      providerId: 'shopify',
+      label: shop,
+      credentials,
+      settings,
+      // A stable key per shop: a retry replays the original 201 instead of
+      // connecting twice.
+      idempotencyKey: 'shopify-connect-' + shop,
+    });
+    const conn = created?.connection ?? created;
+    return {
+      connected: true, connectionId: conn?.id,
+      status: conn?.status,
+      // A failed verification still returns 201 — the connection exists, the
+      // credential just did not work. Surface it rather than claiming success.
+      verified: created?.verification?.ok !== false,
+      error: created?.verification?.error || conn?.lastError,
+    };
+  } catch (err) {
+    // 409 = this workspace already connects that store. Find it and update.
+    if (err?.status === 409) {
+      try {
+        const mine = (await client.listConnections('shopify'))
+          .find((c) => c?.settings?.store_domain === shop);
+        if (mine) {
+          const updated = await client.updateConnection(mine.id, { credentials, settings });
+          const conn = updated?.connection ?? updated;
+          return { connected: true, connectionId: conn?.id || mine.id, status: conn?.status,
+            verified: updated?.verification?.ok !== false };
+        }
+      } catch (e) { /* fall through to the error below */ }
+    }
+    return { connected: false, error: err.message };
+  }
+}
+
+// GET /api/integrations/shopify — current connection status for this store.
+app.get('/api/integrations/shopify', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  const client = telenowFor(shop, res);
+  if (!client) return;
+  try {
+    const conn = (await client.listConnections('shopify'))
+      .find((c) => c?.settings?.store_domain === shop) || null;
+    res.json({
+      connected: Boolean(conn),
+      connectionId: conn?.id || null,
+      status: conn?.status || null,
+      account: conn?.settings?.account || null,
+      capabilities: conn?.capabilities || [],
+      lastError: conn?.lastError || null,
+    });
+  } catch (err) {
+    telenowFail(res, err, 'integration');
+  }
+});
+
+// POST /api/integrations/shopify/connect — connect or repair on demand. The
+// same routine runs automatically when the API key is saved; this is the retry.
+app.post('/api/integrations/shopify/connect', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  const client = telenowFor(shop, res);
+  if (!client) return;
+  res.json(await connectShopifyIntegration(shop, client));
+});
+
 // GET /api/numbers — phone numbers this org has bought, for the "call from"
 // picker. An empty list is a normal state, not an error: the merchant simply
 // has not purchased a number yet, and the UI points them at Telenow to buy one.
@@ -581,6 +699,10 @@ app.post('/api/settings', async (req, res) => {
       const client = new TelenowClient(saved.telenowApiKey);
       await client.me(); // throws if invalid
       await ensureTelenowHook(shop);
+      // Same auto-connect as validate-key, for the settings-save path.
+      try {
+        await connectShopifyIntegration(shop, new TelenowClient(saved.telenowApiKey));
+      } catch (e) { /* never block saving the key on this */ }
       hookStatus = 'Telenow connected and result webhook subscribed.';
     } catch (err) {
       hookStatus = `Saved, but Telenow setup failed: ${err.message}`;
@@ -605,8 +727,23 @@ app.post('/api/validate-key', async (req, res) => {
     return;
   }
   try {
-    const me = await new TelenowClient(key).me();
-    res.json(me);
+    const client = new TelenowClient(key);
+    const me = await client.me();
+    // The key is good — now connect this Shopify store to their Telenow
+    // workspace using the Admin token we already hold, so the merchant never
+    // has to paste one into Telenow by hand.
+    //
+    // Deliberately non-fatal: a valid key must still save even if the store
+    // connection fails (a viewer-role key cannot write connections, for one).
+    let integration = null;
+    try {
+      integration = await connectShopifyIntegration(shop, client);
+      console.log(`[integration] shop=${shop} connected=${integration.connected}` +
+        (integration.error ? ` error=${integration.error}` : ''));
+    } catch (err) {
+      integration = { connected: false, error: err.message };
+    }
+    res.json({ ...me, integration });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
