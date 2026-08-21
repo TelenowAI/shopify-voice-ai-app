@@ -25,6 +25,14 @@ export const AUTOMATIONS = [
     defaultDelayMinutes: 30,
   },
   {
+    key: 'rtoRecovery',
+    label: 'Failed delivery / RTO recovery',
+    // Shopify emits nothing for a failed delivery, so this one is driven by the
+    // courier or 3PL posting to /webhooks/ndr/:token rather than a store event.
+    triggers: ['carrier NDR webhook'],
+    defaultDelayMinutes: 0,
+  },
+  {
     key: 'codConfirmation',
     label: 'COD order confirmation / RTO reduction',
     triggers: ['orders/create'],
@@ -94,6 +102,9 @@ export function defaultSettings(shop) {
     // Which ready-made templates have been set up, and the agent each made:
     //   { cod: { agentId, at }, support: { … } }
     installedTemplates: {},
+    // Secret path segment for the carrier NDR endpoint. Minted on demand so a
+    // shop that never uses RTO never gets one.
+    ndrToken: null,
     // Set the first time the merchant finishes (or skips) the welcome flow.
     // Null means the embedded UI should show onboarding on open.
     onboardedAt: null,

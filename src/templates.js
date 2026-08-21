@@ -133,7 +133,7 @@ export const TEMPLATES = [
   {
     key: 'rto',
     // Which store event fires this agent. null = no automatic trigger yet.
-    automationKey: null,
+    automationKey: 'rtoRecovery',
     icon: '📦',
     name: 'RTO Reduction',
     tagline: 'Save parcels that are about to bounce back',

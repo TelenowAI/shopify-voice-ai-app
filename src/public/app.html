@@ -463,6 +463,7 @@
     wiz: null,
     kbs: null,
     playing: null,
+    ndrUrl: null,
     agents: null,
     calls: null,
     leads: null,
@@ -1648,6 +1649,9 @@
   // Telenow workspace, wired to their Shopify connector so it can read the store
   // mid-call, and adds it to this store's agent list.
 
+  /** Templates with a guided multi-step setup. The rest are one-click. */
+  const WIZARD_TEMPLATES = new Set(['cod', 'rto']);
+
   function templateCard(t) {
     const st = (S.templateBusy || {})[t.key];
     const done = t.installed;
@@ -1669,7 +1673,7 @@
           ? `<span class="pill ok"><span class="dot"></span>Set up</span>
              <button class="btn secondary" data-open-tpl="${esc(done.agentId)}" style="flex:0 0 auto;">View agent</button>`
           : `<span class="hint" style="font-size:11.5px;">Creates an agent in Telenow</span>
-             <button class="btn" data-${t.key === 'cod' ? 'wizard' : 'setup'}-tpl="${esc(t.key)}" style="flex:0 0 auto;"${st ? ' disabled' : ''}>
+             <button class="btn" data-${WIZARD_TEMPLATES.has(t.key) ? 'wizard' : 'setup'}-tpl="${esc(t.key)}" style="flex:0 0 auto;"${st ? ' disabled' : ''}>
                ${st ? 'Setting up…' : 'Setup'}</button>`}
       </div>
     </div>`;
@@ -1970,6 +1974,94 @@
   }
 
   function wizStep2(c) {
+    return S.wiz?.key === 'rto' ? wizStep2Rto(c) : wizStep2Orders(c);
+  }
+
+  /**
+   * RTO Access step.
+   *
+   * Shopify emits nothing when a delivery fails — the event only exists at the
+   * courier — so this step is about wiring that up, not about a delay after an
+   * order. Retry policy matters too: a courier makes 2-3 attempts, and calling
+   * on only the first wastes the other chances to save the parcel.
+   */
+  function wizStep2Rto(c) {
+    const nums = (S.numbers || []).map((n) => ({ value: n.id, label: `${n.phone_number} (${n.provider || '—'})` }));
+    return `
+      <div class="card" style="margin-bottom:16px;">
+        <h2>Where failed deliveries come from</h2>
+        <p class="hint">Shopify has no failed-delivery webhook — only your courier knows. Give them this URL and they will trigger the call.</p>
+        <div class="field" style="margin-top:12px;">
+          <label>Your NDR endpoint</label>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input type="text" id="wNdrUrl" readonly value="${esc(S.ndrUrl || 'Loading…')}" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;" />
+            <button class="btn secondary" id="wNdrCopy" style="flex:0 0 auto;">Copy</button>
+          </div>
+          <div class="hint" style="margin-top:6px;">
+            Paste this into Delhivery, Shiprocket, Blue Dart, Xpressbees or Ekart as the NDR / failed-delivery webhook.
+            The URL contains a secret — treat it like a password.
+          </div>
+        </div>
+        <div class="banner" style="margin-top:10px;"><span>ℹ</span>
+          <div>We accept the usual field names (<code>order_number</code>, <code>awb</code>, <code>phone</code>, <code>reason</code>, <code>attempt</code>),
+          so most couriers work without any mapping.</div>
+        </div>
+      </div>
+
+      <div class="grid grid-2" style="margin-bottom:16px;">
+        <div class="card">
+          <h2>Retry policy</h2>
+          <p class="hint">A courier usually attempts delivery two or three times. Calling on every attempt gives you more than one chance to save the parcel.</p>
+          <div class="field" style="margin-top:8px;">
+            <label>Call on up to (attempts)</label>
+            ${selectOf('wMaxAttempts', [1,2,3].map((n) => ({ value: String(n), label: n === 1 ? 'First attempt only' : `First ${n} attempts` })), String(c.maxAttempts))}
+          </div>
+          <div class="field">
+            <label>Wait before calling (seconds)</label>
+            <input type="number" id="wDelay" min="0" max="86400" value="${esc(String(c.delaySeconds))}" />
+            <div class="hint" style="margin-top:6px;">0 calls immediately. The courier has just left, so the customer usually remembers.</div>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Quiet hours</h2>
+          <p class="hint">NDR events arrive whenever the courier syncs, often late at night. Calls inside this window are held.</p>
+          <label class="toggle" style="margin:10px 0;">
+            <input type="checkbox" id="wQuiet" ${c.quietEnabled ? 'checked' : ''} />
+            <span>Hold calls outside working hours</span>
+          </label>
+          <div class="row">
+            <div style="flex:1;"><label>From</label><input type="text" id="wQuietStart" value="${esc(c.quietStart)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
+            <div style="flex:1;"><label>To</label><input type="text" id="wQuietEnd" value="${esc(c.quietEnd)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-2">
+        <div class="card">
+          <h2>Call from</h2>
+          ${nums.length
+            ? `<p class="hint">The number the customer sees.</p>
+               ${selectOf('wFrom', nums, c.fromNumberId, { blank: "The agent's default" })}`
+            : `<div class="banner warn" style="margin-top:8px;"><span>⚠</span>
+                <div>You have no phone number yet, so outbound calls cannot be placed.</div></div>
+               <p style="margin-top:10px;"><a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">Buy a number on Telenow ↗</a></p>`}
+        </div>
+        <div class="card">
+          <h2>Transfer to a human <span class="hint" style="font-weight:400;">— optional</span></h2>
+          <p class="hint">An angry customer about a missed delivery is exactly who should reach a person.</p>
+          <div class="row" style="margin-top:8px;">
+            <div style="flex:1 1 140px;"><label>Label</label><input type="text" id="wXferLabel" value="${esc(c.transferLabel || 'support')}" /></div>
+            <div style="flex:2 1 200px;"><label>Number</label><input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="+919876543210" /></div>
+          </div>
+          <div class="field" style="margin-top:10px;">
+            <label>What the agent says</label>
+            <input type="text" id="wXferMsg" value="${esc(c.transferMessage || 'Sure, connecting you now.')}" />
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function wizStep2Orders(c) {
     const nums = (S.numbers || []).map((n) => ({ value: n.id, label: `${n.phone_number} (${n.provider || '—'})` }));
     return `
       <div class="card" style="margin-bottom:16px;">
@@ -2047,7 +2139,11 @@
         <div class="card">
           <h2>Trigger &amp; access</h2>
           <div class="kv">
-            ${kv('Fires on', 'New Cash-on-Delivery orders')}
+            ${S.wiz?.key === 'rto'
+              ? kv('Fires on', 'Courier NDR webhook — a failed delivery attempt')
+              : kv('Fires on', 'New Cash-on-Delivery orders')}
+            ${S.wiz?.key === 'rto' ? kv('Calls on', c.maxAttempts === 1 ? 'First attempt only' : `First ${c.maxAttempts} attempts`) : ''}
+            ${S.wiz?.key === 'rto' ? kv('Quiet hours', c.quietEnabled ? `${c.quietStart}–${c.quietEnd} held` : 'Off') : ''}
             ${kv('Calls after', c.delaySeconds + ' seconds')}
             ${kv('Calls from', num ? num.phone_number : "The agent's default")}
             ${kv('Store tools', c.wired ? c.capabilities.join(', ') : 'None — store not connected')}
@@ -2155,6 +2251,9 @@
       S.kbs === null ? api('/api/knowledge-bases')
         .then((r) => { S.kbs = r.knowledgeBases || []; })
         .catch(() => { S.kbs = []; }) : null,
+      // The NDR endpoint is minted on first request, so only fetch it for RTO.
+      key === 'rto' && !S.ndrUrl
+        ? api('/api/ndr-endpoint').then((r) => { S.ndrUrl = r.url; }).catch(() => null) : null,
     ]);
 
     // A wizard opened and then abandoned mid-fetch must not overwrite a newer one.
@@ -2177,6 +2276,10 @@
       delaySeconds: 60,
       fromNumberId: '',
       transferLabel: 'support', transferNumber: '', transferMessage: 'Sure, connecting you now.',
+      // RTO only: retry policy and quiet hours. NDR events land at all hours,
+      // so quiet hours default ON here where COD leaves them off.
+      maxAttempts: 2,
+      quietEnabled: true, quietStart: '21:00', quietEnd: '09:00',
       variables: tpl.variables,
       capabilities: tpl.capabilities,
       wired: Boolean(S.templates?.connected),
@@ -2216,6 +2319,10 @@
       c.transferLabel = val('#wXferLabel') ?? c.transferLabel;
       c.transferNumber = (val('#wXferNumber') ?? c.transferNumber).trim();
       c.transferMessage = val('#wXferMsg') ?? c.transferMessage;
+      c.maxAttempts = Number(val('#wMaxAttempts')) || c.maxAttempts;
+      const q = $('#wQuiet'); if (q) c.quietEnabled = q.checked;
+      c.quietStart = val('#wQuietStart') ?? c.quietStart;
+      c.quietEnd = val('#wQuietEnd') ?? c.quietEnd;
     }
   }
 
@@ -2264,6 +2371,10 @@
           systemPrompt: c.systemPrompt, opener: c.opener, speakOpener: c.speakOpener,
           knowledgeBaseId: kbId || undefined,
           delaySeconds: c.delaySeconds,
+          maxAttempts: c.maxAttempts,
+          quietHours: c.quietEnabled
+            ? { enabled: true, start: c.quietStart, end: c.quietEnd, timezone: 'Asia/Kolkata' }
+            : { enabled: false },
           fromNumberId: c.fromNumberId || undefined,
           transferDestinations: c.transferNumber
             ? [{ label: c.transferLabel || 'support', number: c.transferNumber }] : [],
@@ -2368,6 +2479,23 @@
         S.wiz.config.kbMode = b.dataset.kbmode;
         render();
       }));
+
+    const ndrCopy = $('#wNdrCopy');
+    if (ndrCopy) ndrCopy.addEventListener('click', async () => {
+      const el = $('#wNdrUrl');
+      if (!el) return;
+      try {
+        await navigator.clipboard.writeText(el.value);
+        toast('Endpoint URL copied.', 'ok');
+      } catch (e) {
+        // Clipboard access can be blocked in an iframe; select it instead so
+        // the merchant can copy manually rather than being stuck.
+        el.select();
+        toast('Press Ctrl+C to copy.', '');
+      }
+    });
+    const quiet = $('#wQuiet');
+    if (quiet) quiet.addEventListener('change', () => { collectWizard(); render(); });
 
     document.querySelectorAll('[data-play]').forEach((b) =>
       b.addEventListener('click', (ev) => { ev.stopPropagation(); playVoice(b.dataset.play); }));

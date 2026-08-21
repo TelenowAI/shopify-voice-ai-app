@@ -10,6 +10,7 @@
 // Run with: `npm start` (needs env from .env — see .env.example).
 // ─────────────────────────────────────────────────────────────────────────────
 
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -23,9 +24,10 @@ import { shopify, HOST, getShopProfile } from './shopify.js';
 import { authRouter, rootHandler } from './auth.js';
 import { shopifyWebhookRouter } from './webhooks/shopify.js';
 import { telenowWebhookRouter, ensureTelenowHook } from './webhooks/telenow.js';
+import { ndrWebhookRouter } from './webhooks/ndr.js';
 import {
   getSettings, getRedactedSettings, updateSettings, AUTOMATIONS,
-  getSavedAgents, addSavedAgent, removeSavedAgent,
+  getAutomation, getSavedAgents, addSavedAgent, removeSavedAgent,
 } from './settings.js';
 import { getShop, listLeads } from './store.js';
 import { listTemplates, getTemplate, buildAgentPayload } from './templates.js';
@@ -47,6 +49,9 @@ app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'telenow-shopif
 // Shopify HMAC and Telenow X-VoiceAI-Signature both verify over raw bytes.
 app.use('/webhooks/shopify', express.text({ type: '*/*', limit: '2mb' }), shopifyWebhookRouter);
 app.use('/telenow/webhook', express.text({ type: '*/*', limit: '2mb' }), telenowWebhookRouter);
+// Carrier NDR (failed delivery). Same raw-body treatment as the others so it
+// sits with them, though it authenticates by secret path rather than HMAC.
+app.use('/webhooks/ndr', express.text({ type: '*/*', limit: '1mb' }), ndrWebhookRouter);
 
 // ── Everything else can use JSON ──────────────────────────────────────────────
 app.use(express.json({ limit: '1mb' }));
@@ -632,6 +637,30 @@ app.post('/api/knowledge-bases', async (req, res) => {
   }
 });
 
+// GET /api/ndr-endpoint — the URL the merchant gives their courier, minting the
+// secret on first request so a shop that never sets up RTO never holds one.
+app.get('/api/ndr-endpoint', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  let token = getSettings(shop).ndrToken;
+  if (!token) {
+    token = crypto.randomBytes(32).toString('hex');
+    updateSettings(shop, { ndrToken: token });
+    console.log(`[ndr] minted endpoint token for ${shop}`);
+  }
+  res.json({ url: `${HOST}/webhooks/ndr/${token}` });
+});
+
+// POST /api/ndr-endpoint/rotate — replace the secret if it leaks.
+app.post('/api/ndr-endpoint/rotate', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  const token = crypto.randomBytes(32).toString('hex');
+  updateSettings(shop, { ndrToken: token });
+  console.log(`[ndr] rotated endpoint token for ${shop}`);
+  res.json({ url: `${HOST}/webhooks/ndr/${token}` });
+});
+
 // POST /api/voice-preview — synthesise a sample of one voice and stream the
 // audio back, so the wizard's play buttons work without the browser ever
 // holding the Telenow key.
@@ -755,6 +784,20 @@ app.post('/api/templates/:key/publish', async (req, res) => {
         agentId: agent.id,
         delaySeconds,
         fromNumberId: String(b.fromNumberId || '') || undefined,
+        // RTO only: the courier fires one NDR per attempt, and maxAttempts
+        // decides how many of those become calls.
+        filters: b.maxAttempts
+          ? { ...(getAutomation(shop, tpl.automationKey)?.filters || {}),
+              maxAttempts: Math.max(1, Number(b.maxAttempts) || 1) }
+          : undefined,
+        quietHours: b.quietHours && typeof b.quietHours === 'object'
+          ? {
+              enabled: Boolean(b.quietHours.enabled),
+              start: String(b.quietHours.start || '21:00'),
+              end: String(b.quietHours.end || '09:00'),
+              timezone: String(b.quietHours.timezone || 'Asia/Kolkata'),
+            }
+          : undefined,
       } } });
       automation = tpl.automationKey;
     }
