@@ -68,6 +68,8 @@ function defaultAutomation(def) {
     enabled: false,
     agentId: '', // Telenow agent UUID — required when enabled
     delayMinutes: def.defaultDelayMinutes ?? 0,
+    // Set by the setup wizard. Overrides delayMinutes when not null.
+    delaySeconds: null,
     // Quiet hours: don't place calls within this local window. 24h "HH:MM".
     quietHours: { enabled: false, start: '21:00', end: '09:00', timezone: 'Asia/Kolkata' },
     // Free-form filters per automation (see each automation module for usage).
@@ -89,6 +91,9 @@ export function defaultSettings(shop) {
     // Empty by design: the Agents page starts blank and the merchant pulls in
     // only the agents they actually want, rather than every agent in the org.
     savedAgents: [],
+    // Which ready-made templates have been set up, and the agent each made:
+    //   { cod: { agentId, at }, support: { … } }
+    installedTemplates: {},
     // Set the first time the merchant finishes (or skips) the welcome flow.
     // Null means the embedded UI should show onboarding on open.
     onboardedAt: null,

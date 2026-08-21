@@ -427,6 +427,103 @@ export class TelenowClient {
     return this.#request('POST', '/api/v1/integrations/connections/' + encodeURIComponent(id) + '/test');
   }
 
+  /**
+   * Create an agent. Dashboard surface — writes need an owner/admin/developer key.
+   *
+   * Request fields are camelCase (llmProvider, systemPrompt, sessionConfig);
+   * the response comes back snake_case. Returns the created agent.
+   */
+  async createAgent(payload) {
+    if (!payload?.name) throw new TelenowError('createAgent: name is required');
+    const res = await this.#request('POST', '/api/agents', payload);
+    return res?.data ?? res;
+  }
+
+  /** Soft-delete an agent. */
+  deleteAgent(id) {
+    if (!id) throw new TelenowError('deleteAgent: id is required');
+    return this.#request('DELETE', '/api/agents/' + encodeURIComponent(id));
+  }
+
+  /** Knowledge bases in the org: { id, name, description, document_count }. */
+  async listKnowledgeBases(orgId) {
+    if (!orgId) throw new TelenowError('listKnowledgeBases: orgId is required');
+    const res = await this.#request('GET', '/api/orgs/' + encodeURIComponent(orgId) + '/knowledge-bases');
+    return (res?.data ?? res)?.knowledgeBases ?? [];
+  }
+
+  /**
+   * Attach a knowledge base to an agent. The kb id goes in the PATH — a body
+   * with the id in it answers 405, because POST is only mounted on /:kbId.
+   */
+  attachKnowledgeBase(orgId, agentId, kbId) {
+    if (!orgId || !agentId || !kbId) throw new TelenowError('attachKnowledgeBase: orgId, agentId and kbId are required');
+    return this.#request('POST', '/api/orgs/' + encodeURIComponent(orgId)
+      + '/agents/' + encodeURIComponent(agentId)
+      + '/knowledge-bases/' + encodeURIComponent(kbId));
+  }
+
+  /** Create an empty knowledge base. Returns the new row (incl. its id). */
+  async createKnowledgeBase(orgId, { name, description }) {
+    if (!orgId || !name) throw new TelenowError('createKnowledgeBase: orgId and name are required');
+    const res = await this.#request('POST', '/api/orgs/' + encodeURIComponent(orgId) + '/knowledge-bases',
+      { name, description });
+    return res?.data ?? res;
+  }
+
+  /**
+   * Add a text document to a knowledge base. Embedding runs asynchronously
+   * upstream, so a fresh document is not searchable the instant this returns.
+   */
+  async createKnowledgeDocument(orgId, kbId, { title, body }) {
+    if (!orgId || !kbId || !title) throw new TelenowError('createKnowledgeDocument: orgId, kbId and title are required');
+    const res = await this.#request('POST',
+      '/api/orgs/' + encodeURIComponent(orgId) + '/knowledge-bases/' + encodeURIComponent(kbId) + '/documents',
+      { title, body: body || '' });
+    return res?.data ?? res;
+  }
+
+  /**
+   * Synthesise a short sample of one voice. Returns raw audio bytes plus the
+   * content type, NOT JSON — so it bypasses #request, which parses JSON.
+   *
+   * Upstream this is POST /api/providers/tts/{provider}/preview. It currently
+   * demands a user JWT (the handler takes an `Authed` extractor rather than the
+   * `jwt_or_api_key_auth` layer that /api/catalog uses), so an org API key gets
+   * 401. That is surfaced as a typed error rather than a generic failure, so
+   * the UI can explain it instead of just going quiet.
+   *
+   * @returns {Promise<{ bytes: Uint8Array, contentType: string }>}
+   */
+  async previewVoice({ provider, voice, text, config }) {
+    if (!provider) throw new TelenowError('previewVoice: provider is required');
+    const url = `${this.base}/api/providers/tts/${encodeURIComponent(provider)}/preview`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'X-API-Key': this.apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voice, config }),
+        signal: ctrl.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      throw new TelenowError(`Telenow voice preview failed: ${err.message}`);
+    }
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      let msg = `Telenow voice preview → ${res.status}`;
+      try { msg = JSON.parse(detail)?.error || msg; } catch { /* keep the status */ }
+      throw new TelenowError(msg, res.status, detail);
+    }
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    return { bytes, contentType: res.headers.get('content-type') || 'audio/mpeg' };
+  }
+
   /** List the org phone numbers. */
   async listNumbers() {
     const res = await this.#request("GET", "/api/v1/numbers");

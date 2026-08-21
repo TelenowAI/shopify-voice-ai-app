@@ -28,6 +28,7 @@ import {
   getSavedAgents, addSavedAgent, removeSavedAgent,
 } from './settings.js';
 import { getShop, listLeads } from './store.js';
+import { listTemplates, getTemplate, buildAgentPayload } from './templates.js';
 import { verifyAnySessionToken } from './session.js';
 import { TelenowClient } from './telenow.js';
 import { runWinBackSweep } from './automations/winBack.js';
@@ -121,6 +122,13 @@ app.get('/api/settings', async (req, res) => {
 // stored for the shop. A shop with no key yet gets 409 so the UI can prompt.
 
 /** Build a Telenow client for the shop, or write 409 and return null. */
+/** Like telenowFor, but returns null instead of answering 409 — for routes
+  * that still have something useful to render without a key. */
+function telenowForOrNull(shop) {
+  const key = getSettings(shop).telenowApiKey;
+  return key ? new TelenowClient(key) : null;
+}
+
 function telenowFor(shop, res) {
   const key = getSettings(shop).telenowApiKey;
   if (!key) {
@@ -215,12 +223,27 @@ app.post('/api/agents/saved', async (req, res) => {
 });
 
 // DELETE /api/agents/saved/:id — unlink from this store. The agent itself is
-// untouched in Telenow. Accepts an id that no longer resolves upstream, so a
-// tombstoned entry can still be cleared.
+// untouched in Telenow, so it can be added back at any time from the picker.
+// Accepts an id that no longer resolves upstream, so a tombstoned entry can
+// still be cleared.
 app.delete('/api/agents/saved/:id', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  res.json({ saved: removeSavedAgent(shop, req.params.id) });
+  const id = req.params.id;
+  const saved = removeSavedAgent(shop, id);
+
+  // If this agent came from a template, forget that too — otherwise the
+  // Templates page keeps claiming it is set up while the agent is gone from
+  // the store, and there is no way to make it again.
+  const installed = getSettings(shop).installedTemplates || {};
+  const freed = Object.entries(installed).filter(([, v]) => v?.agentId === id).map(([k]) => k);
+  if (freed.length) {
+    const next = { ...installed };
+    for (const k of freed) delete next[k];
+    updateSettings(shop, { installedTemplates: next });
+  }
+
+  res.json({ saved, freedTemplates: freed });
 });
 
 // GET /api/agents/:id — one agent with its FULL configuration, for the agent
@@ -491,6 +514,267 @@ app.post('/api/integrations/shopify/connect', async (req, res) => {
   const client = telenowFor(shop, res);
   if (!client) return;
   res.json(await connectShopifyIntegration(shop, client));
+});
+
+// GET /api/templates — the ready-made agent catalog, plus whether each is
+// already set up for this store and whether the Shopify connector is live.
+app.get('/api/templates', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  const installed = getSettings(shop).installedTemplates || {};
+  let connection = null;
+  const client = telenowForOrNull(shop);
+  if (client) {
+    try {
+      connection = (await client.listConnections('shopify'))
+        .find((c) => c?.settings?.store_domain === shop) || null;
+    } catch (e) { /* the catalog still renders without it */ }
+  }
+  res.json({
+    templates: listTemplates().map((t) => ({ ...t, installed: installed[t.key] || null })),
+    // Tools need the connector. Without it the agents still get created, but
+    // they cannot read the store mid-call — so the UI warns rather than
+    // silently producing a weaker agent.
+    connected: Boolean(connection && connection.status === 'active'),
+    connectionId: connection?.id || null,
+  });
+});
+
+// POST /api/templates/:key/setup — create this agent in Telenow, wired to the
+// store's Shopify connector, and add it to the store's agent list.
+app.post('/api/templates/:key/setup', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  const tpl = getTemplate(req.params.key);
+  if (!tpl) {
+    res.status(404).json({ error: 'unknown_template', message: 'No such template.' });
+    return;
+  }
+  const client = telenowFor(shop, res);
+  if (!client) return;
+
+  try {
+    // Connect the store first if it is not already — the tools are the point.
+    let conn = (await client.listConnections('shopify'))
+      .find((c) => c?.settings?.store_domain === shop) || null;
+    if (!conn) {
+      const r = await connectShopifyIntegration(shop, client);
+      if (r.connected) {
+        conn = (await client.listConnections('shopify'))
+          .find((c) => c?.settings?.store_domain === shop) || null;
+      }
+    }
+
+    const profile = await getShopProfile(shop).catch(() => null);
+    const payload = buildAgentPayload(tpl, shop, profile?.name, conn?.id || null);
+    const agent = await client.createAgent(payload);
+    if (!agent?.id) throw new Error('Telenow did not return an agent id.');
+
+    // Show up on the Agents page without a second step.
+    addSavedAgent(shop, agent.id);
+    const installed = { ...(getSettings(shop).installedTemplates || {}) };
+    installed[tpl.key] = { agentId: agent.id, at: new Date().toISOString() };
+    updateSettings(shop, { installedTemplates: installed });
+
+    console.log(`[template] shop=${shop} ${tpl.key} -> agent=${agent.id} tools=${payload.metadata.tools.length}`);
+    res.json({
+      agentId: agent.id,
+      name: agent.name,
+      tools: payload.metadata.tools.length,
+      // False means the agent exists but has no store tools — worth saying.
+      wired: Boolean(conn?.id),
+    });
+  } catch (err) {
+    telenowFail(res, err, 'template setup');
+  }
+});
+
+// POST /api/knowledge-bases — create one, optionally with its first document,
+// so the merchant can write their returns/COD policy without leaving the wizard.
+app.post('/api/knowledge-bases', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  const client = telenowFor(shop, res);
+  if (!client) return;
+  const name = String(req.body?.name || '').trim();
+  if (!name) {
+    res.status(400).json({ error: 'bad_request', message: 'A name is required.' });
+    return;
+  }
+  try {
+    const orgId = await orgIdFor(shop, client);
+    if (!orgId) throw new Error('Could not resolve the Telenow organization.');
+    const kb = await client.createKnowledgeBase(orgId, {
+      name,
+      description: String(req.body?.description || '').trim() || undefined,
+    });
+    if (!kb?.id) throw new Error('Telenow did not return a knowledge base id.');
+
+    // The first document is optional — a base with no content is still valid,
+    // and failing here must not lose the base that was just created.
+    let document = null;
+    const body = String(req.body?.body || '').trim();
+    if (body) {
+      try {
+        const doc = await client.createKnowledgeDocument(orgId, kb.id, {
+          title: String(req.body?.title || '').trim() || name,
+          body,
+        });
+        document = doc?.id || true;
+      } catch (err) {
+        console.error(`[kb] document add failed for ${kb.id}:`, err.message);
+      }
+    }
+    console.log(`[kb] shop=${shop} created ${kb.id} doc=${document ? 'yes' : 'no'}`);
+    res.json({ id: kb.id, name: kb.name, document });
+  } catch (err) {
+    telenowFail(res, err, 'knowledge base');
+  }
+});
+
+// POST /api/voice-preview — synthesise a sample of one voice and stream the
+// audio back, so the wizard's play buttons work without the browser ever
+// holding the Telenow key.
+//
+// The upstream endpoint currently accepts a user JWT only, so an org API key
+// gets 401. That is translated into a 501 with an explanation rather than
+// passed through as a bare auth error, because it is not the merchant's
+// credentials that are wrong — the capability simply is not exposed to keys yet.
+app.post('/api/voice-preview', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  const client = telenowFor(shop, res);
+  if (!client) return;
+
+  const provider = String(req.body?.provider || '').trim();
+  const voice = String(req.body?.voice || '').trim();
+  if (!provider) {
+    res.status(400).json({ error: 'bad_request', message: 'provider is required' });
+    return;
+  }
+  // Short and capped: a preview costs real TTS characters on every press.
+  const text = String(req.body?.text || '').trim().slice(0, 180)
+    || 'Hello, this is a quick call from your store about the order you just placed.';
+
+  try {
+    const { bytes, contentType } = await client.previewVoice({
+      provider, voice, text,
+      config: req.body?.model ? { model: String(req.body.model) } : undefined,
+    });
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(Buffer.from(bytes));
+  } catch (err) {
+    if (err?.status === 401 || err?.status === 403) {
+      res.status(501).json({
+        error: 'preview_unavailable',
+        message: 'Voice preview is not available to API keys yet. '
+          + 'Open the agent in Telenow to hear voices.',
+      });
+      return;
+    }
+    telenowFail(res, err, 'voice preview');
+  }
+});
+
+// GET /api/knowledge-bases — the org's knowledge bases, for the setup wizard.
+app.get('/api/knowledge-bases', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  const client = telenowFor(shop, res);
+  if (!client) return;
+  try {
+    const orgId = await orgIdFor(shop, client);
+    const list = orgId ? await client.listKnowledgeBases(orgId) : [];
+    res.json({ knowledgeBases: list.map((k) => ({
+      id: k.id, name: k.name, description: k.description, documents: k.document_count,
+    })) });
+  } catch (err) {
+    telenowFail(res, err, 'knowledge bases');
+  }
+});
+
+// POST /api/templates/:key/publish — the setup wizard's final step.
+//
+// Creates the agent with the merchant's chosen stack, voice, prompt and opener,
+// attaches a knowledge base if they picked one, and switches on the matching
+// automation so new orders actually trigger the call.
+app.post('/api/templates/:key/publish', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  const tpl = getTemplate(req.params.key);
+  if (!tpl) {
+    res.status(404).json({ error: 'unknown_template', message: 'No such template.' });
+    return;
+  }
+  const client = telenowFor(shop, res);
+  if (!client) return;
+  const b = req.body || {};
+
+  try {
+    // The tools are the point, so make sure the store is connected first.
+    let conn = (await client.listConnections('shopify'))
+      .find((c) => c?.settings?.store_domain === shop) || null;
+    if (!conn) {
+      const r = await connectShopifyIntegration(shop, client);
+      if (r.connected) {
+        conn = (await client.listConnections('shopify'))
+          .find((c) => c?.settings?.store_domain === shop) || null;
+      }
+    }
+
+    const profile = await getShopProfile(shop).catch(() => null);
+    const payload = buildAgentPayload(tpl, shop, profile?.name, conn?.id || null, {
+      llmProvider: b.llmProvider, llmModel: b.llmModel,
+      sttProvider: b.sttProvider, sttModel: b.sttModel,
+      ttsProvider: b.ttsProvider, ttsVoice: b.ttsVoice, ttsModel: b.ttsModel,
+      systemPrompt: b.systemPrompt, opener: b.opener, speakOpener: b.speakOpener,
+      transferDestinations: b.transferDestinations, transferMessage: b.transferMessage,
+    });
+    const agent = await client.createAgent(payload);
+    if (!agent?.id) throw new Error('Telenow did not return an agent id.');
+
+    // Knowledge base is optional and must never sink a successful publish.
+    let knowledgeBase = null;
+    if (b.knowledgeBaseId) {
+      try {
+        const orgId = await orgIdFor(shop, client);
+        await client.attachKnowledgeBase(orgId, agent.id, b.knowledgeBaseId);
+        knowledgeBase = b.knowledgeBaseId;
+      } catch (err) {
+        console.error(`[publish] KB attach failed for ${agent.id}:`, err.message);
+      }
+    }
+
+    // Switch the automation on, so an order actually triggers a call.
+    const delaySeconds = Math.max(0, Number(b.delaySeconds) || 0);
+    let automation = null;
+    if (AUTOMATIONS.some((a) => a.key === tpl.automationKey)) {
+      updateSettings(shop, { automations: { [tpl.automationKey]: {
+        enabled: b.enableAutomation !== false,
+        agentId: agent.id,
+        delaySeconds,
+        fromNumberId: String(b.fromNumberId || '') || undefined,
+      } } });
+      automation = tpl.automationKey;
+    }
+
+    addSavedAgent(shop, agent.id);
+    const installed = { ...(getSettings(shop).installedTemplates || {}) };
+    installed[tpl.key] = { agentId: agent.id, at: new Date().toISOString() };
+    updateSettings(shop, { installedTemplates: installed });
+
+    console.log(`[publish] shop=${shop} ${tpl.key} -> agent=${agent.id} ` +
+      `tools=${payload.metadata.tools.length} kb=${knowledgeBase || 'none'} delay=${delaySeconds}s`);
+    res.json({
+      agentId: agent.id, name: agent.name,
+      tools: payload.metadata.tools.length,
+      wired: Boolean(conn?.id),
+      knowledgeBase, automation, delaySeconds,
+    });
+  } catch (err) {
+    telenowFail(res, err, 'publish');
+  }
 });
 
 // GET /api/numbers — phone numbers this org has bought, for the "call from"
@@ -769,6 +1053,9 @@ function sanitizeSettingsPatch(body = {}) {
         enabled: Boolean(a.enabled),
         agentId: typeof a.agentId === 'string' ? a.agentId.trim() : '',
         delayMinutes: Math.max(0, Number(a.delayMinutes) || 0),
+        delaySeconds: a.delaySeconds == null || a.delaySeconds === ''
+          ? undefined
+          : Math.max(0, Number(a.delaySeconds) || 0),
         filters: a.filters && typeof a.filters === 'object' ? a.filters : undefined,
         quietHours: a.quietHours
           ? {
@@ -780,6 +1067,7 @@ function sanitizeSettingsPatch(body = {}) {
           : undefined,
       };
       // Drop undefined keys so updateSettings' deep-merge keeps existing values.
+      if (out.automations[def.key].delaySeconds === undefined) delete out.automations[def.key].delaySeconds;
       if (out.automations[def.key].filters === undefined) delete out.automations[def.key].filters;
       if (out.automations[def.key].quietHours === undefined) {
         delete out.automations[def.key].quietHours;

@@ -71,7 +71,12 @@ export async function placeCall(args) {
     return skip('duplicate — already attempted for this entity');
   }
 
-  const delayMs = Math.max(0, Number(cfg.delayMinutes) || 0) * 60 * 1000;
+  // delaySeconds wins when set, so a template can schedule a confirmation call
+  // a minute after the order rather than being stuck on whole minutes.
+  // delayMinutes stays the fallback so existing settings keep working.
+  const delayMs = cfg.delaySeconds != null
+    ? Math.max(0, Number(cfg.delaySeconds) || 0) * 1000
+    : Math.max(0, Number(cfg.delayMinutes) || 0) * 60 * 1000;
 
   // The actual call-placing closure (run now or after the delay).
   const fire = async () => {
@@ -130,7 +135,7 @@ export async function placeCall(args) {
       }
       fire().catch(() => {});
     }, delayMs);
-    return { placed: false, reason: `scheduled in ${cfg.delayMinutes}m` };
+    return { placed: false, reason: `scheduled in ${Math.round(delayMs / 1000)}s` };
   }
 
   const result = await fire();
