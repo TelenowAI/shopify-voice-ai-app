@@ -35,7 +35,8 @@ const DB_FILE = path.join(DATA_DIR, 'store.json');
 let db = load();
 
 function emptyDb() {
-  return { shops: {}, settings: {}, callMap: {}, hooks: {}, attempts: {}, leads: {}, leadSeq: {} };
+  return { shops: {}, settings: {}, callMap: {}, hooks: {}, attempts: {}, leads: {}, leadSeq: {},
+    fulfillments: {} };
 }
 
 function load() {
@@ -391,4 +392,107 @@ function pruneLeads(shop) {
     .sort(([, a], [, b]) => Number(b.id) - Number(a.id))
     .slice(MAX_LEADS_PER_SHOP);
   for (const [mapKey] of stale) delete db.leads[mapKey];
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fulfillment index
+//
+// The feedback sweep asks "which orders were fulfilled N days ago", and there
+// is nowhere else to get that: Shopify will not answer it cheaply, and the
+// webhook only fires once, at the moment of fulfillment. So each orders/fulfilled
+// is recorded here and the sweep reads back from it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Record that an order was fulfilled. Idempotent — Shopify retries webhooks,
+ * and the first fulfilledAt is the true one, so a repeat does not move it.
+ * @param {string} shop
+ * @param {object} rec { orderId, orderName, fulfilledAt, phone, name, total, items }
+ */
+export function recordFulfillment(shop, rec) {
+  if (!shop || !rec?.orderId) return null;
+  db.fulfillments[shop] ||= {};
+  const key = String(rec.orderId);
+  const existing = db.fulfillments[shop][key];
+  if (existing) return existing;
+  db.fulfillments[shop][key] = {
+    ...rec,
+    orderId: key,
+    fulfilledAt: rec.fulfilledAt || new Date().toISOString(),
+    calledAt: null,
+  };
+  persist();
+  return db.fulfillments[shop][key];
+}
+
+/**
+ * Orders fulfilled long enough ago to be worth calling about, for ONE purpose.
+ *
+ * Two sweeps read this index — feedback and post-purchase — and they must not
+ * both ring the same customer. So "called" is tracked per purpose, and
+ * `suppressIfCalledWithinDays` additionally hides orders another purpose called
+ * recently. Without that, a customer who rated the product on Monday gets an
+ * upsell call on Tuesday.
+ *
+ * The age window is a range, not a floor: `maxAgeDays` stops a newly-enabled
+ * sweep dredging up months of old orders, while still catching anything missed
+ * while it was paused.
+ *
+ * @param {string} shop
+ * @param {string} purpose  "feedback" | "postPurchase"
+ * @param {object} opts { days, maxAgeDays, suppressIfCalledWithinDays }
+ * @returns {Array<object>}
+ */
+export function dueForCall(shop, purpose, opts = {}) {
+  const all = db.fulfillments[shop] || {};
+  const now = Date.now();
+  const minAge = Math.max(0, Number(opts.days) || 0) * 86400000;
+  const maxAge = Math.max(minAge, Number(opts.maxAgeDays ?? 30) * 86400000);
+  const suppressMs = Math.max(0, Number(opts.suppressIfCalledWithinDays) || 0) * 86400000;
+
+  return Object.values(all).filter((f) => {
+    const calls = f.calls || {};
+    if (calls[purpose]) return false; // already done for this purpose
+
+    if (suppressMs > 0) {
+      for (const [p, ts] of Object.entries(calls)) {
+        if (p === purpose || !ts) continue;
+        if (now - new Date(ts).getTime() < suppressMs) return false;
+      }
+    }
+
+    const age = now - new Date(f.fulfilledAt).getTime();
+    return Number.isFinite(age) && age >= minAge && age <= maxAge;
+  });
+}
+
+/** Mark one order as called for a purpose so neither sweep repeats it. */
+export function markCalled(shop, orderId, purpose) {
+  const rec = db.fulfillments[shop]?.[String(orderId)];
+  if (!rec) return null;
+  rec.calls = { ...(rec.calls || {}), [purpose]: new Date().toISOString() };
+  persist();
+  return rec;
+}
+
+/** @deprecated thin wrappers kept so existing callers do not break. */
+export function dueForFeedback(shop, days, maxAgeDays = 30) {
+  return dueForCall(shop, 'feedback', { days, maxAgeDays });
+}
+export function markFeedbackCalled(shop, orderId) {
+  return markCalled(shop, orderId, 'feedback');
+}
+
+/** Drop records older than `days` so the file store does not grow forever. */
+export function pruneFulfillments(shop, days = 90) {
+  const all = db.fulfillments[shop];
+  if (!all) return 0;
+  const cutoff = Date.now() - Math.max(1, Number(days)) * 86400000;
+  let n = 0;
+  for (const [k, f] of Object.entries(all)) {
+    if (new Date(f.fulfilledAt).getTime() < cutoff) { delete all[k]; n++; }
+  }
+  if (n) persist();
+  return n;
 }

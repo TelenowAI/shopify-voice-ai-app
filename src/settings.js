@@ -63,6 +63,14 @@ export const AUTOMATIONS = [
     defaultDelayMinutes: 0,
   },
   {
+    key: 'postPurchase',
+    label: 'Post-purchase check-in',
+    // Same fulfilment sweep as reviews, a few days later, and suppressed when
+    // the feedback call already reached that customer.
+    triggers: ['scheduled (X days after fulfillment)'],
+    defaultDelayMinutes: 0,
+  },
+  {
     key: 'reviews',
     label: 'Reviews / NPS',
     triggers: ['scheduled (X days after fulfillment)'],

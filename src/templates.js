@@ -84,6 +84,20 @@ const TOOLS = {
     description: 'Create a checkout link the customer can pay on. Use only after they agree to buy.',
     handoff: 'Creating that link for you…',
   },
+  // Freshdesk. Shopify itself has no ticket resource — helpdesks are separate
+  // apps — so raising a real ticket needs a helpdesk connector.
+  'ticket.create': {
+    name: 'raise_ticket',
+    description: "Raise a support ticket for the team when the problem cannot be resolved on the call.",
+    handoff: 'Let me log this for the team…',
+  },
+  // Delivering a checkout link needs a messaging channel — a voice call cannot
+  // hand over a URL. Bound to whichever WhatsApp connector the merchant picked.
+  'whatsapp.send': {
+    name: 'send_whatsapp',
+    description: 'Send the customer a WhatsApp message, such as a checkout link they agreed to receive.',
+    handoff: 'Sending that to your WhatsApp now…',
+  },
   'order.update': {
     name: 'update_order',
     description: 'Write the outcome back onto the Shopify order as a tag or note.',
@@ -95,6 +109,9 @@ const TOOLS = {
 export const TEMPLATES = [
   {
     key: 'cod',
+    // inbound = the customer rings the store, so there is no trigger and no
+    // delay; outbound = a store event makes the agent ring the customer.
+    direction: 'outbound',
     // Which store event fires this agent. null = no automatic trigger yet.
     automationKey: 'codConfirmation',
     icon: '💵',
@@ -132,6 +149,9 @@ export const TEMPLATES = [
   },
   {
     key: 'rto',
+    // inbound = the customer rings the store, so there is no trigger and no
+    // delay; outbound = a store event makes the agent ring the customer.
+    direction: 'outbound',
     // Which store event fires this agent. null = no automatic trigger yet.
     automationKey: 'rtoRecovery',
     icon: '📦',
@@ -168,6 +188,9 @@ export const TEMPLATES = [
   },
   {
     key: 'order-confirmation',
+    // inbound = the customer rings the store, so there is no trigger and no
+    // delay; outbound = a store event makes the agent ring the customer.
+    direction: 'outbound',
     // Which store event fires this agent. null = no automatic trigger yet.
     automationKey: 'orderConfirmation',
     icon: '✅',
@@ -208,6 +231,9 @@ export const TEMPLATES = [
   },
   {
     key: 'support',
+    // inbound = the customer rings the store, so there is no trigger and no
+    // delay; outbound = a store event makes the agent ring the customer.
+    direction: 'inbound',
     // Which store event fires this agent. null = no automatic trigger yet.
     automationKey: null,
     icon: '🎧',
@@ -239,10 +265,24 @@ export const TEMPLATES = [
       '- Never promise a refund, a discount or a delivery date you cannot see in the data.',
       '- If you cannot resolve it, say a team member will call back, and end. Do not stall.',
       '- Never read out payment details, and never ask for a card number, UPI PIN or OTP.',
+      '',
+      '## Reading personal data aloud',
+      'Your tools return the full customer record — address, phone, email. There is no',
+      'redaction between the tool and you, so treat it as yours to CHECK, not to recite.',
+      '- Never volunteer an address, phone number or email. Only confirm what the caller',
+      '  has already said, or read it back when they explicitly ask you to check it.',
+      '- Confirm identity before discussing an order: ask for the order number, or the',
+      '  name and pincode. If it does not match, say you cannot find it and stop.',
+      '- Never read another order or another customer, even if a tool returns one.',
+      '- If someone calls about an order that is not theirs, refuse politely and offer to',
+      '  have a person call the account holder.',
     ].join('\n'),
   },
   {
     key: 'feedback',
+    // inbound = the customer rings the store, so there is no trigger and no
+    // delay; outbound = a store event makes the agent ring the customer.
+    direction: 'outbound',
     // Which store event fires this agent. null = no automatic trigger yet.
     automationKey: 'reviews',
     icon: '⭐',
@@ -278,8 +318,11 @@ export const TEMPLATES = [
   },
   {
     key: 'post-purchase',
+    // inbound = the customer rings the store, so there is no trigger and no
+    // delay; outbound = a store event makes the agent ring the customer.
+    direction: 'outbound',
     // Which store event fires this agent. null = no automatic trigger yet.
-    automationKey: null,
+    automationKey: 'postPurchase',
     icon: '🛍️',
     name: 'Post-Purchase',
     tagline: 'Check in after delivery, and recommend what fits',
@@ -353,6 +396,17 @@ export function buildAgentPayload(tpl, shop, storeName, connectionId, o = {}) {
         .map((cap) => ({ ...TOOLS[cap], kind: 'connector', config: { connectionId, capability: cap } }))
     : [];
 
+  // Extra capabilities chosen in the wizard. Each carries its OWN connection id,
+  // because a Freshdesk ticket runs through the Freshdesk connection, not the
+  // Shopify one.
+  for (const extra of (o.extraTools || [])) {
+    const spec = TOOLS[extra.capability];
+    if (!spec || !extra.connectionId) continue;
+    if (tools.some((t) => t.config?.capability === extra.capability)) continue;
+    tools.push({ ...spec, kind: 'connector',
+      config: { connectionId: extra.connectionId, capability: extra.capability } });
+  }
+
   // A transfer target is a native tool, not a connector one.
   const dests = (o.transferDestinations || []).filter((d) => d && d.number);
   if (dests.length) {
@@ -386,19 +440,34 @@ ${COMMON_RULES}`,
     ttsConfig: { ...STACK.ttsConfig, ...(o.ttsModel ? { model: o.ttsModel } : {}) },
     sessionConfig: SESSION,
     telephonyConfig: {
+      // Inbound and outbound read DIFFERENT keys. An inbound call reads
+      // agentMsg/firstResponse verbatim (webhooks.rs:3055 twilio, :3944 plivo);
+      // outbound paths run apply_outbound_opener(), which overwrites those two
+      // from the *Outbound pair. Both are set so the agent speaks first either
+      // way — getting this backwards gives a silent agent waiting for a caller
+      // who is waiting for it.
+      agentMsg: opener,
       agentMsgOutbound: opener,
-      // 'agent' makes the agent speak first on an outbound call.
+      firstResponse: o.speakOpener === false ? 'user' : 'agent',
       firstResponseOutbound: o.speakOpener === false ? 'user' : 'agent',
       recording: true,
     },
     metadata: {
       environment: 'staging',
-      channels: ['phone'],
+      // Must be 'telephony' (or empty). The inbound gate is
+      // `channels.is_empty() || channels.contains("telephony")` — 'phone' is
+      // neither, and an agent with it set is refused as web-only.
+      channels: ['telephony'],
       tools,
       variables: tpl.variables
         .filter((v) => v !== 'store_name')
         .map((name) => ({ name, required: false })),
       telenowShopify: { template: tpl.key, shop },
+      // Post-call analysis. The worker gates on
+      // metadata.postCallAnalysis.enabled being truthy, and a MISSING block
+      // counts as off — so the key is only written when it is switched on,
+      // rather than writing enabled:false and paying for a no-op field.
+      ...(o.postCallAnalysis ? { postCallAnalysis: { enabled: true } } : {}),
     },
   };
 }

@@ -524,6 +524,30 @@ export class TelenowClient {
     return { bytes, contentType: res.headers.get('content-type') || 'audio/mpeg' };
   }
 
+  /**
+   * Bind a number to an agent so the agent answers calls to it.
+   *
+   * Side effect worth knowing: the update also clears is_default_outbound and
+   * inbound_action on that number, so making the number the agent's outbound
+   * caller id has to happen AFTER this, not before.
+   *
+   * Throws 409 when a team member already receives inbound on the number —
+   * inbound is exclusive, and the upstream message names the fix.
+   * @param {string} numberId  voice_phone_numbers.id (not the E.164)
+   * @param {string} agentId
+   */
+  assignNumberToAgent(numberId, agentId) {
+    if (!numberId || !agentId) throw new TelenowError('assignNumberToAgent: numberId and agentId are required');
+    return this.#request('POST', '/api/voice/numbers/' + encodeURIComponent(numberId) + '/assign-agent',
+      { agentId });
+  }
+
+  /** Release a number from whatever agent answers it. */
+  unassignNumber(numberId) {
+    if (!numberId) throw new TelenowError('unassignNumber: numberId is required');
+    return this.#request('DELETE', '/api/voice/numbers/' + encodeURIComponent(numberId) + '/agent');
+  }
+
   /** List the org phone numbers. */
   async listNumbers() {
     const res = await this.#request("GET", "/api/v1/numbers");

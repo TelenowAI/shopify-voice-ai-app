@@ -10,6 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { placeCall, formatMoney, summarizeLineItems, firstName } from './_base.js';
+import { recordFulfillment } from '../store.js';
 
 const storeName = (shop) => (shop || '').replace('.myshopify.com', '');
 
@@ -46,6 +47,24 @@ export async function handleOrderConfirmation(shop, order) {
  * @param {string} shop @param {object} order
  */
 export async function handleOrderShipped(shop, order) {
+  // Index it for the feedback sweep. This happens regardless of whether the
+  // shipped-update call is enabled: the sweep needs "fulfilled at" for every
+  // order, and this webhook is the only time we learn it.
+  try {
+    recordFulfillment(shop, {
+      orderId: order.id,
+      orderName: String(order.name || order.order_number || order.id),
+      fulfilledAt: new Date().toISOString(),
+      phone: order?.phone || order?.customer?.phone || order?.shipping_address?.phone || null,
+      name: firstName(order),
+      total: order?.total_price || null,
+      currency: order?.currency || null,
+      items: summarizeLineItems(order.line_items),
+    });
+  } catch (err) {
+    console.error('[fulfillment] index failed:', err.message);
+  }
+
   const fulfillment = latestFulfillment(order);
   const trackingNumber =
     fulfillment?.tracking_number ||

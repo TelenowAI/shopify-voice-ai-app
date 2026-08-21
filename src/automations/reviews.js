@@ -16,24 +16,65 @@
 // variable-building + placeCall path so finishing it is a small change.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { listShops } from '../store.js';
+import { listShops, dueForCall, markCalled, pruneFulfillments } from '../store.js';
 import { getAutomation } from '../settings.js';
 import { placeCall } from './_base.js';
 
 /**
- * Scheduler entrypoint. Currently a no-op sweep because we don't persist
- * fulfillment dates in the file stub. Returns immediately after logging once.
+ * Scheduler entrypoint: call customers whose order was fulfilled N days ago.
+ *
+ * Reads the fulfillment index written on orders/fulfilled. Each order is called
+ * at most once — marked the moment placeCall is asked, not when it succeeds, so
+ * a failure does not put the customer in a retry loop on every sweep.
  */
 export async function runReviewsSweep() {
-  for (const { shop } of listShops()) {
+  for (const row of listShops()) {
+    const shop = typeof row === 'string' ? row : row?.shop;
+    if (!shop) continue;
     const cfg = getAutomation(shop, 'reviews');
     if (!cfg?.enabled || !cfg.agentId) continue;
-    // TODO: select orders fulfilled `cfg.filters.daysAfterFulfillment || 5` days
-    // ago from your DB and call requestReview(shop, order) for each.
-    console.log(
-      `[reviews] sweep for ${shop}: enabled but no fulfillment index yet (stub). ` +
-        `Persist fulfilledAt on orders/fulfilled to activate.`,
-    );
+
+    const days = Number(cfg.filters?.daysAfterFulfillment) || 5;
+    const maxAge = Number(cfg.filters?.maxAgeDays) || 30;
+    const minTotal = Number(cfg.filters?.minOrderValue) || 0;
+    const perSweep = Math.max(1, Number(cfg.filters?.maxPerSweep) || 25);
+
+    // Suppressed when the post-purchase call already reached this customer.
+    const suppressDays = Number(cfg.filters?.suppressDays ?? 14);
+    let due = dueForCall(shop, 'feedback', { days, maxAgeDays: maxAge, suppressIfCalledWithinDays: suppressDays });
+    // Low-value orders are not worth a call: the call can cost more than the
+    // margin on the order it is asking about.
+    if (minTotal > 0) due = due.filter((f) => (Number(f.total) || 0) >= minTotal);
+    // Cap per sweep so enabling this on a busy store does not dial hundreds at once.
+    due = due.slice(0, perSweep);
+    if (!due.length) continue;
+
+    console.log(`[reviews] ${shop}: ${due.length} order(s) due for feedback`);
+    for (const f of due) {
+      // Mark BEFORE calling. If placeCall throws, this customer is skipped
+      // rather than retried on every sweep for the rest of the window.
+      markCalled(shop, f.orderId, 'feedback');
+      try {
+        await placeCall({
+          shop,
+          automation: 'reviews',
+          entity: { phone: f.phone, name: f.name },
+          phoneOverride: f.phone,
+          identifier: `feedback:${f.orderId}`,
+          variables: {
+            customer_name: f.name || 'there',
+            order_number: f.orderName || '',
+            items: f.items || '',
+            delivered_days_ago: String(Math.max(1, Math.round(
+              (Date.now() - new Date(f.fulfilledAt).getTime()) / 86400000))),
+          },
+          mapExtra: { orderId: f.orderId, orderName: f.orderName, purpose: 'feedback' },
+        });
+      } catch (err) {
+        console.error(`[reviews] ${shop} order=${f.orderName}:`, err.message);
+      }
+    }
+    pruneFulfillments(shop, 90);
   }
 }
 

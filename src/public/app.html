@@ -359,6 +359,7 @@
     <div class="nav-section">RUN</div>
     <button class="nav-item" data-view="calls"><span class="ico">☏</span> Calls</button>
     <button class="nav-item" data-view="leads"><span class="ico">☰</span> Leads</button>
+    <button class="nav-item" data-view="escalations"><span class="ico">⚑</span> Issues</button>
 
     <div class="nav-section">ACCOUNT</div>
     <button class="nav-item" data-view="settings"><span class="ico">⚙</span> Settings</button>
@@ -464,6 +465,8 @@
     kbs: null,
     playing: null,
     ndrUrl: null,
+    integrations: null,
+    escalations: null,
     agents: null,
     calls: null,
     leads: null,
@@ -1650,7 +1653,7 @@
   // mid-call, and adds it to this store's agent list.
 
   /** Templates with a guided multi-step setup. The rest are one-click. */
-  const WIZARD_TEMPLATES = new Set(['cod', 'rto']);
+  const WIZARD_TEMPLATES = new Set(['cod', 'rto', 'support', 'feedback', 'post-purchase']);
 
   function templateCard(t) {
     const st = (S.templateBusy || {})[t.key];
@@ -1970,12 +1973,444 @@
             ? selectOf('wKb', kbs, c.knowledgeBaseId, { blank: 'None' })
             : `<div class="banner warn"><span>⚠</span>
                 <div>No knowledge bases in your workspace yet. Switch to <b>Write a new one</b> to create your first.</div></div>`)}
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h2>Post-call analysis <span class="hint" style="font-weight:400;">— optional</span></h2>
+        <label class="toggle" style="margin-top:10px;">
+          <input type="checkbox" id="wAnalysis" ${c.postCallAnalysis ? 'checked' : ''} />
+          <span>Analyse every call after it ends</span>
+        </label>
+        <div class="hint" style="margin:8px 0 0 26px;">
+          After each call, an AI reads the transcript and works out what actually happened —
+          a short summary, the customer's sentiment, and a disposition such as
+          <code>answered</code> or <code>no-answer</code>. That is what fills the
+          <b>Outcome</b> column on the Calls page and what your automations write back
+          onto the order.
+          <br /><br />
+          <b>Off by default because it is billed per call</b>, on top of the call itself.
+          Leave it off while you are testing; switch it on once the calls are real and you
+          want to know how they went without listening to each one.
+        </div>
       </div>`;
   }
 
   function wizStep2(c) {
-    return S.wiz?.key === 'rto' ? wizStep2Rto(c) : wizStep2Orders(c);
+    const k = S.wiz?.key;
+    if (k === 'rto') return wizStep2Rto(c);
+    if (k === 'support') return wizStep2Support(c);
+    if (k === 'feedback') return wizStep2Feedback(c);
+    if (k === 'post-purchase') return wizStep2PostPurchase(c);
+    return wizStep2Orders(c);
   }
+
+  /**
+   * Support Access step.
+   *
+   * Support is INBOUND — the customer rings the store — so there is no trigger,
+   * no delay and no quiet hours. The questions that matter instead are: which
+   * number reaches this agent, when does it hand over to a person, and what is
+   * it allowed to say.
+   *
+   * Deliberately absent: a business-hours picker. Telenow has no time gate on
+   * the inbound path (plan_inbound reads no clock), so an hours control here
+   * would be a switch that does nothing. The card says so instead.
+   */
+  function wizStep2Support(c) {
+    const freshdesk = (S.integrations || []).find((x) => x.providerId === 'freshdesk' && x.status === 'active');
+    const nums = (S.numbers || []);
+    const taken = nums.filter((n) => n.agent_id && n.id === c.inboundNumberId);
+    return `
+      <div class="card" style="margin-bottom:16px;">
+        <h2>Which number reaches this agent</h2>
+        <p class="hint">Customers ring this number and the agent answers. One agent per number — assigning replaces whoever answers it today.</p>
+        ${nums.length
+          ? `<div class="field" style="margin-top:12px;">
+               <label>Inbound number</label>
+               ${selectOf('wInbound', nums.map((n) => ({
+                 value: n.id,
+                 label: `${n.phone_number} (${n.provider || '—'})${n.agent_id ? ' — currently answered by another agent' : ''}`,
+               })), c.inboundNumberId, { blank: 'Do not assign a number yet' })}
+               <div class="hint" style="margin-top:6px;">
+                 Numbers bought through Telenow need no carrier setup. Leave this unset and the agent is created but unreachable by phone.
+               </div>
+             </div>
+             ${taken.length ? `<div class="banner warn" style="margin-top:10px;"><span>⚠</span>
+               <div>That number already answers with a different agent. Publishing will move it to this one.</div></div>` : ''}`
+          : `<div class="banner warn" style="margin-top:10px;"><span>⚠</span>
+              <div>You have no phone number, so customers have no way to reach this agent.</div></div>
+             <p style="margin-top:10px;">
+               <a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">Buy a number on Telenow ↗</a>
+             </p>`}
+      </div>
+
+      <div class="grid grid-2" style="margin-bottom:16px;">
+        <div class="card">
+          <h2>Availability</h2>
+          <div class="banner" style="margin-top:6px;"><span>ℹ</span>
+            <div>This agent answers <b>24 hours a day</b>. Telenow has no business-hours setting for inbound calls, so there is no switch here that could change that.</div>
+          </div>
+          <p class="hint" style="margin-top:10px;">
+            If you only want it live during working hours, either unassign the number outside them,
+            or tell it the hours in the Context step so it can say when the team is back.
+          </p>
+          <label class="toggle" style="margin-top:12px;">
+            <input type="checkbox" id="wStateHours" ${c.stateHours ? 'checked' : ''} />
+            <span>Mention working hours when it cannot resolve something</span>
+          </label>
+          <input type="text" id="wHoursText" value="${esc(c.hoursText || '')}"
+                 placeholder="Mon–Sat, 10am to 7pm" ${c.stateHours ? '' : 'disabled'} />
+        </div>
+
+        <div class="card">
+          <h2>Hand over to a person</h2>
+          <p class="hint">Support is the one agent that genuinely needs an exit. A caller who asks for a human should get one.</p>
+          <div class="row" style="margin-top:8px;">
+            <div style="flex:1 1 140px;"><label>Label</label>
+              <input type="text" id="wXferLabel" value="${esc(c.transferLabel || 'support')}" /></div>
+            <div style="flex:2 1 200px;"><label>Number</label>
+              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="+919876543210" /></div>
+          </div>
+          <div class="field" style="margin-top:10px;">
+            <label>What the agent says</label>
+            <input type="text" id="wXferMsg" value="${esc(c.transferMessage || 'Sure, connecting you now.')}" />
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <h2>What it can look up</h2>
+        <p class="hint">Read-only. None of these change anything in your store.</p>
+        <div class="kv" style="margin-top:10px;">
+          ${kv('Orders', 'Status, items, totals, delivery — by order number')}
+          ${kv('Customers', 'Finds the caller by their phone number')}
+          ${kv('Products', 'Price and availability from your catalogue')}
+          ${kv('Live access', c.wired ? 'Connected' : 'Not connected — it will have no store data')}
+        </div>
+        <div class="banner warn" style="margin-top:12px;"><span>⚠</span>
+          <div><b>These tools return the full customer record</b> — address, phone, email — with no redaction.
+          The agent is instructed to confirm identity first and never volunteer personal details,
+          but read the Context step if you want to tighten that further.</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <h2>When it cannot resolve something</h2>
+        <p class="hint">Shopify has no support tickets of its own, so there are two ways to make sure nothing is dropped.</p>
+        <label class="toggle" style="margin-top:12px;">
+          <input type="checkbox" id="wLogOrder" ${c.logOnOrder ? 'checked' : ''} />
+          <span>Log it on the Shopify order as a note and tag</span>
+        </label>
+        <div class="hint" style="margin:2px 0 14px 26px;">Native to Shopify. Your team sees it on the order itself — no extra tool needed.</div>
+
+        <label class="toggle">
+          <input type="checkbox" id="wTicket" ${c.raiseTicket ? 'checked' : ''} />
+          <span>Raise a Freshdesk ticket</span>
+        </label>
+        <div class="hint" style="margin:2px 0 0 26px;">A real ticket with an owner and an SLA. Freshdesk is the only connected helpdesk that exposes ticket creation.</div>
+        ${c.raiseTicket ? (freshdesk
+          ? `<div class="banner" style="margin-top:12px;border-color:var(--ok);"><span>✓</span>
+              <div>Freshdesk is connected${freshdesk.label ? ' (' + esc(freshdesk.label) + ')' : ''} — tickets will be raised there.</div></div>`
+          : `<div style="margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:10px;">
+              <div class="hint" style="margin-bottom:10px;">Freshdesk is not connected yet. Add it here and it is wired up on publish.</div>
+              <div class="row">
+                <div style="flex:1 1 180px;"><label>Freshdesk domain</label>
+                  <input type="text" id="wFdDomain" value="${esc(c.fdDomain || '')}" placeholder="yourcompany.freshdesk.com" /></div>
+                <div style="flex:1 1 180px;"><label>API key</label>
+                  <input type="password" id="wFdKey" value="${esc(c.fdKey || '')}" placeholder="Freshdesk → Profile → API key" /></div>
+              </div>
+            </div>`) : ''}
+      </div>
+
+      <div class="card">
+        <h2>Boundaries</h2>
+        <p class="hint">Things a support agent should never decide on its own. Each adds a rule to its instructions.</p>
+        <div style="margin-top:10px;">
+          <label class="toggle" style="margin-bottom:8px;">
+            <input type="checkbox" id="wNoRefund" ${c.noRefund ? 'checked' : ''} />
+            <span>Never promise a refund or its amount</span>
+          </label>
+          <label class="toggle" style="margin-bottom:8px;">
+            <input type="checkbox" id="wNoDiscount" ${c.noDiscount ? 'checked' : ''} />
+            <span>Never offer a discount or a free replacement</span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="wNoDate" ${c.noDate ? 'checked' : ''} />
+            <span>Never promise a delivery date the order does not show</span>
+          </label>
+        </div>
+      </div>`;
+  }
+
+
+  /**
+   * Product Feedback Access step.
+   *
+   * The only template driven by a scheduled SWEEP rather than an event. Shopify
+   * fires orders/fulfilled once, at dispatch, and never tells you the parcel
+   * arrived — so "N days after fulfilment" is the closest honest proxy for
+   * "after they have had it a while", and the wizard says so rather than
+   * claiming to know about delivery.
+   *
+   * The value here is catching an unhappy customer BEFORE the public review, so
+   * the volume controls matter: call too early and they have not opened the box,
+   * call everyone and you spend more than the orders were worth.
+   */
+  function wizStep2Feedback(c) {
+    const nums = (S.numbers || []).map((n) => ({ value: n.id, label: `${n.phone_number} (${n.provider || '—'})` }));
+    // The sweep runs on the scheduler's cadence, so the wait is approximate.
+    const sweepHours = 6;
+    return `
+      <div class="card" style="margin-bottom:16px;">
+        <h2>When to call</h2>
+        <p class="hint">
+          Shopify tells us when an order <b>ships</b>, never when it arrives — there is no delivery webhook.
+          So the wait is counted from dispatch, and should cover your usual delivery time plus a few days of use.
+        </p>
+        <div class="row" style="margin-top:12px;">
+          <div style="flex:1 1 200px;">
+            <label>Call this many days after dispatch</label>
+            <input type="number" id="wFbDays" min="1" max="60" value="${esc(String(c.daysAfter))}" />
+            <div class="hint" style="margin-top:6px;">
+              7 is a good default in India: 3–5 days to arrive, a couple of days to actually use it.
+            </div>
+          </div>
+          <div style="flex:1 1 200px;">
+            <label>Ignore orders older than (days)</label>
+            <input type="number" id="wFbMaxAge" min="7" max="120" value="${esc(String(c.maxAgeDays))}" />
+            <div class="hint" style="margin-top:6px;">
+              Stops the first sweep phoning everyone you ever shipped to.
+            </div>
+          </div>
+        </div>
+        <div class="banner" style="margin-top:12px;"><span>ℹ</span>
+          <div>Orders are checked every ${esc(String(sweepHours))} hours, so a call goes out within that window of becoming due.</div>
+        </div>
+      </div>
+
+      <div class="grid grid-2" style="margin-bottom:16px;">
+        <div class="card">
+          <h2>Who to call</h2>
+          <p class="hint">Feedback calls cost the same as any other. Spend them where the answer is worth something.</p>
+          <div class="field" style="margin-top:8px;">
+            <label>Only orders worth at least</label>
+            <input type="number" id="wFbMinValue" min="0" value="${esc(String(c.minOrderValue))}" />
+            <div class="hint" style="margin-top:6px;">
+              In your store currency. 0 calls everyone — on a low-value order the call can cost more than the margin.
+            </div>
+          </div>
+          <div class="field">
+            <label>Most calls per sweep</label>
+            <input type="number" id="wFbMaxPer" min="1" max="200" value="${esc(String(c.maxPerSweep))}" />
+            <div class="hint" style="margin-top:6px;">
+              A ceiling, so switching this on does not dial your whole backlog at once.
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Quiet hours</h2>
+          <p class="hint">Nothing about this call is urgent, so it should never be the reason someone's evening is interrupted.</p>
+          <label class="toggle" style="margin:10px 0;">
+            <input type="checkbox" id="wQuiet" ${c.quietEnabled ? 'checked' : ''} />
+            <span>Hold calls outside these hours</span>
+          </label>
+          <div class="row">
+            <div style="flex:1;"><label>From</label>
+              <input type="text" id="wQuietStart" value="${esc(c.quietStart)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
+            <div style="flex:1;"><label>To</label>
+              <input type="text" id="wQuietEnd" value="${esc(c.quietEnd)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <h2>What happens with the answer</h2>
+        <p class="hint">The score is only useful if it goes somewhere. Both of these write back onto the Shopify order.</p>
+        <label class="toggle" style="margin-top:10px;">
+          <input type="checkbox" id="wFbTag" ${c.tagOrder ? 'checked' : ''} />
+          <span>Tag the order with the score</span>
+        </label>
+        <div class="hint" style="margin:2px 0 12px 26px;">
+          <code>telenow-feedback-5</code> and the verbatim as an order note, so it is searchable later.
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="wFbFlagLow" ${c.flagLow ? 'checked' : ''} />
+          <span>Flag low scores for a human</span>
+        </label>
+        <div class="hint" style="margin:2px 0 0 26px;">
+          Three or below is tagged <code>telenow-feedback-low</code> and appears on the
+          <b>Issues</b> page. This is the point of the call — reaching an unhappy customer
+          before the review is public.
+        </div>
+      </div>
+
+      <div class="grid grid-2">
+        <div class="card">
+          <h2>Call from</h2>
+          ${nums.length
+            ? `<p class="hint">The number the customer sees.</p>
+               ${selectOf('wFrom', nums, c.fromNumberId, { blank: "The agent's default" })}`
+            : `<div class="banner warn" style="margin-top:8px;"><span>⚠</span>
+                <div>You have no phone number yet, so outbound calls cannot be placed.</div></div>
+               <p style="margin-top:10px;"><a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">Buy a number on Telenow ↗</a></p>`}
+        </div>
+        <div class="card">
+          <h2>Transfer to a human <span class="hint" style="font-weight:400;">— optional</span></h2>
+          <p class="hint">Rare on a feedback call, but a customer with a real complaint should not be told to call back.</p>
+          <div class="row" style="margin-top:8px;">
+            <div style="flex:1 1 140px;"><label>Label</label>
+              <input type="text" id="wXferLabel" value="${esc(c.transferLabel || 'support')}" /></div>
+            <div style="flex:2 1 200px;"><label>Number</label>
+              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="+919876543210" /></div>
+          </div>
+          <div class="field" style="margin-top:10px;">
+            <label>What the agent says</label>
+            <input type="text" id="wXferMsg" value="${esc(c.transferMessage || 'Sure, connecting you now.')}" />
+          </div>
+        </div>
+      </div>`;
+  }
+
+
+  /**
+   * Post-Purchase Access step.
+   *
+   * Shares the fulfilment sweep with Product Feedback, so the first thing this
+   * step has to solve is not double-calling. The second is the cross-sell: it is
+   * the only template that can spend the customer's money, and a voice call
+   * cannot hand over a URL — so the link needs a messaging channel or it is
+   * useless.
+   */
+  function wizStep2PostPurchase(c) {
+    const nums = (S.numbers || []).map((n) => ({ value: n.id, label: `${n.phone_number} (${n.provider || '—'})` }));
+    // Only connectors that can actually deliver a link.
+    const waConns = (S.integrations || [])
+      .filter((x) => x.status === 'active' && (x.capabilities || []).includes('whatsapp.send'))
+      .map((x) => ({ value: x.id, label: `${x.label || x.providerId}` }));
+    const feedbackOn = Boolean((S.templates?.templates || []).find((t) => t.key === 'feedback')?.installed);
+
+    return `
+      <div class="card" style="margin-bottom:16px;">
+        <h2>When to call</h2>
+        <p class="hint">
+          Counted from dispatch — Shopify has no delivery webhook. Later than the feedback call,
+          so they have actually lived with the product before you suggest another one.
+        </p>
+        <div class="row" style="margin-top:12px;">
+          <div style="flex:1 1 200px;">
+            <label>Call this many days after dispatch</label>
+            <input type="number" id="wPpDays" min="1" max="60" value="${esc(String(c.daysAfter))}" />
+          </div>
+          <div style="flex:1 1 200px;">
+            <label>Ignore orders older than (days)</label>
+            <input type="number" id="wPpMaxAge" min="7" max="120" value="${esc(String(c.maxAgeDays))}" />
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <h2>Do not call the same customer twice</h2>
+        <p class="hint">
+          Product Feedback calls the same orders from the same list. Without a gap, someone who
+          rated the product on Monday gets an upsell call on Tuesday.
+        </p>
+        <div class="field" style="margin-top:12px;">
+          <label>Skip if another agent called them in the last (days)</label>
+          <input type="number" id="wPpSuppress" min="0" max="60" value="${esc(String(c.suppressDays))}" />
+          <div class="hint" style="margin-top:6px;">0 turns this off. 14 is sensible if you run both.</div>
+        </div>
+        ${feedbackOn
+          ? `<div class="banner" style="margin-top:10px;"><span>ℹ</span>
+              <div>Product Feedback is set up and calls the same orders, so keep this above zero.</div></div>`
+          : ''}
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <h2>Recommend another product</h2>
+        <p class="hint">The one template that can spend the customer's money. Off means it only checks in.</p>
+        <label class="toggle" style="margin-top:10px;">
+          <input type="checkbox" id="wPpCross" ${c.crossSell ? 'checked' : ''} />
+          <span>Suggest one related product when the call is going well</span>
+        </label>
+
+        ${c.crossSell ? `
+          <div style="margin-top:14px;padding:13px;border:1px solid var(--line);border-radius:10px;">
+            <div class="field">
+              <label>Send the checkout link over</label>
+              ${waConns.length
+                ? selectOf('wPpWa', waConns, c.waConnectionId, { blank: 'Read it out only — do not send' })
+                : `<div class="banner warn"><span>⚠</span>
+                    <div>No WhatsApp connector is active, so a link cannot be delivered.
+                    The agent can still read a short code aloud, but a URL over the phone rarely survives.
+                    Connect WhatsApp in Telenow → Integrations to enable this.</div></div>`}
+              ${waConns.length ? `<div class="hint" style="margin-top:6px;">
+                A voice call cannot hand over a URL — without a channel the link is created and never arrives.
+              </div>` : ''}
+            </div>
+            <div class="banner" style="margin-top:10px;"><span>✓</span>
+              <div><b>Checkout links are always confirmed.</b> Telenow forces the agent to read the item
+              and price back and wait for a spoken yes before creating one — that is not a setting you can turn off.</div>
+            </div>
+          </div>` : ''}
+      </div>
+
+      <div class="grid grid-2" style="margin-bottom:16px;">
+        <div class="card">
+          <h2>Who to call</h2>
+          <div class="field" style="margin-top:8px;">
+            <label>Only orders worth at least</label>
+            <input type="number" id="wPpMinValue" min="0" value="${esc(String(c.minOrderValue))}" />
+            <div class="hint" style="margin-top:6px;">An upsell call needs margin behind it to be worth placing.</div>
+          </div>
+          <div class="field">
+            <label>Most calls per sweep</label>
+            <input type="number" id="wPpMaxPer" min="1" max="200" value="${esc(String(c.maxPerSweep))}" />
+          </div>
+        </div>
+        <div class="card">
+          <h2>Quiet hours</h2>
+          <p class="hint">A sales-flavoured call at the wrong hour costs you the customer, not just the call.</p>
+          <label class="toggle" style="margin:10px 0;">
+            <input type="checkbox" id="wQuiet" ${c.quietEnabled ? 'checked' : ''} />
+            <span>Hold calls outside these hours</span>
+          </label>
+          <div class="row">
+            <div style="flex:1;"><label>From</label>
+              <input type="text" id="wQuietStart" value="${esc(c.quietStart)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
+            <div style="flex:1;"><label>To</label>
+              <input type="text" id="wQuietEnd" value="${esc(c.quietEnd)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-2">
+        <div class="card">
+          <h2>Call from</h2>
+          ${nums.length
+            ? `<p class="hint">The number the customer sees.</p>
+               ${selectOf('wFrom', nums, c.fromNumberId, { blank: "The agent's default" })}`
+            : `<div class="banner warn" style="margin-top:8px;"><span>⚠</span>
+                <div>You have no phone number yet, so outbound calls cannot be placed.</div></div>
+               <p style="margin-top:10px;"><a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">Buy a number on Telenow ↗</a></p>`}
+        </div>
+        <div class="card">
+          <h2>Transfer to a human <span class="hint" style="font-weight:400;">— optional</span></h2>
+          <p class="hint">If the check-in surfaces a real problem, the agent should hand over rather than sell.</p>
+          <div class="row" style="margin-top:8px;">
+            <div style="flex:1 1 140px;"><label>Label</label>
+              <input type="text" id="wXferLabel" value="${esc(c.transferLabel || 'support')}" /></div>
+            <div style="flex:2 1 200px;"><label>Number</label>
+              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="+919876543210" /></div>
+          </div>
+          <div class="field" style="margin-top:10px;">
+            <label>What the agent says</label>
+            <input type="text" id="wXferMsg" value="${esc(c.transferMessage || 'Sure, connecting you now.')}" />
+          </div>
+        </div>
+      </div>`;
+  }
+
 
   /**
    * RTO Access step.
@@ -2134,12 +2569,29 @@
             ${kv('Voice', voice ? [voice.name, voice.language, voice.gender].filter(Boolean).join(' · ') : (c.ttsVoice || 'default'))}
             ${kv('Knowledge base', c.kbMode === 'new' && (c.kbName || '').trim()
               ? c.kbName.trim() + ' (new)' : (kb ? kb.name : 'None'))}
+            ${kv('Post-call analysis', c.postCallAnalysis ? 'On — billed per call' : 'Off')}
           </div>
         </div>
         <div class="card">
           <h2>Trigger &amp; access</h2>
           <div class="kv">
-            ${S.wiz?.key === 'rto'
+            ${S.wiz?.key === 'support' ? kv('Answers on',
+              (S.numbers || []).find((n) => n.id === c.inboundNumberId)?.phone_number
+                || 'No number assigned — unreachable by phone') : ''}
+            ${S.wiz?.key === 'support' ? kv('Available', '24 hours — Telenow has no inbound hours setting') : ''}
+            ${S.wiz?.key === 'post-purchase' ? kv('Calls', c.daysAfter + ' days after dispatch, up to ' + c.maxPerSweep + ' per sweep') : ''}
+            ${S.wiz?.key === 'post-purchase' ? kv('Skips', c.suppressDays > 0 ? 'anyone called in the last ' + c.suppressDays + ' days' : 'nobody — suppression off') : ''}
+            ${S.wiz?.key === 'post-purchase' ? kv('Cross-sell', c.crossSell
+              ? (c.waConnectionId ? 'On, link sent over WhatsApp' : 'On, link read out only')
+              : 'Off — check-in only') : ''}
+            ${S.wiz?.key === 'feedback' ? kv('Calls', c.daysAfter + ' days after dispatch, up to ' + c.maxPerSweep + ' per sweep') : ''}
+            ${S.wiz?.key === 'feedback' ? kv('Only orders over', c.minOrderValue > 0 ? String(c.minOrderValue) : 'Any value') : ''}
+            ${S.wiz?.key === 'feedback' ? kv('Low scores', c.flagLow ? 'Tagged and shown on Issues' : 'Not flagged') : ''}
+            ${S.wiz?.key === 'support' ? kv('Unresolved calls', [c.logOnOrder && 'logged on the order',
+              c.raiseTicket && 'Freshdesk ticket'].filter(Boolean).join(' + ') || 'Nothing recorded') : ''}
+            ${S.wiz?.key === 'support' ? kv('Boundaries', [c.noRefund && 'no refunds', c.noDiscount && 'no discounts',
+              c.noDate && 'no delivery promises'].filter(Boolean).join(', ') || 'None set') : ''}
+            ${S.wiz?.key === 'support' ? '' : S.wiz?.key === 'rto'
               ? kv('Fires on', 'Courier NDR webhook — a failed delivery attempt')
               : kv('Fires on', 'New Cash-on-Delivery orders')}
             ${S.wiz?.key === 'rto' ? kv('Calls on', c.maxAttempts === 1 ? 'First attempt only' : `First ${c.maxAttempts} attempts`) : ''}
@@ -2252,6 +2704,9 @@
         .then((r) => { S.kbs = r.knowledgeBases || []; })
         .catch(() => { S.kbs = []; }) : null,
       // The NDR endpoint is minted on first request, so only fetch it for RTO.
+      (key === 'support' || key === 'post-purchase') && S.integrations === null
+        ? api('/api/integrations').then((r) => { S.integrations = r.connections || []; })
+            .catch(() => { S.integrations = []; }) : null,
       key === 'rto' && !S.ndrUrl
         ? api('/api/ndr-endpoint').then((r) => { S.ndrUrl = r.url; }).catch(() => null) : null,
     ]);
@@ -2273,11 +2728,24 @@
       speakOpener: true,
       knowledgeBaseId: '',
       kbMode: 'pick', kbName: '', kbBody: '',
+      // Off by default: it is a billed extra, so it should be a deliberate choice.
+      postCallAnalysis: false,
       delaySeconds: 60,
       fromNumberId: '',
       transferLabel: 'support', transferNumber: '', transferMessage: 'Sure, connecting you now.',
       // RTO only: retry policy and quiet hours. NDR events land at all hours,
       // so quiet hours default ON here where COD leaves them off.
+      // Support only: inbound number, spoken hours, and the scope toggles.
+      inboundNumberId: '', stateHours: false, hoursText: '',
+      // Escalation: the Shopify-native path is on by default because it needs
+      // nothing extra; the helpdesk path is opt-in.
+      logOnOrder: true, raiseTicket: false, fdDomain: '', fdKey: '',
+      noRefund: true, noDiscount: true, noDate: true,
+      // Feedback only: sweep window, volume caps and score handling.
+      daysAfter: 7, maxAgeDays: 30, minOrderValue: 0, maxPerSweep: 25,
+      // Post-purchase only: it runs after feedback and suppresses against it.
+      suppressDays: 14, crossSell: true, waConnectionId: '',
+      tagOrder: true, flagLow: true,
       maxAttempts: 2,
       quietEnabled: true, quietStart: '21:00', quietEnd: '09:00',
       variables: tpl.variables,
@@ -2312,6 +2780,7 @@
       c.knowledgeBaseId = val('#wKb') ?? c.knowledgeBaseId;
       c.kbName = val('#wKbName') ?? c.kbName;
       c.kbBody = val('#wKbBody') ?? c.kbBody;
+      const an = $('#wAnalysis'); if (an) c.postCallAnalysis = an.checked;
     } else if (w.step === 1) {
       const d = Number(val('#wDelay'));
       c.delaySeconds = Number.isFinite(d) && d >= 0 ? Math.round(d) : c.delaySeconds;
@@ -2319,6 +2788,32 @@
       c.transferLabel = val('#wXferLabel') ?? c.transferLabel;
       c.transferNumber = (val('#wXferNumber') ?? c.transferNumber).trim();
       c.transferMessage = val('#wXferMsg') ?? c.transferMessage;
+      c.inboundNumberId = val('#wInbound') ?? c.inboundNumberId;
+      c.fdDomain = val('#wFdDomain') ?? c.fdDomain;
+      c.fdKey = val('#wFdKey') ?? c.fdKey;
+      for (const [id, key] of [['#wLogOrder','logOnOrder'],['#wTicket','raiseTicket']]) {
+        const el = $(id); if (el) c[key] = el.checked;
+      }
+      c.hoursText = val('#wHoursText') ?? c.hoursText;
+      for (const [id, key] of [['#wStateHours','stateHours'],['#wNoRefund','noRefund'],
+        ['#wNoDiscount','noDiscount'],['#wNoDate','noDate']]) {
+        const el = $(id); if (el) c[key] = el.checked;
+      }
+      for (const [id, key, min] of [['#wPpDays','daysAfter',1],['#wPpMaxAge','maxAgeDays',7],
+        ['#wPpMinValue','minOrderValue',0],['#wPpMaxPer','maxPerSweep',1],['#wPpSuppress','suppressDays',0]]) {
+        const v = Number(val(id));
+        if (Number.isFinite(v) && v >= min) c[key] = Math.round(v);
+      }
+      c.waConnectionId = val('#wPpWa') ?? c.waConnectionId;
+      const cs = $('#wPpCross'); if (cs) c.crossSell = cs.checked;
+      for (const [id, key, min] of [['#wFbDays','daysAfter',1],['#wFbMaxAge','maxAgeDays',7],
+        ['#wFbMinValue','minOrderValue',0],['#wFbMaxPer','maxPerSweep',1]]) {
+        const v = Number(val(id));
+        if (Number.isFinite(v) && v >= min) c[key] = Math.round(v);
+      }
+      for (const [id, key] of [['#wFbTag','tagOrder'],['#wFbFlagLow','flagLow']]) {
+        const el = $(id); if (el) c[key] = el.checked;
+      }
       c.maxAttempts = Number(val('#wMaxAttempts')) || c.maxAttempts;
       const q = $('#wQuiet'); if (q) c.quietEnabled = q.checked;
       c.quietStart = val('#wQuietStart') ?? c.quietStart;
@@ -2352,6 +2847,20 @@
     w.error = '';
     render();
     try {
+      // Freshdesk has to exist before a ticket tool can point at it.
+      let freshdeskId = (S.integrations || []).find((x) => x.providerId === 'freshdesk' && x.status === 'active')?.id || '';
+      if (c.raiseTicket && !freshdeskId && (c.fdDomain || '').trim() && (c.fdKey || '').trim()) {
+        const made = await api('/api/integrations/connect', {
+          method: 'POST',
+          body: JSON.stringify({ providerId: 'freshdesk',
+            credentials: { api_key: c.fdKey.trim() },
+            settings: { domain: c.fdDomain.trim() } }),
+        });
+        freshdeskId = made.id || '';
+        S.integrations = null;
+        if (!made.verified) toast('Freshdesk connected, but the credentials did not verify.', 'err');
+      }
+
       // A written knowledge base has to exist before the agent can reference it.
       let kbId = c.knowledgeBaseId || '';
       if (c.kbMode === 'new' && (c.kbName || '').trim()) {
@@ -2370,7 +2879,29 @@
           ttsProvider: c.ttsProvider, ttsModel: c.ttsModel, ttsVoice: c.ttsVoice,
           systemPrompt: c.systemPrompt, opener: c.opener, speakOpener: c.speakOpener,
           knowledgeBaseId: kbId || undefined,
+          postCallAnalysis: c.postCallAnalysis,
           delaySeconds: c.delaySeconds,
+          inboundNumberId: c.inboundNumberId || undefined,
+          escalation: {
+            logOnOrder: c.logOnOrder,
+            freshdeskConnectionId: c.raiseTicket ? (freshdeskId || undefined) : undefined,
+          },
+          scope: {
+            hours: c.stateHours ? c.hoursText : undefined,
+            noRefund: c.noRefund, noDiscount: c.noDiscount, noDate: c.noDate,
+          },
+          postPurchase: {
+            daysAfterFulfillment: c.daysAfter, maxAgeDays: c.maxAgeDays,
+            minOrderValue: c.minOrderValue, maxPerSweep: c.maxPerSweep,
+            suppressDays: c.suppressDays,
+            crossSell: c.crossSell,
+            waConnectionId: c.crossSell ? (c.waConnectionId || undefined) : undefined,
+          },
+          feedback: {
+            daysAfterFulfillment: c.daysAfter, maxAgeDays: c.maxAgeDays,
+            minOrderValue: c.minOrderValue, maxPerSweep: c.maxPerSweep,
+            tagOrder: c.tagOrder, flagLow: c.flagLow,
+          },
           maxAttempts: c.maxAttempts,
           quietHours: c.quietEnabled
             ? { enabled: true, start: c.quietStart, end: c.quietEnd, timezone: 'Asia/Kolkata' }
@@ -2399,9 +2930,129 @@
   }
 
 
+  // ── Issue escalation ────────────────────────────────────────────────────────
+  // Everything the agents flagged for a human, from the two sources that can
+  // actually be read back: orders they tagged, and calls that ended badly.
+
+  /** A tag like "telenow-cod-cancelled" rendered as "COD cancelled". */
+  function tagLabel(tag) {
+    return String(tag).replace(/^telenow-/, '').replace(/-/g, ' ')
+      .replace(/^\w/, (ch) => ch.toUpperCase())
+      .replace(/\bcod\b/i, 'COD').replace(/\brto\b/i, 'RTO');
+  }
+
+  /** Tags that mean "someone needs to look at this" get a warmer colour. */
+  function tagTone(tag) {
+    const t = String(tag);
+    if (/cancelled|refused|failed|unsure/i.test(t)) return 'warn';
+    if (/confirmed|saved|resolved/i.test(t)) return 'ok';
+    return '';
+  }
+
+  function escalationOrderRow(o) {
+    return `<tr>
+      <td>${esc(fmtDate(o.createdAt))}</td>
+      <td><b>${esc(o.name)}</b></td>
+      <td>${esc(o.customer || '—')}${o.phone ? `<div class="hint">${esc(o.phone)}</div>` : ''}</td>
+      <td>${(o.tags || []).map((t) =>
+        `<span class="pill ${tagTone(t)}" style="margin:0 4px 4px 0;"><span class="dot"></span>${esc(tagLabel(t))}</span>`).join('') || '—'}</td>
+      <td style="max-width:280px;">${o.note
+        ? `<div class="hint" style="white-space:pre-wrap;">${esc(o.note.slice(0, 220))}</div>` : '—'}</td>
+      <td>${esc(o.total || '—')}<div class="hint">${esc(o.fulfillment || '')}</div></td>
+    </tr>`;
+  }
+
+  function escalationCallRow(c) {
+    return `<tr data-call-id="${esc(c.id)}" style="cursor:pointer;">
+      <td>${esc(fmtDate(c.when))}</td>
+      <td>${esc(c.agent || '—')}</td>
+      <td>${esc(c.to || '—')}</td>
+      <td><span class="pill warn"><span class="dot"></span>${esc(c.disposition || '—')}</span></td>
+      <td>${esc(fmtDuration(c.duration))}</td>
+    </tr>`;
+  }
+
+  function viewEscalations() {
+    if (S.escalations === null) return '<div class="empty">Loading issues…</div>';
+    const e = S.escalations;
+    const total = (e.orders || []).length + (e.calls || []).length;
+
+    return `
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
+        <div>
+          <h1 style="margin:0;">Issue escalation</h1>
+          <p class="page-sub" style="margin:4px 0 0;">
+            ${total ? `${esc(String(total))} item(s) your agents flagged for a human.`
+              : 'Everything your agents flag for a human lands here.'}
+          </p>
+        </div>
+        <button class="btn secondary" data-refresh="escalations" style="flex:0 0 auto;">Refresh</button>
+      </div>
+
+      ${e.ordersError ? `<div class="banner err" style="margin-top:16px;"><span>✕</span>
+        <div>Could not read your orders: ${esc(e.ordersError)}</div></div>` : ''}
+
+      <div class="grid grid-2" style="margin:18px 0;">
+        <div class="card stat"><span class="n">${esc(String((e.orders || []).length))}</span><span class="l">Flagged orders</span></div>
+        <div class="card stat"><span class="n">${esc(String((e.calls || []).length))}</span><span class="l">Calls that did not connect</span></div>
+      </div>
+
+      <div class="card" style="margin-bottom:18px;">
+        <h2>Flagged orders</h2>
+        <p class="hint">Orders your agents tagged during a call — a cancelled COD, a refused delivery, an unresolved question. The note is what the agent wrote.</p>
+        ${(e.orders || []).length
+          ? `<div class="table-wrap" style="margin-top:12px;"><table>
+              <thead><tr><th>When</th><th>Order</th><th>Customer</th><th>Flag</th><th>Agent's note</th><th>Value</th></tr></thead>
+              <tbody>${e.orders.map(escalationOrderRow).join('')}</tbody>
+            </table></div>`
+          : `<div class="empty" style="padding:22px;">
+              <p class="hint">No flagged orders yet. They appear once an agent tags one — a COD the customer cancelled, or a delivery they refused.</p>
+             </div>`}
+      </div>
+
+      <div class="card" style="margin-bottom:18px;">
+        <h2>Calls that did not connect</h2>
+        <p class="hint">No answer, busy or failed. These customers were never reached, so nobody has spoken to them.</p>
+        ${(e.calls || []).length
+          ? `<div class="table-wrap" style="margin-top:12px;"><table>
+              <thead><tr><th>When</th><th>Agent</th><th>To</th><th>Outcome</th><th>Duration</th></tr></thead>
+              <tbody>${e.calls.map(escalationCallRow).join('')}</tbody>
+            </table></div>`
+          : `<div class="empty" style="padding:22px;">
+              <p class="hint">${e.hasAgents
+                ? 'Every call so far connected.'
+                : 'Add an agent on the Agents page and its calls will be tracked here.'}</p>
+             </div>`}
+      </div>
+
+      <div class="card">
+        <h2>Helpdesk tickets</h2>
+        <p class="hint">
+          Tickets raised by the Customer Support agent live in your helpdesk, not here.
+          Telenow's Freshdesk connector can <b>create</b> a ticket but cannot list them back,
+          so this page would only ever show a stale copy.
+        </p>
+        <p style="margin-top:10px;">
+          <a class="btn secondary" href="https://freshdesk.com/login" target="_blank" rel="noopener">Open Freshdesk ↗</a>
+        </p>
+      </div>`;
+  }
+
+  async function loadEscalations() {
+    try {
+      S.escalations = await api('/api/escalations');
+      S.error = '';
+    } catch (err) {
+      S.escalations = { orders: [], calls: [] };
+      if (err.code !== 'no_api_key') S.error = 'Could not load issues: ' + err.message;
+    }
+  }
+
+
   const VIEWS = {
     home: viewHome, agents: viewAgents, calls: viewCalls, leads: viewLeads,
     templates: viewTemplates,
+    escalations: viewEscalations,
     wizard: viewWizard,
     agent: viewAgent,
     call: viewCall,
@@ -2494,6 +3145,15 @@
         toast('Press Ctrl+C to copy.', '');
       }
     });
+    const crossTgl = $('#wPpCross');
+    if (crossTgl) crossTgl.addEventListener('change', () => { collectWizard(); render(); });
+
+    const ticketTgl = $('#wTicket');
+    if (ticketTgl) ticketTgl.addEventListener('change', () => { collectWizard(); render(); });
+
+    const stateHours = $('#wStateHours');
+    if (stateHours) stateHours.addEventListener('change', () => { collectWizard(); render(); });
+
     const quiet = $('#wQuiet');
     if (quiet) quiet.addEventListener('change', () => { collectWizard(); render(); });
 
@@ -2727,6 +3387,7 @@
   async function ensureData(view, force = false) {
     if (view === 'agents' && (S.agents === null || force)) { await loadAgents(); render(); }
     if (view === 'templates' && (S.templates === null || force)) { await loadTemplates(); render(); }
+    if (view === 'escalations' && (S.escalations === null || force)) { await loadEscalations(); render(); }
     if (view === 'agent' && S.agentId && (S.agent === null || force)) { await loadAgent(S.agentId); }
     if (view === 'call' && S.callId && (S.call === null || force)) { await loadCall(S.callId); }
     if (view === 'calls' && (S.calls === null || force)) { await loadCalls(); }

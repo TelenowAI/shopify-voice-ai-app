@@ -20,7 +20,7 @@ import express from 'express';
 
 // Import order: shopify.js (which imports the node adapter) before anything that
 // touches the library. The webhook module also calls addHandlers() at import.
-import { shopify, HOST, getShopProfile } from './shopify.js';
+import { shopify, HOST, getShopProfile, findFlaggedOrders } from './shopify.js';
 import { authRouter, rootHandler } from './auth.js';
 import { shopifyWebhookRouter } from './webhooks/shopify.js';
 import { telenowWebhookRouter, ensureTelenowHook } from './webhooks/telenow.js';
@@ -35,6 +35,7 @@ import { verifyAnySessionToken } from './session.js';
 import { TelenowClient } from './telenow.js';
 import { runWinBackSweep } from './automations/winBack.js';
 import { runReviewsSweep } from './automations/reviews.js';
+import { runPostPurchaseSweep } from './automations/postPurchase.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 3000;
@@ -706,6 +707,131 @@ app.post('/api/voice-preview', async (req, res) => {
   }
 });
 
+// GET /api/escalations — issues raised by the agents, from the two sources that
+// are actually readable.
+//
+// Deliberately NOT here: Freshdesk tickets. The connector exposes ticket.create
+// and nothing else, so a ticket can be raised but never listed back. Nor are
+// per-call tool invocations available (/api/sessions/{id}/tool-invocations is
+// JWT-only, and /api/v1/calls/{id} carries no tool data), so "which calls raised
+// a ticket" cannot be derived either. The UI says so rather than showing a
+// half-empty list that looks broken.
+app.get('/api/escalations', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+
+  // Orders the agents tagged. Independent of Telenow, so it still works when
+  // no API key is set.
+  let orders = [];
+  let ordersError = null;
+  try {
+    orders = (await findFlaggedOrders(shop, 50)).map((o) => ({
+      id: o.id,
+      name: o.name,
+      createdAt: o.createdAt,
+      tags: (o.tags || []).filter((t) => String(t).startsWith('telenow-')),
+      note: o.note || '',
+      fulfillment: o.displayFulfillmentStatus || null,
+      financial: o.displayFinancialStatus || null,
+      total: o.totalPriceSet?.shopMoney
+        ? `${o.totalPriceSet.shopMoney.amount} ${o.totalPriceSet.shopMoney.currencyCode}` : null,
+      customer: [o.customer?.firstName, o.customer?.lastName].filter(Boolean).join(' ') || null,
+      phone: o.customer?.phone || null,
+    }));
+  } catch (err) {
+    ordersError = err.message;
+    console.error(`[escalations] order search failed for ${shop}:`, err.message);
+  }
+
+  // Calls that ended without a clean outcome, from this store's own agents.
+  let calls = [];
+  let callsError = null;
+  const saved = getSavedAgents(shop);
+  const client = telenowForOrNull(shop);
+  if (client && saved.length) {
+    try {
+      const pages = await Promise.all(saved.slice(0, 10).map((id) =>
+        client.listCalls({ limit: 50, agentId: id, sort: 'newest' }).catch(() => ({ calls: [] }))));
+      const UNRESOLVED = new Set(['no-answer', 'failed', 'busy', 'cancelled']);
+      calls = pages.flatMap((p) => p.calls || [])
+        .filter((c) => UNRESOLVED.has(String(c.disposition || c.wrapup_disposition || '').toLowerCase()))
+        .sort((a, b) => new Date(b.start_time || 0) - new Date(a.start_time || 0))
+        .slice(0, 50)
+        .map((c) => ({
+          id: c.id, agent: c.agent_name, when: c.start_time,
+          to: c.to_number || c.phone_number,
+          disposition: c.disposition || c.wrapup_disposition,
+          duration: c.duration_sec,
+        }));
+    } catch (err) {
+      callsError = err.message;
+    }
+  }
+
+  res.json({ orders, calls, ordersError, callsError, hasAgents: saved.length > 0 });
+});
+
+// GET /api/integrations — every connector this workspace has connected, so the
+// wizard can tell whether a helpdesk is already available for ticket.create.
+// Credentials are never included: they come back masked upstream anyway.
+app.get('/api/integrations', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  const client = telenowFor(shop, res);
+  if (!client) return;
+  try {
+    const conns = await client.listConnections();
+    res.json({
+      connections: conns.map((c) => ({
+        id: c.id, providerId: c.providerId, label: c.label,
+        status: c.status, capabilities: c.capabilities || [],
+      })),
+    });
+  } catch (err) {
+    telenowFail(res, err, 'integrations');
+  }
+});
+
+// POST /api/integrations/connect — connect a non-Shopify provider from inside
+// the wizard, so a merchant can wire up Freshdesk without leaving the setup.
+//
+// Shopify is excluded on purpose: it connects itself from the OAuth token this
+// app already holds, and accepting a pasted one here would let a merchant point
+// their Telenow workspace at a different store.
+app.post('/api/integrations/connect', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+  const client = telenowFor(shop, res);
+  if (!client) return;
+  const providerId = String(req.body?.providerId || '').trim();
+  if (!providerId || providerId === 'shopify') {
+    res.status(400).json({ error: 'bad_request', message: 'A non-Shopify providerId is required.' });
+    return;
+  }
+  const credentials = req.body?.credentials && typeof req.body.credentials === 'object'
+    ? req.body.credentials : {};
+  const settings = req.body?.settings && typeof req.body.settings === 'object'
+    ? req.body.settings : {};
+  try {
+    const created = await client.createConnection({
+      providerId, label: providerId + ' — ' + shop, credentials, settings,
+      idempotencyKey: providerId + '-connect-' + shop,
+    });
+    const conn = created?.connection ?? created;
+    console.log(`[integration] shop=${shop} connected ${providerId} status=${conn?.status}`);
+    res.json({
+      id: conn?.id || null, status: conn?.status || null,
+      capabilities: conn?.capabilities || [],
+      // A failed verification still returns 201 upstream, so report it apart
+      // from whether the connection exists.
+      verified: created?.verification?.ok !== false,
+      error: created?.verification?.error || conn?.lastError || null,
+    });
+  } catch (err) {
+    telenowFail(res, err, 'integration connect');
+  }
+});
+
 // GET /api/knowledge-bases — the org's knowledge bases, for the setup wizard.
 app.get('/api/knowledge-bases', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
@@ -753,15 +879,72 @@ app.post('/api/templates/:key/publish', async (req, res) => {
     }
 
     const profile = await getShopProfile(shop).catch(() => null);
-    const payload = buildAgentPayload(tpl, shop, profile?.name, conn?.id || null, {
+    // Boundaries chosen in the Access step become prompt rules. They are
+    // appended rather than merged into the body so an edited prompt keeps them.
+    const scope = req.body?.scope || {};
+    const rules = [
+      scope.noRefund && '- Never promise a refund, or state a refund amount. Say the team will confirm it.',
+      scope.noDiscount && '- Never offer a discount, a free replacement or any goodwill gesture.',
+      scope.noDate && '- Never promise a delivery date that the order data does not show.',
+      scope.hours && `- Your team is available ${String(scope.hours).slice(0, 120)}. Mention that when something needs a person.`,
+      b.postPurchase && b.postPurchase.crossSell === false
+        && '- Do NOT recommend or sell anything on this call. Check in, answer questions, and end.',
+      b.postPurchase?.crossSell && !b.postPurchase?.waConnectionId
+        && '- You cannot send a link. If they want the product, tell them you will have the team message them.',
+      b.feedback?.tagOrder && '- After they give a score, use update_order to tag the order telenow-feedback-<score> and add their exact words as a note.',
+      b.feedback?.flagLow && '- If the score is 3 or below, also tag it telenow-feedback-low so a person follows up. Tell them someone from the team will call.',
+    ].filter(Boolean);
+    const NL = String.fromCharCode(10);
+    const promptOverride = rules.length
+      ? [String(b.systemPrompt || tpl.prompt), '', '## Limits set by the store', ...rules].join(NL)
+      : b.systemPrompt;
+
+    // With cross-sell off, the checkout tool is removed outright — a prompt rule
+    // alone still leaves the model holding a way to spend the customer's money.
+    const tplForBuild = (b.postPurchase && b.postPurchase.crossSell === false)
+      ? { ...tpl, capabilities: tpl.capabilities.filter((c) => c !== 'checkout.create_link') }
+      : tpl;
+
+    const payload = buildAgentPayload(tplForBuild, shop, profile?.name, conn?.id || null, {
       llmProvider: b.llmProvider, llmModel: b.llmModel,
       sttProvider: b.sttProvider, sttModel: b.sttModel,
       ttsProvider: b.ttsProvider, ttsVoice: b.ttsVoice, ttsModel: b.ttsModel,
-      systemPrompt: b.systemPrompt, opener: b.opener, speakOpener: b.speakOpener,
+      systemPrompt: promptOverride, opener: b.opener, speakOpener: b.speakOpener,
       transferDestinations: b.transferDestinations, transferMessage: b.transferMessage,
+      // Off unless the wizard explicitly asked for it — it is billed per call.
+      postCallAnalysis: b.postCallAnalysis === true,
+      // Escalation tools, each bound to the connection that provides it.
+      extraTools: [
+        // Feedback writes the score back as a tag + note, so it needs the write
+        // capability its template does not carry by default.
+        // The link is created by the Shopify connector but delivered by the
+        // WhatsApp one, so the two tools carry different connection ids.
+        b.postPurchase?.crossSell && b.postPurchase?.waConnectionId
+          ? { capability: 'whatsapp.send', connectionId: b.postPurchase.waConnectionId } : null,
+        (b.feedback?.tagOrder || b.feedback?.flagLow) && conn?.id
+          ? { capability: 'order.update', connectionId: conn.id } : null,
+        b.escalation?.logOnOrder && conn?.id
+          ? { capability: 'order.update', connectionId: conn.id } : null,
+        b.escalation?.freshdeskConnectionId
+          ? { capability: 'ticket.create', connectionId: b.escalation.freshdeskConnectionId } : null,
+      ].filter(Boolean),
     });
     const agent = await client.createAgent(payload);
     if (!agent?.id) throw new Error('Telenow did not return an agent id.');
+
+    // Inbound: bind the number so customers can actually reach the agent. Done
+    // after creation because it needs the agent id, and reported separately so
+    // a 409 does not throw away an otherwise-good agent.
+    let inbound = null;
+    if (b.inboundNumberId) {
+      try {
+        await client.assignNumberToAgent(String(b.inboundNumberId), agent.id);
+        inbound = { assigned: true };
+      } catch (err) {
+        inbound = { assigned: false, error: err.message, conflict: err?.status === 409 };
+        console.error(`[publish] number assign failed for ${agent.id}:`, err.message);
+      }
+    }
 
     // Knowledge base is optional and must never sink a successful publish.
     let knowledgeBase = null;
@@ -786,9 +969,25 @@ app.post('/api/templates/:key/publish', async (req, res) => {
         fromNumberId: String(b.fromNumberId || '') || undefined,
         // RTO only: the courier fires one NDR per attempt, and maxAttempts
         // decides how many of those become calls.
-        filters: b.maxAttempts
-          ? { ...(getAutomation(shop, tpl.automationKey)?.filters || {}),
-              maxAttempts: Math.max(1, Number(b.maxAttempts) || 1) }
+        // Per-template filters the sweeps and receivers read back.
+        filters: (b.maxAttempts || b.feedback || b.postPurchase)
+          ? {
+              ...(getAutomation(shop, tpl.automationKey)?.filters || {}),
+              ...(b.maxAttempts ? { maxAttempts: Math.max(1, Number(b.maxAttempts) || 1) } : {}),
+              ...(b.postPurchase ? {
+                daysAfterFulfillment: Math.max(1, Number(b.postPurchase.daysAfterFulfillment) || 10),
+                maxAgeDays: Math.max(7, Number(b.postPurchase.maxAgeDays) || 30),
+                minOrderValue: Math.max(0, Number(b.postPurchase.minOrderValue) || 0),
+                maxPerSweep: Math.max(1, Number(b.postPurchase.maxPerSweep) || 25),
+                suppressDays: Math.max(0, Number(b.postPurchase.suppressDays ?? 14)),
+              } : {}),
+              ...(b.feedback ? {
+                daysAfterFulfillment: Math.max(1, Number(b.feedback.daysAfterFulfillment) || 7),
+                maxAgeDays: Math.max(7, Number(b.feedback.maxAgeDays) || 30),
+                minOrderValue: Math.max(0, Number(b.feedback.minOrderValue) || 0),
+                maxPerSweep: Math.max(1, Number(b.feedback.maxPerSweep) || 25),
+              } : {}),
+            }
           : undefined,
         quietHours: b.quietHours && typeof b.quietHours === 'object'
           ? {
@@ -813,7 +1012,7 @@ app.post('/api/templates/:key/publish', async (req, res) => {
       agentId: agent.id, name: agent.name,
       tools: payload.metadata.tools.length,
       wired: Boolean(conn?.id),
-      knowledgeBase, automation, delaySeconds,
+      knowledgeBase, automation, delaySeconds, inbound,
     });
   } catch (err) {
     telenowFail(res, err, 'publish');
@@ -1140,6 +1339,11 @@ function startSchedulers() {
       await runReviewsSweep();
     } catch (err) {
       console.error('[scheduler] reviews sweep error:', err.message);
+    }
+    try {
+      await runPostPurchaseSweep();
+    } catch (err) {
+      console.error('[scheduler] post-purchase sweep error:', err.message);
     }
   };
   // Don't run immediately at boot (let the process settle); first run after one

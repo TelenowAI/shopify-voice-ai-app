@@ -172,6 +172,44 @@ export async function setOrderMetafield(shop, orderId, key, value, type = 'singl
 }
 
 /**
+ * Orders this app's agents have flagged, newest first.
+ *
+ * GraphQL rather than REST because REST cannot filter by tag at all — it would
+ * mean pulling every order and filtering in memory. `tag:telenow-*` matches the
+ * tags the automations write (telenow-cod-cancelled, telenow-rto-refused, ...).
+ *
+ * @param {string} shop
+ * @param {number} [limit=50]
+ * @returns {Promise<Array<object>>}
+ */
+export async function findFlaggedOrders(shop, limit = 50) {
+  const session = getShop(shop);
+  if (!session?.accessToken) throw new Error(`No offline session for ${shop}`);
+  const query = `query FlaggedOrders($n: Int!) {
+    orders(first: $n, reverse: true, query: "tag:telenow-*") {
+      edges { node {
+        id name createdAt tags note displayFulfillmentStatus displayFinancialStatus
+        totalPriceSet { shopMoney { amount currencyCode } }
+        customer { firstName lastName phone }
+      } }
+    }
+  }`;
+  const res = await fetch(`https://${shop}/admin/api/${REST_API_VERSION}/graphql.json`, {
+    method: 'POST',
+    headers: {
+      'X-Shopify-Access-Token': session.accessToken,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ query, variables: { n: Math.min(Math.max(limit, 1), 100) } }),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(`Shopify GraphQL → ${res.status}`);
+  // GraphQL answers 200 with an errors array, so a bad query is not an HTTP error.
+  if (data?.errors?.length) throw new Error(data.errors[0]?.message || 'Shopify GraphQL error');
+  return (data?.data?.orders?.edges || []).map((e) => e.node).filter(Boolean);
+}
+
+/**
  * Fetch the merchant shop profile for display in the embedded UI (name, owner,
  * contact email, plan, currency, timezone). Uses the offline token stored at
  * install, so it works without a logged-in user.
