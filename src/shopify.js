@@ -31,7 +31,19 @@ import { getShop } from './store.js';
 
 // ── Config from env ──────────────────────────────────────────────────────────
 
-const HOST = (process.env.HOST || 'http://localhost:3000').replace(/\/$/, '');
+// The app's public origin. An explicit HOST always wins.
+//
+// RENDER_EXTERNAL_URL is injected automatically into every Render web service,
+// so a Render deploy needs no extra configuration. It is always the
+// *.onrender.com URL and never a custom domain — put a custom domain in front
+// and you must set HOST explicitly.
+//
+// NOTE: SHOPIFY_APP_URL is deliberately NOT consulted here. It is set by the
+// Shopify CLI during `shopify app dev` and is read only by scripts/dev-cli.js.
+// Setting it in production looks right and does nothing.
+const HOST = (
+  process.env.HOST || process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000'
+).replace(/\/$/, '');
 const hostName = HOST.replace(/^https?:\/\//, '');
 const isHttps = HOST.startsWith('https://');
 
@@ -53,9 +65,11 @@ const isHttps = HOST.startsWith('https://');
 export function assertHostConfig() {
   const isLocal = /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(hostName);
 
-  if (!process.env.HOST) {
+  if (!process.env.HOST && !process.env.RENDER_EXTERNAL_URL) {
     throw new Error(
-      '[shopify] HOST is required — set it to this app\'s public origin, e.g. https://app.example.com',
+      '[shopify] HOST is not set. Set it to this app\'s public origin with no trailing ' +
+        'slash, e.g. https://your-app.onrender.com. (SHOPIFY_APP_URL is a Shopify-CLI ' +
+        'dev variable and is never read by this server — setting it has no effect.)',
     );
   }
   // The shipped templates carry example.com; catching it here is what stops a

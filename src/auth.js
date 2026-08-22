@@ -133,7 +133,7 @@ export function rootHandler(req, res) {
     .type('html')
     .send(
       `<h1>Telenow for Shopify</h1>
-       <p>Install by visiting <code>${HOST}/auth?shop=YOUR-STORE.myshopify.com</code></p>
+       <p>Install by visiting <code>${HOST}/auth?shop=telenow.myshopify.com</code></p>
        <p>Already installed? Open the <a href="/app">settings page</a> (add <code>?shop=</code>).</p>`,
     );
 }

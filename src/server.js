@@ -1387,8 +1387,8 @@ assertHostConfig();
 const server = app.listen(PORT, () => {
   console.log(`\nTelenow Shopify app listening on :${PORT}`);
   console.log(`  Public HOST:        ${HOST}`);
-  console.log(`  Install URL:        ${HOST}/auth?shop=YOUR-STORE.myshopify.com`);
-  console.log(`  Settings UI:        ${HOST}/app?shop=YOUR-STORE.myshopify.com`);
+  console.log(`  Install URL:        ${HOST}/auth?shop=telenow.myshopify.com`);
+  console.log(`  Settings UI:        ${HOST}/app?shop=telenow.myshopify.com`);
   console.log(`  Shopify webhooks →  ${HOST}/webhooks/shopify`);
   console.log(`  Telenow webhooks →  ${HOST}/telenow/webhook`);
   console.log(`  Telenow API base:   ${process.env.TELENOW_API_BASE || 'https://api.telenow.ai'}\n`);

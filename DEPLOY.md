@@ -1,10 +1,73 @@
-# Deploying to AWS
+# Deploying
 
 This app is a single Node/Express process that keeps its state in a JSON file and
 runs its outbound-call sweeps on an in-process timer. That combination decides the
-whole deployment shape, so read the constraint first — most of the AWS menu is
+whole deployment shape, so read the constraint first — most of the hosting menu is
 disqualified by it, and the ones that "work" but violate it fail silently rather
 than loudly.
+
+Two platforms are covered: **[Render](#deploying-to-render)** (currently in use) and
+**[AWS](#deploying-to-aws)**.
+
+---
+
+## Deploying to Render
+
+Render satisfies the single-instance constraint well — attaching a Disk *forces*
+one instance and disables rolling deploys, which is exactly what this app needs.
+Caddy is not used here; Render terminates TLS for you, so
+[docker-compose.yml](docker-compose.yml) and [deploy/Caddyfile](deploy/Caddyfile)
+are not part of a Render deploy.
+
+### Required settings
+
+| Setting | Value | Why |
+|---|---|---|
+| Instance type | **Starter** ($7/mo) or higher | [Free services cannot attach a disk](https://render.com/docs/free), and free instances spin down — which times out Shopify webhooks and stops the sweeps entirely. |
+| Disk | Attach one, any size (~$0.25/GB/mo) | Without it, `store.json` — every merchant's OAuth token and Telenow API key — is wiped on every deploy. |
+| `DATA_DIR` | The disk's mount path, e.g. `/var/data` | Must point **at the mounted disk**. A relative `./data` lands on the ephemeral container filesystem. |
+| `HOST` | Optional on Render | `RENDER_EXTERNAL_URL` is injected automatically and used as the fallback. Set `HOST` explicitly only once a custom domain is in front. |
+
+> **`SHOPIFY_APP_URL` is not the variable you want.** It is set by the Shopify CLI
+> for `shopify app dev` and is read only by [scripts/dev-cli.js](scripts/dev-cli.js).
+> Setting it in production has no effect — the server reads `HOST`.
+
+Everything else (`SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`, `SHOPIFY_SCOPES`,
+`SHOPIFY_API_VERSION`, `TELENOW_API_BASE`, `DEFAULT_PHONE_COUNTRY`) is the same as
+in [.env.production.example](.env.production.example). Leave `SWEEP_RUN_ON_BOOT`
+unset — it places real calls at startup.
+
+### Then
+
+**1. Set the Partners URLs** (Partners → your app → App setup):
+
+- App URL: `https://shopify-telenow-ai-app.onrender.com`
+- Allowed redirection URL: `https://shopify-telenow-ai-app.onrender.com/auth/callback`
+
+Exactly that one redirect entry — it must match `CALLBACK_PATH` in
+[src/auth.js:24](src/auth.js:24). Remove any leftover `shopify.dev` or
+`trycloudflare.com` entries from earlier `shopify app dev` runs.
+
+**2. Run the OAuth install once.** This is the only thing that produces a valid
+session token:
+
+```bash
+open "https://shopify-telenow-ai-app.onrender.com/auth?shop=telenow.myshopify.com"
+```
+
+It redirects to `/app?shop=telenow.myshopify.com#t=<token>` — the `#t=` fragment
+is what the settings page reads. Opening `/app` directly, with no fragment and
+outside the admin iframe, will **always** return
+`401 missing or invalid session token`.
+
+**3. Afterwards, open the app from the Shopify admin**, not by typing the Render
+URL into the address bar.
+
+Verification checks are in §7.
+
+---
+
+## Deploying to AWS
 
 ---
 
@@ -151,8 +214,8 @@ Read the boot banner. **Every URL must show your real domain:**
 ```
 Telenow Shopify app listening on :3000
   Public HOST:        https://app.yourdomain.com
-  Install URL:        https://app.yourdomain.com/auth?shop=YOUR-STORE.myshopify.com
-  Settings UI:        https://app.yourdomain.com/app?shop=YOUR-STORE.myshopify.com
+  Install URL:        https://app.yourdomain.com/auth?shop=telenow.myshopify.com
+  Settings UI:        https://app.yourdomain.com/app?shop=telenow.myshopify.com
   Shopify webhooks →  https://app.yourdomain.com/webhooks/shopify
   Telenow webhooks →  https://app.yourdomain.com/telenow/webhook
 ```
@@ -205,7 +268,7 @@ entries from earlier `shopify app dev` runs.
 Open the install URL for your store:
 
 ```
-https://app.yourdomain.com/auth?shop=YOUR-STORE.myshopify.com
+https://app.yourdomain.com/auth?shop=telenow.myshopify.com
 ```
 
 Approve the scopes; you should land on `/app`.
