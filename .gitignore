@@ -5,6 +5,7 @@ node_modules/
 .env
 .env.local
 .env.*.local
+.env.production
 
 # file-persistence stub (swap for a real DB in production)
 data/*.json

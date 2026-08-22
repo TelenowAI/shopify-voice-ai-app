@@ -1653,7 +1653,8 @@
   // mid-call, and adds it to this store's agent list.
 
   /** Templates with a guided multi-step setup. The rest are one-click. */
-  const WIZARD_TEMPLATES = new Set(['cod', 'rto', 'support', 'feedback', 'post-purchase']);
+  // Every template now has a guided setup.
+  const WIZARD_TEMPLATES = new Set(['cod', 'rto', 'support', 'feedback', 'post-purchase', 'order-confirmation']);
 
   function templateCard(t) {
     const st = (S.templateBusy || {})[t.key];
@@ -2001,6 +2002,7 @@
     if (k === 'support') return wizStep2Support(c);
     if (k === 'feedback') return wizStep2Feedback(c);
     if (k === 'post-purchase') return wizStep2PostPurchase(c);
+    if (k === 'order-confirmation') return wizStep2OrderConfirm(c);
     return wizStep2Orders(c);
   }
 
@@ -2413,6 +2415,140 @@
 
 
   /**
+   * Order Confirmation Access step.
+   *
+   * Fires on orders/create — the same event as COD Confirmation — so the first
+   * thing this step has to settle is which of the two calls a COD order gets.
+   * The rest is about what the agent reads back, because this template exists to
+   * catch a wrong size or a bad pincode while it is still free to fix.
+   */
+  function wizStep2OrderConfirm(c) {
+    const nums = (S.numbers || []).map((n) => ({ value: n.id, label: `${n.phone_number} (${n.provider || '—'})` }));
+    const codOn = Boolean((S.templates?.templates || []).find((t) => t.key === 'cod')?.installed);
+
+    return `
+      <div class="card" style="margin-bottom:16px;">
+        <h2>What the agent reads back</h2>
+        <p class="hint">Each one it checks adds time to the call. Each one it skips is a return you pay for later.</p>
+        <div style="margin-top:12px;">
+          <label class="toggle" style="margin-bottom:6px;">
+            <input type="checkbox" id="wOcItems" ${c.checkItems ? 'checked' : ''} />
+            <span>Items and quantity</span>
+          </label>
+          <div class="hint" style="margin:0 0 12px 26px;">
+            Reads them back with counts — "two Blue Kurtas and one Silk Scarf". Catches the duplicate tap that ordered two.
+          </div>
+          <label class="toggle" style="margin-bottom:6px;">
+            <input type="checkbox" id="wOcAddress" ${c.checkAddress ? 'checked' : ''} />
+            <span>Delivery address, including the pincode</span>
+          </label>
+          <div class="hint" style="margin:0 0 12px 26px;">
+            The step that actually prevents a return. Slower to read, and worth it.
+          </div>
+          <label class="toggle" style="margin-bottom:6px;">
+            <input type="checkbox" id="wOcPhone" ${c.checkPhone ? 'checked' : ''} />
+            <span>Confirm this is the right number for delivery updates</span>
+          </label>
+          <div class="hint" style="margin:0 0 0 26px;">
+            One extra question. Useful if your courier calls before delivering.
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <h2>Which orders</h2>
+        <p class="hint">
+          This agent and COD Confirmation both fire on a new order.
+          Without a rule, a cash-on-delivery customer is rung twice within a minute.
+        </p>
+        <label class="toggle" style="margin-top:12px;">
+          <input type="checkbox" id="wOcSkipCod" ${c.skipCod ? 'checked' : ''} />
+          <span>Skip cash-on-delivery orders</span>
+        </label>
+        <div class="hint" style="margin:2px 0 0 26px;">
+          ${codOn
+            ? 'COD Confirmation is set up and already calls those customers, so leave this on.'
+            : 'Turn this on if you also run COD Confirmation — it asks a different question about the same order.'}
+        </div>
+        <div class="field" style="margin-top:14px;">
+          <label>Only orders worth at least</label>
+          <input type="number" id="wOcMinValue" min="0" value="${esc(String(c.minOrderValue))}" />
+          <div class="hint" style="margin-top:6px;">0 confirms every order. In your store currency.</div>
+        </div>
+      </div>
+
+      <div class="grid grid-2" style="margin-bottom:16px;">
+        <div class="card">
+          <h2>When to call</h2>
+          <p class="hint">Soon enough that the order is still in their mind, late enough that they have put the phone down.</p>
+          <div class="field" style="margin-top:8px;">
+            <label>Call after (seconds)</label>
+            <input type="number" id="wDelay" min="0" max="86400" value="${esc(String(c.delaySeconds))}" />
+            <div class="hint" style="margin-top:6px;">60 is the default.</div>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Quiet hours</h2>
+          <p class="hint">An order placed at midnight should not ring back at midnight.</p>
+          <label class="toggle" style="margin:10px 0;">
+            <input type="checkbox" id="wQuiet" ${c.quietEnabled ? 'checked' : ''} />
+            <span>Hold calls outside these hours</span>
+          </label>
+          <div class="row">
+            <div style="flex:1;"><label>From</label>
+              <input type="text" id="wQuietStart" value="${esc(c.quietStart)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
+            <div style="flex:1;"><label>To</label>
+              <input type="text" id="wQuietEnd" value="${esc(c.quietEnd)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <h2>Order data the agent receives</h2>
+        <p class="hint">Read straight from the order that triggered the call — no lookup needed, so the agent can speak immediately.</p>
+        <div class="kv" style="margin-top:10px;">
+          ${kv('{customer_name}', 'First name from the order')}
+          ${kv('{order_number}', 'e.g. #1001')}
+          ${kv('{items}', 'Titles with counts — "2 x Blue Kurta, Silk Scarf"')}
+          ${kv('{quantity}', 'Total units across the order')}
+          ${kv('{delivery_address}', 'Street, city, state, pincode, country')}
+          ${kv('{order_total}', 'Formatted with the store currency')}
+        </div>
+        <div class="banner" style="margin-top:12px;"><span>ℹ</span>
+          <div>Anything else — payment status, tracking, past orders — the agent fetches live with
+          <code>lookup_order</code> if the customer asks.</div>
+        </div>
+      </div>
+
+      <div class="grid grid-2">
+        <div class="card">
+          <h2>Call from</h2>
+          ${nums.length
+            ? `<p class="hint">The number the customer sees.</p>
+               ${selectOf('wFrom', nums, c.fromNumberId, { blank: "The agent's default" })}`
+            : `<div class="banner warn" style="margin-top:8px;"><span>⚠</span>
+                <div>You have no phone number yet, so outbound calls cannot be placed.</div></div>
+               <p style="margin-top:10px;"><a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">Buy a number on Telenow ↗</a></p>`}
+        </div>
+        <div class="card">
+          <h2>Transfer to a human <span class="hint" style="font-weight:400;">— optional</span></h2>
+          <p class="hint">For a customer who wants to change the order rather than confirm it.</p>
+          <div class="row" style="margin-top:8px;">
+            <div style="flex:1 1 140px;"><label>Label</label>
+              <input type="text" id="wXferLabel" value="${esc(c.transferLabel || 'support')}" /></div>
+            <div style="flex:2 1 200px;"><label>Number</label>
+              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="+919876543210" /></div>
+          </div>
+          <div class="field" style="margin-top:10px;">
+            <label>What the agent says</label>
+            <input type="text" id="wXferMsg" value="${esc(c.transferMessage || 'Sure, connecting you now.')}" />
+          </div>
+        </div>
+      </div>`;
+  }
+
+
+  /**
    * RTO Access step.
    *
    * Shopify emits nothing when a delivery fails — the event only exists at the
@@ -2579,6 +2715,9 @@
               (S.numbers || []).find((n) => n.id === c.inboundNumberId)?.phone_number
                 || 'No number assigned — unreachable by phone') : ''}
             ${S.wiz?.key === 'support' ? kv('Available', '24 hours — Telenow has no inbound hours setting') : ''}
+            ${S.wiz?.key === 'order-confirmation' ? kv('Reads back', [c.checkItems && 'items + quantity',
+              c.checkAddress && 'address', c.checkPhone && 'phone'].filter(Boolean).join(', ') || 'Nothing selected') : ''}
+            ${S.wiz?.key === 'order-confirmation' ? kv('COD orders', c.skipCod ? 'Skipped — left to COD Confirmation' : 'Also called') : ''}
             ${S.wiz?.key === 'post-purchase' ? kv('Calls', c.daysAfter + ' days after dispatch, up to ' + c.maxPerSweep + ' per sweep') : ''}
             ${S.wiz?.key === 'post-purchase' ? kv('Skips', c.suppressDays > 0 ? 'anyone called in the last ' + c.suppressDays + ' days' : 'nobody — suppression off') : ''}
             ${S.wiz?.key === 'post-purchase' ? kv('Cross-sell', c.crossSell
@@ -2745,6 +2884,9 @@
       daysAfter: 7, maxAgeDays: 30, minOrderValue: 0, maxPerSweep: 25,
       // Post-purchase only: it runs after feedback and suppresses against it.
       suppressDays: 14, crossSell: true, waConnectionId: '',
+      // Order confirmation only. skipCod defaults on: both templates fire on
+      // orders/create, and a COD customer should not be rung twice.
+      checkItems: true, checkAddress: true, checkPhone: false, skipCod: true,
       tagOrder: true, flagLow: true,
       maxAttempts: 2,
       quietEnabled: true, quietStart: '21:00', quietEnd: '09:00',
@@ -2797,6 +2939,12 @@
       c.hoursText = val('#wHoursText') ?? c.hoursText;
       for (const [id, key] of [['#wStateHours','stateHours'],['#wNoRefund','noRefund'],
         ['#wNoDiscount','noDiscount'],['#wNoDate','noDate']]) {
+        const el = $(id); if (el) c[key] = el.checked;
+      }
+      const ocMin = Number(val('#wOcMinValue'));
+      if (Number.isFinite(ocMin) && ocMin >= 0) c.minOrderValue = Math.round(ocMin);
+      for (const [id, key] of [['#wOcItems','checkItems'],['#wOcAddress','checkAddress'],
+        ['#wOcPhone','checkPhone'],['#wOcSkipCod','skipCod']]) {
         const el = $(id); if (el) c[key] = el.checked;
       }
       for (const [id, key, min] of [['#wPpDays','daysAfter',1],['#wPpMaxAge','maxAgeDays',7],
@@ -2889,6 +3037,10 @@
           scope: {
             hours: c.stateHours ? c.hoursText : undefined,
             noRefund: c.noRefund, noDiscount: c.noDiscount, noDate: c.noDate,
+          },
+          orderConfirm: {
+            checkItems: c.checkItems, checkAddress: c.checkAddress, checkPhone: c.checkPhone,
+            skipCod: c.skipCod, minOrderValue: c.minOrderValue,
           },
           postPurchase: {
             daysAfterFulfillment: c.daysAfter, maxAgeDays: c.maxAgeDays,

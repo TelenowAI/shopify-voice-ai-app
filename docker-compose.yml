@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Production stack for a single EC2 (or Lightsail) instance.
+#
+#   caddy  — terminates TLS, auto-renews a Let's Encrypt cert, proxies to app
+#   app    — this Shopify app, bound to the internal network only
+#
+# IMPORTANT: `replicas` is deliberately absent and must stay that way. The app
+# keeps state in a JSON file (src/store.js) and runs its call sweeps on an
+# in-process timer (src/server.js). A second instance would corrupt the store
+# through last-write-wins and would place every outbound call twice.
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    # No published ports: only Caddy may reach it. The app speaks plain HTTP and
+    # must never be exposed directly to the internet.
+    expose:
+      - "3000"
+    env_file:
+      - .env.production
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DATA_DIR: /data
+    volumes:
+      # Named volume, NOT a bind mount: survives `docker compose down` and image
+      # rebuilds. This holds the Shopify OAuth access tokens — losing it silently
+      # breaks every merchant's install.
+      - telenow-data:/data
+    # Give the app time to finish an in-flight store write before SIGKILL.
+    stop_grace_period: 30s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"    # required for the ACME HTTP-01 challenge + HTTP→HTTPS redirect
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data      # certificates and ACME account keys — must persist
+      - caddy-config:/config
+    depends_on:
+      - app
+
+volumes:
+  telenow-data:
+  caddy-data:
+  caddy-config:

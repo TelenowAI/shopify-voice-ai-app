@@ -20,7 +20,7 @@ import express from 'express';
 
 // Import order: shopify.js (which imports the node adapter) before anything that
 // touches the library. The webhook module also calls addHandlers() at import.
-import { shopify, HOST, getShopProfile, findFlaggedOrders } from './shopify.js';
+import { shopify, HOST, getShopProfile, findFlaggedOrders, assertHostConfig } from './shopify.js';
 import { authRouter, rootHandler } from './auth.js';
 import { shopifyWebhookRouter } from './webhooks/shopify.js';
 import { telenowWebhookRouter, ensureTelenowHook } from './webhooks/telenow.js';
@@ -42,6 +42,12 @@ const PORT = Number(process.env.PORT) || 3000;
 
 const app = express();
 app.disable('x-powered-by');
+// Exactly one reverse proxy (Caddy) sits in front in production — see
+// docker-compose.yml. One hop, never `true`: trusting the whole chain would let
+// a client spoof its own X-Forwarded-For. Nothing reads req.ip today; this is
+// here so that when something does (a per-IP rate limiter), it sees the real
+// client address rather than the proxy's.
+app.set('trust proxy', 1);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'telenow-shopify' }));
@@ -887,6 +893,12 @@ app.post('/api/templates/:key/publish', async (req, res) => {
       scope.noDiscount && '- Never offer a discount, a free replacement or any goodwill gesture.',
       scope.noDate && '- Never promise a delivery date that the order data does not show.',
       scope.hours && `- Your team is available ${String(scope.hours).slice(0, 120)}. Mention that when something needs a person.`,
+      b.orderConfirm && b.orderConfirm.checkItems === false
+        && '- Do NOT read the items or quantity back. Confirm the order exists and move on.',
+      b.orderConfirm && b.orderConfirm.checkAddress === false
+        && '- Do NOT read the delivery address back.',
+      b.orderConfirm?.checkPhone
+        && '- Before ending, ask whether this number is the right one for delivery updates.',
       b.postPurchase && b.postPurchase.crossSell === false
         && '- Do NOT recommend or sell anything on this call. Check in, answer questions, and end.',
       b.postPurchase?.crossSell && !b.postPurchase?.waConnectionId
@@ -970,10 +982,14 @@ app.post('/api/templates/:key/publish', async (req, res) => {
         // RTO only: the courier fires one NDR per attempt, and maxAttempts
         // decides how many of those become calls.
         // Per-template filters the sweeps and receivers read back.
-        filters: (b.maxAttempts || b.feedback || b.postPurchase)
+        filters: (b.maxAttempts || b.feedback || b.postPurchase || b.orderConfirm)
           ? {
               ...(getAutomation(shop, tpl.automationKey)?.filters || {}),
               ...(b.maxAttempts ? { maxAttempts: Math.max(1, Number(b.maxAttempts) || 1) } : {}),
+              ...(b.orderConfirm ? {
+                skipCod: b.orderConfirm.skipCod !== false,
+                minOrderValue: Math.max(0, Number(b.orderConfirm.minOrderValue) || 0),
+              } : {}),
               ...(b.postPurchase ? {
                 daysAfterFulfillment: Math.max(1, Number(b.postPurchase.daysAfterFulfillment) || 10),
                 maxAgeDays: Math.max(7, Number(b.postPurchase.maxAgeDays) || 30),
@@ -1363,7 +1379,12 @@ app.use((err, _req, res, _next) => {
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+// Refuse to start on a misconfigured public origin rather than come up looking
+// healthy and then hand localhost URLs to Shopify and Telenow. See the comment
+// on assertHostConfig — the Telenow registration is not self-healing.
+assertHostConfig();
+
+const server = app.listen(PORT, () => {
   console.log(`\nTelenow Shopify app listening on :${PORT}`);
   console.log(`  Public HOST:        ${HOST}`);
   console.log(`  Install URL:        ${HOST}/auth?shop=YOUR-STORE.myshopify.com`);
@@ -1373,5 +1394,37 @@ app.listen(PORT, () => {
   console.log(`  Telenow API base:   ${process.env.TELENOW_API_BASE || 'https://api.telenow.ai'}\n`);
   startSchedulers();
 });
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+// Container platforms send SIGTERM on every redeploy and wait a grace period
+// before SIGKILL. Without a handler, Node exits immediately and in-flight
+// requests are dropped — a webhook Shopify considers delivered never finishes
+// its write-back, and Shopify won't retry a connection it saw accepted.
+//
+// The store itself is safe either way: persist() is writeFileSync to a tmp file
+// followed by renameSync, both synchronous, so a signal cannot land mid-write
+// and the rename is atomic. This is about the HTTP layer, not the data.
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[server] ${signal} received — finishing in-flight requests…`);
+
+  // Stop accepting new connections; the callback fires once existing ones drain.
+  server.close(() => {
+    console.log('[server] closed cleanly');
+    process.exit(0);
+  });
+
+  // Backstop: a hung keep-alive connection must not outlast the platform's
+  // grace period, or we get SIGKILLed anyway with a worse exit code.
+  setTimeout(() => {
+    console.error('[server] drain timed out — forcing exit');
+    process.exit(1);
+  }, 15_000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 export { app };

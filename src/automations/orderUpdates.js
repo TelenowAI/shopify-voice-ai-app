@@ -9,23 +9,49 @@
 //     poller — see TODOs).
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { placeCall, formatMoney, summarizeLineItems, firstName } from './_base.js';
+import {
+  placeCall, formatMoney, summarizeLineItems, firstName,
+  formatAddress, totalQuantity, itemsWithQuantity,
+} from './_base.js';
 import { recordFulfillment } from '../store.js';
+import { getAutomation } from '../settings.js';
+// isCodOrder lives with the COD handler; reused here so 'is this a COD order'
+// is decided by one implementation rather than two that can drift apart.
+import { isCodOrder } from './codConfirmation.js';
 
 const storeName = (shop) => (shop || '').replace('.myshopify.com', '');
 
 /**
- * orders/create → plain order confirmation call (separate from COD confirmation).
- * Note: COD confirmation is its own automation; enable only one for orders/create
- * if you don't want two calls. Both are independently toggleable in settings.
- * @param {string} shop @param {object} order
+ * Confirm a new order: items, QUANTITY and delivery ADDRESS.
+ *
+ * Both this and the COD handler key off orders/create, so a COD order would
+ * otherwise be called twice. `skipCod` (set from the setup wizard) leaves those
+ * to the COD agent, which asks a different question about the same order.
  */
 export async function handleOrderConfirmation(shop, order) {
+  const cfg = getAutomation(shop, 'orderConfirmation');
+  const filters = cfg?.filters || {};
+
+  if (filters.skipCod && isCodOrder(order, filters.codGatewaysExtra || [])) {
+    return { placed: false, reason: 'COD order — left to the COD confirmation agent' };
+  }
+  const minValue = Number(filters.minOrderValue) || 0;
+  if (minValue > 0 && (Number(order?.total_price) || 0) < minValue) {
+    return { placed: false, reason: `order below the ${minValue} minimum` };
+  }
+
   const variables = {
     customer_name: firstName(order),
     order_number: String(order.name || order.order_number || order.id),
-    order_items: summarizeLineItems(order.line_items),
+    // Names match the template's declared variables — the prompt reads {items},
+    // {quantity} and {delivery_address}, and an unfilled placeholder is spoken
+    // literally.
+    items: itemsWithQuantity(order),
+    quantity: String(totalQuantity(order)),
+    delivery_address: formatAddress(order),
     order_total: formatMoney(order.total_price, order.currency),
+    // Kept for anything still referencing the older names.
+    order_items: summarizeLineItems(order.line_items),
     currency: order.currency || '',
     store_name: storeName(shop),
   };

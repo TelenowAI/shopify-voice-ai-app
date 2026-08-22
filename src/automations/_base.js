@@ -177,6 +177,47 @@ export function summarizeLineItems(lineItems = [], max = 5) {
   return extra > 0 ? `${parts.join(', ')} and ${extra} more` : parts.join(', ');
 }
 
+/**
+ * The delivery address as a person would read it aloud.
+ *
+ * Shopify splits it across six fields and any of them can be blank, so the
+ * empties are dropped rather than read as pauses. The pincode is kept last and
+ * always included when present — it is the part that actually decides whether
+ * the parcel arrives.
+ * @param {object} order
+ * @returns {string}
+ */
+export function formatAddress(order) {
+  const a = order?.shipping_address || order?.billing_address || order?.customer?.default_address;
+  if (!a) return '';
+  return [a.address1, a.address2, a.city, a.province, a.zip, a.country]
+    .map((s) => String(s || '').trim())
+    .filter(Boolean)
+    .join(', ');
+}
+
+/** Total units across the order — what "is that two of them?" checks against. */
+export function totalQuantity(order) {
+  const items = Array.isArray(order?.line_items) ? order.line_items : [];
+  return items.reduce((n, li) => n + (Number(li?.quantity) || 0), 0);
+}
+
+/**
+ * Line items with their quantities spelled out, e.g. "2 x Blue Kurta, 1 x Scarf".
+ * summarizeLineItems collapses quantity, which is the one thing this agent has
+ * to read back.
+ */
+export function itemsWithQuantity(order, max = 5) {
+  const items = Array.isArray(order?.line_items) ? order.line_items : [];
+  const parts = items.slice(0, max).map((li) => {
+    const q = Number(li?.quantity) || 1;
+    const title = String(li?.title || li?.name || 'item').trim();
+    return q > 1 ? `${q} x ${title}` : title;
+  });
+  if (items.length > max) parts.push(`and ${items.length - max} more`);
+  return parts.join(', ');
+}
+
 /** First name from a Shopify customer/billing/shipping object. */
 export function firstName(entity) {
   return (

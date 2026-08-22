@@ -44,14 +44,30 @@ function load() {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
     if (!fs.existsSync(DB_FILE)) return emptyDb();
     const raw = fs.readFileSync(DB_FILE, 'utf8');
-    const parsed = JSON.parse(raw || '{}');
+    // No `|| '{}'` fallback: a truncated or empty file must reach the catch
+    // below, not parse to {} and boot as a healthy-looking empty database.
+    const parsed = JSON.parse(raw);
     const loaded = { ...emptyDb(), ...parsed };
     migrateLeadKeys(loaded);
     return loaded;
   } catch (err) {
-    // Corrupt file shouldn't crash the app — start fresh but keep a backup.
-    console.error('[store] failed to load DB, starting empty:', err.message);
-    return emptyDb();
+    // Do NOT start empty. Every shop's offline Shopify access token and Telenow
+    // API key live in this file, and the very next write persists the whole
+    // in-memory db — so booting empty turns one bad parse into a permanent,
+    // silent wipe of every merchant's install while /healthz still returns 200.
+    //
+    // Rename rather than copy, so that next write cannot clobber the evidence.
+    const quarantine = `${DB_FILE}.corrupt.${Date.now()}`;
+    try {
+      fs.renameSync(DB_FILE, quarantine);
+    } catch {
+      // Nothing more we can do — the message below still names the problem.
+    }
+    console.error(`[store] DB unreadable, quarantined to ${quarantine}: ${err.message}`);
+    console.error('[store] refusing to start empty — restore from backup before restarting.');
+    // load() runs at module scope, so this is a boot failure by design. The
+    // container restart policy will surface it as a crash loop.
+    process.exit(1);
   }
 }
 

@@ -9,11 +9,19 @@
 // work is server-to-server reacting to webhooks/cron — there is no logged-in
 // merchant in the request.
 //
-// NOTE on API versions: the library's `ApiVersion` enum (v13) no longer includes
-// older versions like 2025-10, so we configure the library with a current,
-// supported version for OAuth/webhooks, and use a *separate* configurable REST
-// version (SHOPIFY_API_VERSION, default 2025-10 per the Telenow app spec) for
-// the direct Admin REST write-back calls below.
+// NOTE on API versions: two separate versions are in play here.
+//
+//   1. The library version below (apiVersion in shopifyApi). This is what every
+//      webhook subscription created at install is stamped with, so it must be a
+//      version Shopify still supports — subscriptions cannot be re-stamped in
+//      place later without deleting and recreating them.
+//   2. SHOPIFY_API_VERSION, used only for the direct Admin REST write-back calls
+//      further down (order tags/notes/metafields).
+//
+// Keep them in sync where you can. They are separate constants only because the
+// REST version is env-overridable for a merchant on an older contract.
+// (An earlier note here claimed the v13 enum had dropped 2025-10 — it has not;
+// the enum runs October24 through July26.)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import '@shopify/shopify-api/adapters/node'; // MUST be imported before shopifyApi
@@ -26,6 +34,39 @@ import { getShop } from './store.js';
 const HOST = (process.env.HOST || 'http://localhost:3000').replace(/\/$/, '');
 const hostName = HOST.replace(/^https?:\/\//, '');
 const isHttps = HOST.startsWith('https://');
+
+/**
+ * Fail the boot if HOST is unset, still a placeholder, or not HTTPS.
+ *
+ * HOST is the single value that the OAuth redirect_uri, the Shopify webhook
+ * target and the Telenow webhook target are all built from — and the Telenow
+ * one is registered REMOTELY and persists. Booting with the localhost fallback
+ * above therefore does not just serve wrong links: it writes
+ * "http://localhost:3000/telenow/webhook" into Telenow as a permanent delivery
+ * address, and nothing about the running process looks unhealthy afterwards
+ * (/healthz still returns 200).
+ *
+ * Deliberately NOT run at import: scripts/seed-demo.js and test/roundtrip.mjs
+ * load this module without a public host, and the warn-don't-throw stance below
+ * exists for the same reason. server.js calls this immediately before listen().
+ */
+export function assertHostConfig() {
+  const isLocal = /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(hostName);
+
+  if (!process.env.HOST) {
+    throw new Error(
+      '[shopify] HOST is required — set it to this app\'s public origin, e.g. https://app.example.com',
+    );
+  }
+  // The shipped templates carry example.com; catching it here is what stops a
+  // half-edited .env.production from reaching Shopify and Telenow.
+  if (/(^|\.)example\.com$/.test(hostName) || hostName.startsWith('your-tunnel')) {
+    throw new Error(`[shopify] HOST is still a placeholder (${HOST}) — set your real domain.`);
+  }
+  if (!isHttps && !isLocal) {
+    throw new Error(`[shopify] HOST must be https:// in production (got ${HOST}).`);
+  }
+}
 
 export const SCOPES = (
   process.env.SHOPIFY_SCOPES ||
@@ -53,8 +94,11 @@ export const shopify = shopifyApi({
   scopes: SCOPES,
   hostName,
   hostScheme: isHttps ? 'https' : 'http',
-  // Library version for OAuth + webhook HMAC. Use a current supported version.
-  apiVersion: ApiVersion.January25,
+  // Library version for OAuth + webhook HMAC, and the version every webhook
+  // subscription is stamped with at install. July26 (2026-07) is the newest the
+  // installed v13 enum offers and the current Shopify stable; the previous
+  // January25 (2025-01) is past Shopify's 12-month support window.
+  apiVersion: ApiVersion.July26,
   // Embedded: the settings page renders inside the Shopify admin through App
   // Bridge, which is what gives the app its entry in the admin nav. Requires the
   // page to send App Bridge session tokens - see verifyAnySessionToken in session.js.

@@ -1,0 +1,21 @@
+# Never bake secrets or local state into the image.
+.env
+.env.*
+!.env.example
+data/
+.shopify/
+
+node_modules/
+.git/
+.gitignore
+
+# Dev-only surface — not needed at runtime.
+test/
+scripts/
+extensions/
+README.md
+DEPLOY.md
+*.log
+.DS_Store
+.claude/
+shopify.app.toml.cli-backup

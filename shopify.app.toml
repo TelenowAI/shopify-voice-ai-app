@@ -1,32 +1,22 @@
-# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
-
 name = "telenowvoiceai"
 client_id = "5aef351a70518eb6484369ba20f78ecc"
 
-# Rewritten by the CLI on each `shopify app dev` run (see automatically_update_urls_on_dev
-# below). The placeholder here is only what's used before the first dev run.
-application_url = "https://shopify.dev/apps/default-app-home"
+application_url = "https://shopify-telenow-ai-app.onrender.com"
 
-# This app serves its own settings page at /app instead of rendering inside the
-# Shopify admin iframe — src/shopify.js sets isEmbeddedApp: false. Leaving this
-# true makes Shopify load the app embedded, which this app cannot answer.
 embedded = true
 
 [access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_orders,write_orders,read_customers,read_checkouts,read_fulfillments"
 
-# REQUIRED: this app implements the classic authorization-code grant in src/auth.js
-# and depends on /auth/callback running to persist the offline token and register
-# webhooks. Shopify managed installation would skip that callback entirely.
 use_legacy_install_flow = true
 
 [auth]
-# Must match CALLBACK_PATH in src/auth.js — NOT the CLI template's /api/auth.
-redirect_urls = [ "https://shopify.dev/apps/default-app-home/auth/callback" ]
+redirect_urls = [
+  "https://shopify-telenow-ai-app.onrender.com/auth/callback"
+]
 
 [webhooks]
-api_version = "2026-10"
+api_version = "2026-07"
 
 [build]
 automatically_update_urls_on_dev = true
