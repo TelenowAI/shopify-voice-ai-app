@@ -1,7 +1,7 @@
 name = "telenowvoiceai"
 client_id = "5aef351a70518eb6484369ba20f78ecc"
 
-application_url = "https://shopify-telenow-ai-app.onrender.com"
+application_url = "https://shopify.telenow.ai"
 
 embedded = true
 
@@ -12,7 +12,7 @@ use_legacy_install_flow = true
 
 [auth]
 redirect_urls = [
-  "https://shopify-telenow-ai-app.onrender.com/auth/callback"
+  "https://shopify.telenow.ai/auth/callback"
 ]
 
 [webhooks]
