@@ -19,4 +19,9 @@ redirect_urls = [
 api_version = "2026-07"
 
 [build]
-automatically_update_urls_on_dev = true
+# false, not true: with `true` the CLI silently rewrites application_url and
+# [auth].redirect_urls above to the temporary tunnel URL on every
+# `shopify app dev` run — which is how those two ended up pointing at a dead
+# address and OAuth stopped working. Keep production URLs in this file and use a
+# separate app record for dev (`shopify app config link --config=dev`).
+automatically_update_urls_on_dev = false
