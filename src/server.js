@@ -25,6 +25,7 @@ import { authRouter, rootHandler } from './auth.js';
 import { shopifyWebhookRouter } from './webhooks/shopify.js';
 import { telenowWebhookRouter, ensureTelenowHook } from './webhooks/telenow.js';
 import { ndrWebhookRouter } from './webhooks/ndr.js';
+import { eventsRouter } from './webhooks/events.js';
 import {
   getSettings, getRedactedSettings, updateSettings, AUTOMATIONS,
   getAutomation, getSavedAgents, addSavedAgent, removeSavedAgent,
@@ -59,6 +60,9 @@ app.use('/telenow/webhook', express.text({ type: '*/*', limit: '2mb' }), telenow
 // Carrier NDR (failed delivery). Same raw-body treatment as the others so it
 // sits with them, though it authenticates by secret path rather than HMAC.
 app.use('/webhooks/ndr', express.text({ type: '*/*', limit: '1mb' }), ndrWebhookRouter);
+// Shopify Events (new webhooks successor) — ACK-only for now, HMAC-verified.
+// Matches the [[events.subscription]] uri in shopify.app.toml.
+app.use('/events', express.text({ type: '*/*', limit: '2mb' }), eventsRouter);
 
 // ── Everything else can use JSON ──────────────────────────────────────────────
 app.use(express.json({ limit: '1mb' }));

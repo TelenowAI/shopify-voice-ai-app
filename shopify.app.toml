@@ -12,7 +12,15 @@ redirect_urls = [
 ]
 
 [webhooks]
-api_version = "2026-10"
+api_version = "2026-07"
 
 [build]
 automatically_update_urls_on_dev = false
+[events]
+api_version = "2026-07"
+
+[[events.subscription]]
+handle = "order-created"
+topic = "Order"
+actions = ["create"]
+uri = "https://shopify.telenow.ai/events/orders"

@@ -1,6 +1,6 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "5aef351a70518eb6484369ba20f78ecc"
+client_id = "1181346b04d8d62d945cce9aa5fa90d7"
 application_url = "https://shopify.telenow.ai"
 embedded = true
 name = "telenowvoiceai"
@@ -13,8 +13,13 @@ scopes = "read_checkouts,read_customers,read_fulfillments,read_orders,write_orde
 redirect_urls = [ "https://shopify.telenow.ai/auth/callback" ]
 
 [webhooks]
-api_version = "2026-10"
+api_version = "2026-07"
 
-[build]
-automatically_update_urls_on_dev = true
+[events]
+api_version = "2026-07"
 
+[[events.subscription]]
+handle = "order-created"
+topic = "Order"
+actions = ["create"]
+uri = "https://shopify.telenow.ai/events/orders"
