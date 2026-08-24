@@ -1,9 +1,25 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "1181346b04d8d62d945cce9aa5fa90d7"
+name = "telenowvoiceai"
 application_url = "https://shopify.telenow.ai"
 embedded = true
-name = "telenowvoiceai"
+
+[build]
+automatically_update_urls_on_dev = false
+
+[events]
+api_version = "unstable"
+
+  [[events.subscription]]
+  handle = "order-created"
+  topic = "Order"
+  actions = [ "create" ]
+  uri = "https://shopify.telenow.ai/events/orders"
+  api_version = "unstable"
+
+[webhooks]
+api_version = "2026-07"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
@@ -11,20 +27,3 @@ scopes = "read_checkouts,read_customers,read_fulfillments,read_orders,write_orde
 
 [auth]
 redirect_urls = [ "https://shopify.telenow.ai/auth/callback" ]
-
-[webhooks]
-api_version = "2026-07"
-
-[events]
-api_version = "unstable"
-
-[[events.subscription]]
-handle = "order-created"
-topic = "Order"
-actions = ["create"]
-uri = "https://shopify.telenow.ai/events/orders"
-
-[build]
-# false, not true: with `true` the CLI silently rewrites application_url and
-# [auth].redirect_urls above to the temporary tunnel URL on every `shopify app dev`.
-automatically_update_urls_on_dev = false
