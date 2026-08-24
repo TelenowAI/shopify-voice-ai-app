@@ -267,20 +267,41 @@
   }
   .seg-btn:hover { color: var(--text); }
   .seg-btn.active { background: var(--accent); color: var(--accent-text); }
-  .stepbar { display: flex; gap: 10px; margin: 16px 0 20px; }
-  .step {
-    flex: 1; display: flex; align-items: center; gap: 9px; padding: 11px 14px;
-    border: 1px solid var(--line); border-radius: 10px; color: var(--muted); font-weight: 600;
+  /* ── Wizard stepper ──────────────────────────────────────────────────────── */
+  /* Circles joined by a rail. The connector's fill is a child element rather
+     than a background gradient so the part-filled in-progress segment can
+     animate its width. Every node is a button so keyboard users get the
+     back-navigation for free; the ones that are not reachable are disabled. */
+  .wsteps { display: flex; align-items: flex-start; margin: 18px 0 26px; }
+  .wstep {
+    flex: 0 0 auto; width: 104px;
+    display: flex; flex-direction: column; align-items: center; gap: 9px;
+    background: none; border: 0; padding: 0; font: inherit; text-align: center;
   }
-  .step .step-n {
-    width: 22px; height: 22px; border-radius: 50%; display: inline-flex;
-    align-items: center; justify-content: center; font-size: 12px;
-    background: var(--line); color: var(--text);
+  .wstep:not(:disabled) { cursor: pointer; }
+  .wstep-dot {
+    width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center;
+    font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums;
+    background: var(--surface); color: var(--muted); border: 1.5px solid var(--line);
+    transition: background-color .2s ease, border-color .2s ease, color .2s ease, transform .2s ease;
   }
-  .step.active { border-color: var(--accent); color: var(--text); }
-  .step.active .step-n { background: var(--accent); color: var(--accent-text); }
-  .step.done { border-color: var(--ok); color: var(--text); }
-  .step.done .step-n { background: var(--ok); color: #fff; }
+  .wstep-dot svg { width: 18px; height: 18px; }
+  .wstep-label { font-size: 12.5px; font-weight: 600; color: var(--muted); line-height: 1.3; }
+  .wstep.current .wstep-dot {
+    border-color: var(--accent); background: var(--accent-soft); color: var(--accent-text);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .wstep.done .wstep-dot { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .wstep.current .wstep-label, .wstep.done .wstep-label { color: var(--text); }
+  .wstep:not(:disabled):hover .wstep-dot { transform: scale(1.07); }
+  .wstep:focus-visible { outline: 0; }
+  .wstep:focus-visible .wstep-dot { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* 17px, not 18px, so the 2px rail sits on the circles' centre line. */
+  .wstep-line {
+    flex: 1 1 auto; height: 2px; margin-top: 17px; border-radius: 2px;
+    background: var(--line); overflow: hidden;
+  }
+  .wstep-line i { display: block; height: 100%; background: var(--accent); border-radius: 2px; transition: width .35s ease; }
   .voice {
     display: flex; align-items: center; justify-content: space-between; gap: 8px;
     text-align: left; padding: 11px 13px; border-radius: 10px; cursor: pointer;
@@ -448,6 +469,8 @@
     .content.view-in { animation: none; }
     .dots i { animation: sk-pulse 1.2s ease-in-out infinite; }
     .nav-item, .nav-item .ico { transition: none; }
+    .wstep-dot, .wstep-line i { transition: none; }
+    .wstep:not(:disabled):hover .wstep-dot { transform: none; }
     #tnbar .fill { animation: none; }
     .route-box .brand { animation: none; }
     #routeOverlay { animation: none; }
@@ -2362,13 +2385,34 @@
     return (p && Array.isArray(p.voices) ? p.voices : []).slice(0, 4);
   }
 
+  /** White tick for a completed node. Inline for the same CSP reason as the rail. */
+  const WIZ_CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"'
+    + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">'
+    + '<path d="M20 6 9 17l-5-5"/></svg>';
+
+  /**
+   * The wizard's progress rail.
+   *
+   * Completed nodes are clickable and jump back to that step; later ones are
+   * disabled, because moving forward has to go through wizGo() to pick up the
+   * validation it runs on the way out of each step.
+   */
   function stepBar(step) {
-    return `<div class="stepbar">
-      ${WIZ_STEPS.map((label, i) => `
-        <div class="step ${i === step ? 'active' : (i < step ? 'done' : '')}">
-          <span class="step-n">${i < step ? '✓' : i + 1}</span>
-          <span>${label}</span>
-        </div>`).join('')}
+    const last = WIZ_STEPS.length - 1;
+    return `<div class="wsteps" aria-label="Setup progress">
+      ${WIZ_STEPS.map((label, i) => {
+        const state = i < step ? 'done' : i === step ? 'current' : '';
+        // The connector leaving a finished step only part-fills while the step
+        // it points at is still the one being worked on.
+        const fill = i + 1 < step ? 100 : i + 1 === step ? 45 : 0;
+        return `<button type="button" class="wstep ${state}"
+          ${i < step ? `data-wizstep="${i}"` : 'disabled'}
+          ${i === step ? 'aria-current="step"' : ''}>
+          <span class="wstep-dot">${i < step ? WIZ_CHECK : String(i + 1).padStart(2, '0')}</span>
+          <span class="wstep-label">${esc(label)}</span>
+        </button>
+        ${i < last ? `<span class="wstep-line"><i style="width:${fill}%"></i></span>` : ''}`;
+      }).join('')}
     </div>`;
   }
 
@@ -3493,6 +3537,21 @@
     render();
   }
 
+  /**
+   * Jump back to an earlier step from the progress rail.
+   *
+   * Backwards only: forward moves stay on wizGo() so they keep running its
+   * validation.
+   */
+  function wizGoTo(n) {
+    const w = S.wiz;
+    if (!w || n >= w.step) return;
+    collectWizard();
+    w.error = '';
+    w.step = n;
+    render();
+  }
+
   async function publishWizard() {
     const w = S.wiz;
     if (!w || w.publishing) return;
@@ -3783,6 +3842,8 @@
       (S.wiz && S.wiz.step === 2 ? publishWizard() : wizGo(1)));
     const wizCancel = $('#wizCancel');
     if (wizCancel) wizCancel.addEventListener('click', closeWizard);
+    document.querySelectorAll('[data-wizstep]').forEach((b) =>
+      b.addEventListener('click', () => wizGoTo(Number(b.dataset.wizstep))));
     // Provider changes reset the dependent model/voice lists, so re-read the
     // step and re-render rather than leaving a stale model selected.
     ['#wLlmP','#wSttP','#wTtsP'].forEach((sel) => {
