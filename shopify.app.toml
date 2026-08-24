@@ -5,7 +5,6 @@ name = "telenowvoiceai"
 
 [access_scopes]
 scopes = "read_checkouts,read_customers,read_fulfillments,read_orders,write_orders"
-use_legacy_install_flow = true
 
 [auth]
 redirect_urls = [
