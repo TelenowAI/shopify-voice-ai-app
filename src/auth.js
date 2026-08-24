@@ -30,19 +30,28 @@ function isValidShop(shop) {
 
 // ── Begin OAuth ───────────────────────────────────────────────────────────────
 authRouter.get('/auth', async (req, res) => {
-  const shop = shopify.utils.sanitizeShop(req.query.shop, true);
+  // sanitizeShop(_, false) returns null instead of throwing, so bad input hits
+  // our 400 below rather than escaping as an unhandled rejection (Express 4
+  // does not forward async throws to the error middleware — the request would
+  // just hang).
+  const shop = shopify.utils.sanitizeShop(String(req.query.shop || ''), false);
   if (!shop || !isValidShop(shop)) {
     res.status(400).send('Missing or invalid ?shop=<store>.myshopify.com');
     return;
   }
-  // shopify.auth.begin writes the redirect to the raw response itself.
-  await shopify.auth.begin({
-    shop,
-    callbackPath: CALLBACK_PATH,
-    isOnline: false, // offline token (long-lived, server-to-server)
-    rawRequest: req,
-    rawResponse: res,
-  });
+  try {
+    // shopify.auth.begin writes the redirect to the raw response itself.
+    await shopify.auth.begin({
+      shop,
+      callbackPath: CALLBACK_PATH,
+      isOnline: false, // offline token (long-lived, server-to-server)
+      rawRequest: req,
+      rawResponse: res,
+    });
+  } catch (err) {
+    console.error('[auth] OAuth begin failed:', err);
+    if (!res.headersSent) res.status(500).send(`OAuth failed: ${err.message}`);
+  }
 });
 
 // ── OAuth callback ────────────────────────────────────────────────────────────
@@ -118,14 +127,34 @@ async function registerShopifyWebhooks(session) {
 export function rootHandler(req, res) {
   const shop = req.query.shop;
   if (shop && isValidShop(String(shop))) {
-    // Already installed: go straight to the settings UI. Embedded apps are loaded
-    // at "/" inside the admin iframe, and restarting OAuth there would try to
-    // navigate that iframe to Shopify's consent screen, which refuses to be framed.
+    // Already installed: go straight to the settings UI. Forward the WHOLE
+    // query string (host, embedded, ...) — App Bridge cannot initialize
+    // without ?host= on the page URL, and without App Bridge there is no
+    // session token, so every /api call would 401 in the embedded admin.
     if (getShop(String(shop))) {
-      res.redirect(`/app?shop=${encodeURIComponent(String(shop))}`);
+      const qs = new URLSearchParams(req.query).toString();
+      res.redirect(`/app?${qs}`);
       return;
     }
-    res.redirect(`/auth?shop=${encodeURIComponent(String(shop))}`);
+    // Not installed. Embedded apps are loaded at "/" inside the admin iframe,
+    // and OAuth cannot run there: Shopify's consent screen refuses to be
+    // framed, and the state cookie (SameSite=Lax) never flows on iframe
+    // navigations. Serve a tiny page that escapes to the top-level window and
+    // restarts the install there. Outside an iframe, plain redirect is fine.
+    const authUrl = `${HOST}/auth?shop=${encodeURIComponent(String(shop))}`;
+    if (String(req.query.embedded) === '1') {
+      res
+        .status(200)
+        .type('html')
+        .send(
+          `<script src="https://cdn.shopify.com/shopifycloud/app-bridge.js" data-api-key="${process.env.SHOPIFY_API_KEY || ''}"></script>
+           <p>Redirecting to app installation…
+             <a href="${authUrl}" target="_top">Continue</a></p>
+           <script>window.open(${JSON.stringify(authUrl)}, '_top');</script>`,
+        );
+      return;
+    }
+    res.redirect(authUrl);
     return;
   }
   res

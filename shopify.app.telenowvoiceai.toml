@@ -8,6 +8,7 @@ name = "telenowvoiceai"
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_checkouts,read_customers,read_fulfillments,read_orders,write_orders"
+use_legacy_install_flow = true
 
 [auth]
 redirect_urls = [ "https://shopify.telenow.ai/auth/callback" ]
@@ -23,3 +24,8 @@ handle = "order-created"
 topic = "Order"
 actions = ["create"]
 uri = "https://shopify.telenow.ai/events/orders"
+
+[build]
+# false, not true: with `true` the CLI silently rewrites application_url and
+# [auth].redirect_urls above to the temporary tunnel URL on every `shopify app dev`.
+automatically_update_urls_on_dev = false
