@@ -3567,11 +3567,75 @@
   $('#welcomeSkip').addEventListener('click', () => finishWelcome(null));
   $('#welcomeStart').addEventListener('click', () => finishWelcome('settings'));
 
+  // ── Re-auth self-heal ───────────────────────────────────────────────────────
+  // A 401 on boot means we have no usable session token: the page was opened
+  // standalone (no App Bridge, no fresh #t= fragment) or the 8h fragment token
+  // expired. Standalone with a known shop → bounce through /auth once, which
+  // auto-approves (scopes already granted) and returns with a fresh fragment
+  // token. Loop guard is structural, not storage-based: /auth/callback ALWAYS
+  // puts `t=` in the fragment, so its presence proves a re-auth already ran —
+  // redirecting again could only repeat the same failure. The one exception is
+  // an EXPIRED fragment token (stale bookmark/tab): one more bounce returns an
+  // unexpired token, so that retry either succeeds or lands in the `t=`-present
+  // unexpired case below. Every path terminates after at most one redirect.
+  const CAME_FROM_AUTH = /(^|&)t=/.test(location.hash.slice(1));
+  function fragmentTokenExpired() {
+    try {
+      // token = base64url("<shop>.<exp>.<hmac>") — exp is the 2nd-to-last part.
+      const decoded = atob(FRAGMENT_TOKEN.replace(/-/g, '+').replace(/_/g, '/'));
+      const parts = decoded.split('.');
+      return Number(parts[parts.length - 2]) < Date.now() / 1000;
+    } catch {
+      return false;
+    }
+  }
+  function handleAuthFailure(err) {
+    if (err.status !== 401) return false;
+    const embedded = params.get('embedded') === '1' ||
+      (window.shopify && typeof window.shopify.idToken === 'function');
+    if (embedded) {
+      // Inside the admin iframe, /auth cannot run (consent refuses framing) —
+      // an App Bridge token the server rejects points at server config (secret
+      // mismatch / clock skew). Reloading re-mints a token; that is the one
+      // recovery a merchant can do from here.
+      contentEl.innerHTML = `<div class="banner err"><span>✕</span>
+        <div>Could not verify your Shopify session — try reloading the page.
+          If this keeps happening, reinstall the app.</div></div>`;
+      return true;
+    }
+    if (shop && (!CAME_FROM_AUTH || fragmentTokenExpired())) {
+      location.href = '/auth?shop=' + encodeURIComponent(shop);
+      return true;
+    }
+    // No shop to re-auth with (or the retry already failed): explain the two
+    // ways back in instead of dead-ending on a raw error banner.
+    contentEl.innerHTML = `<div class="banner err"><span>✕</span>
+        <div>Your session has expired or the app was opened outside Shopify.</div></div>
+      <div class="card" style="max-width:520px;margin-top:16px">
+        <p style="margin-top:0">Open the app from your <strong>Shopify admin</strong>
+          (Apps → Telenow), or reconnect your store directly:</p>
+        <form id="reauthForm" style="display:flex;gap:8px">
+          <input id="reauthShop" placeholder="your-store.myshopify.com"
+            value="${esc(shop)}" style="flex:1" />
+          <button class="btn" type="submit">Reconnect</button>
+        </form>
+      </div>`;
+    document.getElementById('reauthForm').addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      const s = document.getElementById('reauthShop').value.trim().toLowerCase();
+      if (/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(s)) {
+        location.href = '/auth?shop=' + encodeURIComponent(s);
+      }
+    });
+    return true;
+  }
+
   // ── Boot ────────────────────────────────────────────────────────────────────
   (async function boot() {
     try {
       await loadSettings();
     } catch (err) {
+      if (handleAuthFailure(err)) return;
       contentEl.innerHTML = `<div class="banner err"><span>✕</span>
         <div>Could not load the app: ${esc(err.message)}</div></div>`;
       return;
