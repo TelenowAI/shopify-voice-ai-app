@@ -291,6 +291,138 @@
   .scenario.active > div:first-child { color: var(--ok); }
   .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
 
+  /* ── Loading system ────────────────────────────────────────────────────────
+     One vocabulary for every wait in the app:
+       #tnbar     — top progress bar, driven by the in-flight request count;
+       .sk*       — shimmer skeletons shaped like the content they stand in for;
+       .view-in   — the enter transition played when the view changes;
+       #routeOverlay — blocking cover for navigations that leave the document.
+     Motion is decorative here, so all of it degrades under prefers-reduced-
+     motion at the bottom of this block. */
+
+  #tnbar {
+    position: fixed; top: 0; left: 0; right: 0; height: 3px; z-index: 100;
+    pointer-events: none; opacity: 0; transition: opacity .3s ease .15s;
+  }
+  #tnbar.on { opacity: 1; transition-delay: 0s; }
+  #tnbar .fill {
+    height: 100%; width: 0;
+    border-radius: 0 3px 3px 0;
+    background: linear-gradient(90deg,
+      var(--accent),
+      color-mix(in srgb, var(--accent) 45%, #22d3ee),
+      var(--accent));
+    background-size: 200% 100%;
+    box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 65%, transparent);
+    transition: width .3s cubic-bezier(.22, .61, .36, 1);
+    animation: bar-flow 1.5s linear infinite;
+  }
+  @keyframes bar-flow { to { background-position: -200% 0; } }
+
+  /* Shimmer block. Every skeleton piece is a .sk with a size on top. */
+  .sk {
+    position: relative; overflow: hidden; border-radius: 6px;
+    background: var(--surface-2);
+  }
+  .sk::after {
+    content: ''; position: absolute; inset: 0; transform: translateX(-100%);
+    background: linear-gradient(90deg, transparent,
+      color-mix(in srgb, var(--text) 8%, transparent), transparent);
+    animation: sk-sweep 1.4s ease-in-out infinite;
+  }
+  @keyframes sk-sweep { to { transform: translateX(100%); } }
+  .sk-line { height: 11px; margin-bottom: 9px; }
+  .sk-line:last-child { margin-bottom: 0; }
+  .sk-title { height: 22px; width: min(260px, 55%); border-radius: 7px; margin-bottom: 10px; }
+  .sk-sub { height: 12px; width: min(430px, 72%); margin-bottom: 22px; }
+
+  /* A short delay keeps fast responses from flashing a skeleton on screen. */
+  .sk-wrap { opacity: 0; animation: sk-in .3s ease .12s forwards; }
+  @keyframes sk-in { to { opacity: 1; } }
+  /* Rows and cards cascade in rather than appearing as one slab. */
+  .sk-stagger { opacity: 0; animation: sk-rise .34s cubic-bezier(.22,.61,.36,1) forwards; animation-delay: var(--d, 0ms); }
+  @keyframes sk-rise { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
+
+  /* Inline "working on it" for waits too small to deserve a skeleton. */
+  .loading-inline {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    padding: 40px 20px; color: var(--muted);
+  }
+  .loading-inline.tight { padding: 14px 0; justify-content: flex-start; }
+  .dots { display: inline-flex; gap: 4px; }
+  .dots i {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+    animation: dot-bounce 1.05s ease-in-out infinite;
+  }
+  .dots i:nth-child(2) { animation-delay: .14s; }
+  .dots i:nth-child(3) { animation-delay: .28s; }
+  @keyframes dot-bounce {
+    0%, 80%, 100% { transform: translateY(0); opacity: .4; }
+    40% { transform: translateY(-5px); opacity: 1; }
+  }
+
+  /* Ring loader — the heavier signal, used by the redirect overlay. */
+  .loader-ring {
+    width: 40px; height: 40px; border-radius: 50%;
+    border: 3px solid color-mix(in srgb, var(--accent) 18%, transparent);
+    border-top-color: var(--accent);
+    animation: spin .75s cubic-bezier(.62,.18,.38,.86) infinite;
+  }
+
+  /* Buttons keep their footprint while busy so the layout never jumps. */
+  .btn.busy, .btn-busy {
+    position: relative; color: transparent !important; pointer-events: none;
+  }
+  .btn.busy::after, .btn-busy::after {
+    content: ''; position: absolute; inset: 0; margin: auto;
+    width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, .35); border-top-color: #fff;
+    animation: spin .6s linear infinite;
+  }
+  .btn.secondary.busy::after, .btn.secondary.btn-busy::after {
+    border-color: color-mix(in srgb, var(--text) 22%, transparent);
+    border-top-color: var(--text);
+  }
+
+  /* View enter transition — replayed only when the view actually changes. */
+  .content.view-in { animation: view-in .34s cubic-bezier(.22, .61, .36, 1); }
+  @keyframes view-in {
+    from { opacity: 0; transform: translateY(9px); }
+    to { opacity: 1; transform: none; }
+  }
+
+  /* Content that is on screen but being refetched: readable, clearly stale. */
+  .is-stale { opacity: .55; filter: saturate(.7); pointer-events: none; transition: opacity .2s ease; }
+
+  #routeOverlay {
+    position: fixed; inset: 0; z-index: 200;
+    display: grid; place-items: center;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter: blur(7px) saturate(120%);
+    -webkit-backdrop-filter: blur(7px) saturate(120%);
+    animation: fade-in .2s ease;
+  }
+  #routeOverlay[hidden] { display: none; }
+  @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+  .route-box { display: grid; justify-items: center; gap: 16px; text-align: center; }
+  .route-box .brand { padding: 0; animation: brand-pulse 1.7s ease-in-out infinite; }
+  @keyframes brand-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+  .route-msg { color: var(--muted); font-size: 13.5px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    /* Keep spinners turning — they are the feedback — but drop the sweeps,
+       slides and bounces, which only carry polish. */
+    .sk::after { animation: none; }
+    .sk { animation: sk-pulse 1.6s ease-in-out infinite; }
+    .sk-wrap, .sk-stagger { opacity: 1; animation: none; }
+    .content.view-in { animation: none; }
+    .dots i { animation: sk-pulse 1.2s ease-in-out infinite; }
+    #tnbar .fill { animation: none; }
+    .route-box .brand { animation: none; }
+    #routeOverlay { animation: none; }
+  }
+  @keyframes sk-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+
   @media (max-width: 860px) {
     .layout { grid-template-columns: 1fr; }
     .sidebar {
@@ -302,6 +434,22 @@
     .content { padding: 16px; }
   }
 </style>
+
+<!-- ── Global loading chrome ─────────────────────────────────────────────────── -->
+<!-- Progress bar for anything in flight; the JS counter below owns its width. -->
+<div id="tnbar"><div class="fill"></div></div>
+
+<!-- Shown just before a navigation that tears this document down (/auth), so a
+     slow redirect reads as progress instead of a frozen page. -->
+<div id="routeOverlay" hidden>
+  <div class="route-box">
+    <div class="brand">
+      <span class="brand-mark">Tele</span><span class="brand-word">now</span>
+    </div>
+    <div class="loader-ring"></div>
+    <div class="route-msg" id="routeMsg">Redirecting…</div>
+  </div>
+</div>
 
 <!-- ── Welcome / first run ───────────────────────────────────────────────────── -->
 <div id="toasts" class="toasts"></div>
@@ -376,7 +524,38 @@
       <div class="avatar" id="avatar">TN</div>
     </div>
 
-    <div class="content" id="content"><div class="empty">Loading…</div></div>
+    <!-- Boot placeholder: the same skeleton shape viewHome resolves into, so
+         the first paint does not visibly reflow when settings land. -->
+    <div class="content" id="content">
+      <div class="sk-wrap">
+        <div class="sk sk-title"></div>
+        <div class="sk sk-line sk-sub"></div>
+        <div class="grid grid-4">
+          <div class="card sk-stagger" style="--d:0ms">
+            <div class="sk sk-line" style="width:52%;height:24px;"></div>
+            <div class="sk sk-line" style="width:70%;height:9px;"></div>
+          </div>
+          <div class="card sk-stagger" style="--d:60ms">
+            <div class="sk sk-line" style="width:44%;height:24px;"></div>
+            <div class="sk sk-line" style="width:64%;height:9px;"></div>
+          </div>
+          <div class="card sk-stagger" style="--d:120ms">
+            <div class="sk sk-line" style="width:58%;height:24px;"></div>
+            <div class="sk sk-line" style="width:72%;height:9px;"></div>
+          </div>
+          <div class="card sk-stagger" style="--d:180ms">
+            <div class="sk sk-line" style="width:40%;height:24px;"></div>
+            <div class="sk sk-line" style="width:60%;height:9px;"></div>
+          </div>
+        </div>
+        <div class="card sk-stagger" style="--d:240ms;margin-top:14px;">
+          <div class="sk sk-line" style="width:30%;height:14px;margin-bottom:14px;"></div>
+          <div class="sk sk-line" style="width:92%;"></div>
+          <div class="sk sk-line" style="width:78%;"></div>
+          <div class="sk sk-line" style="width:86%;"></div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -401,19 +580,99 @@
     return FRAGMENT_TOKEN;
   }
 
+  // ── Progress bar ────────────────────────────────────────────────────────────
+  // One counter for everything in flight. The bar creeps toward 90% while any
+  // request is open and only completes when the last one settles, so a burst of
+  // parallel calls reads as one continuous wait instead of a flicker per call.
+  const Progress = (() => {
+    const bar = document.getElementById('tnbar');
+    const fill = bar.querySelector('.fill');
+    let pending = 0;
+    let width = 0;
+    let trickleTimer = 0;
+    let hideTimer = 0;
+    let resetTimer = 0;
+
+    const paint = () => { fill.style.width = width + '%'; };
+
+    function trickle() {
+      trickleTimer = setTimeout(() => {
+        // Ease off as it nears 90 so a long request still shows movement
+        // without ever implying it is about to finish.
+        width = Math.min(90, width + Math.max(0.4, (90 - width) * 0.12));
+        paint();
+        trickle();
+      }, 220);
+    }
+
+    function start() {
+      pending += 1;
+      if (pending > 1) return; // already running — just joined the same wait
+      clearTimeout(hideTimer);
+      clearTimeout(resetTimer);
+      bar.classList.add('on');
+      width = 8;
+      paint();
+      trickle();
+    }
+
+    function done() {
+      pending = Math.max(0, pending - 1);
+      if (pending) return;
+      clearTimeout(trickleTimer);
+      width = 100;
+      paint();
+      hideTimer = setTimeout(() => {
+        bar.classList.remove('on');
+        // Snap back to zero only once it has faded out, and with the width
+        // transition off, otherwise the bar visibly rewinds on screen.
+        resetTimer = setTimeout(() => {
+          fill.style.transition = 'none';
+          width = 0;
+          paint();
+          void fill.offsetWidth; // flush, so the next start() animates again
+          fill.style.transition = '';
+        }, 300);
+      }, 220);
+    }
+
+    /** Put non-api() work (raw fetch, media, redirects) on the same bar. */
+    const track = (p) => { start(); return Promise.resolve(p).finally(done); };
+
+    return { start, done, track };
+  })();
+
+  /** Cover a navigation that leaves this document, so the wait looks intentional. */
+  function leaveTo(href, message) {
+    const overlay = document.getElementById('routeOverlay');
+    document.getElementById('routeMsg').textContent = message || 'Redirecting…';
+    overlay.hidden = false;
+    Progress.start();
+    // Two frames: let the overlay actually paint before the browser starts
+    // tearing the page down, otherwise the user sees nothing at all.
+    requestAnimationFrame(() => requestAnimationFrame(() => { location.href = href; }));
+  }
+
   async function api(path, opts = {}) {
     const url = new URL(path, location.origin);
     if (shop) url.searchParams.set('shop', shop); // display/back-compat only — NOT auth
     const token = await sessionToken();
-    const r = await fetch(url, {
-      ...opts,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...(opts.headers || {}),
-      },
-    });
-    const data = await r.json().catch(() => ({}));
+    Progress.start();
+    let r;
+    let data;
+    try {
+      r = await fetch(url, {
+        ...opts,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(opts.headers || {}),
+        },
+      });
+      data = await r.json().catch(() => ({}));
+    } finally {
+      Progress.done();
+    }
     if (!r.ok) {
       // The server's catch-all 404 ({error:'not found', path}) means the route
       // is missing from the RUNNING build — /app re-reads app.html from disk on
@@ -427,6 +686,109 @@
       throw err;
     }
     return data;
+  }
+
+  // ── Skeletons ───────────────────────────────────────────────────────────────
+  // Each helper returns markup shaped like the view it stands in for, so the
+  // page keeps its layout when the real content arrives instead of jumping.
+  // Widths are deliberately uneven — uniform bars read as a broken table.
+
+  /** Page heading + subheading placeholder, matching h1 / .page-sub. */
+  function skHead() {
+    return '<div class="sk sk-title"></div><div class="sk sk-line sk-sub"></div>';
+  }
+
+  /** Wrap any skeleton body so it fades in only if the wait is real. */
+  function skPage(body) {
+    return `<div class="sk-wrap">${skHead()}${body}</div>`;
+  }
+
+  const SK_W = [86, 62, 45, 72, 38, 55]; // per-column width cycle
+
+  /** Table placeholder with `cols` columns and `rows` shimmering rows. */
+  function skTable(rows = 6, cols = 6) {
+    const head = Array.from({ length: cols }, (_, c) =>
+      `<th><div class="sk sk-line" style="width:${c ? 52 : 70}px;height:8px;margin:0;"></div></th>`).join('');
+    const body = Array.from({ length: rows }, (_, r) =>
+      `<tr class="sk-stagger" style="--d:${r * 45}ms">${Array.from({ length: cols }, (_, c) =>
+        `<td><div class="sk sk-line" style="width:${SK_W[(r + c) % SK_W.length]}%;margin:0;"></div></td>`).join('')}</tr>`).join('');
+    return `<div class="card table-wrap" style="padding:0;"><table>
+        <thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+  }
+
+  /** Card-grid placeholder, e.g. the agent and template lists. */
+  function skCards(n = 6) {
+    return `<div class="grid grid-3">${Array.from({ length: n }, (_, i) => `
+      <div class="card sk-stagger" style="--d:${i * 55}ms">
+        <div class="sk" style="width:32px;height:32px;border-radius:9px;margin-bottom:13px;"></div>
+        <div class="sk sk-line" style="width:${SK_W[i % SK_W.length]}%;height:13px;"></div>
+        <div class="sk sk-line" style="width:92%;"></div>
+        <div class="sk sk-line" style="width:${40 + (i % 3) * 12}%;"></div>
+      </div>`).join('')}</div>`;
+  }
+
+  /** Stat-tile row, e.g. the home dashboard counters. */
+  function skStats(n = 4) {
+    return `<div class="grid grid-4">${Array.from({ length: n }, (_, i) => `
+      <div class="card sk-stagger" style="--d:${i * 60}ms">
+        <div class="sk sk-line" style="width:${38 + (i % 3) * 10}%;height:24px;"></div>
+        <div class="sk sk-line" style="width:${62 + (i % 2) * 10}%;height:9px;"></div>
+      </div>`).join('')}</div>`;
+  }
+
+  /** Form-card placeholder: a heading plus `fields` label/input pairs. */
+  function skForm(fields = 4, delay = 0) {
+    const rows = Array.from({ length: fields }, (_, i) => `
+      <div style="margin-bottom:14px;">
+        <div class="sk sk-line" style="width:${28 + (i % 3) * 9}%;height:9px;margin-bottom:7px;"></div>
+        <div class="sk" style="height:36px;border-radius:8px;"></div>
+      </div>`).join('');
+    return `<div class="card sk-stagger" style="--d:${delay}ms">
+      <div class="sk sk-line" style="width:34%;height:14px;margin-bottom:16px;"></div>
+      ${rows}
+      <div class="sk" style="width:130px;height:36px;border-radius:8px;"></div></div>`;
+  }
+
+  /** Detail placeholder: a summary panel beside a longer body column. */
+  function skDetail() {
+    const line = (w) => `<div class="sk sk-line" style="width:${w}%;"></div>`;
+    return `<div class="grid grid-3">
+      <div class="card sk-stagger" style="--d:0ms">
+        <div class="sk sk-line" style="width:46%;height:14px;margin-bottom:16px;"></div>
+        ${[88, 64, 76, 52, 70].map(line).join('')}
+      </div>
+      <div class="card sk-stagger" style="--d:80ms;grid-column:span 2;">
+        <div class="sk sk-line" style="width:30%;height:14px;margin-bottom:16px;"></div>
+        ${[94, 82, 90, 68, 88, 74, 58].map(line).join('')}
+      </div></div>`;
+  }
+
+  /**
+   * Lock a button and spin it for the duration of an async handler.
+   *
+   * The label is hidden with `color: transparent` rather than replaced, so the
+   * button keeps its exact width and the row around it never reflows.
+   */
+  function withBusy(btn, fn) {
+    return async (...args) => {
+      if (!btn || btn.classList.contains('busy')) return; // already in flight
+      btn.classList.add('busy');
+      btn.disabled = true;
+      try {
+        return await fn(...args);
+      } finally {
+        // A re-render may have detached this node; both calls are harmless then.
+        btn.classList.remove('busy');
+        btn.disabled = false;
+      }
+    };
+  }
+
+  /** The small wait: three bouncing dots plus a label. `tight` left-aligns it. */
+  function loadingInline(label, tight = false) {
+    return `<div class="loading-inline${tight ? ' tight' : ''}">
+      <span class="dots"><i></i><i></i><i></i></span>
+      <span>${esc(label || 'Loading…')}</span></div>`;
   }
 
   // ── State ───────────────────────────────────────────────────────────────────
@@ -589,7 +951,7 @@
 
   function viewAgents() {
     if (!connected()) return notConnected('your agents');
-    if (S.agents === null) return '<div class="empty">Loading agents…</div>' + agentPicker();
+    if (S.agents === null) return skPage(skCards(6)) + agentPicker();
 
     // The fetch action lives top-right on every state, so it is in the same
     // place whether the list is empty or full.
@@ -651,7 +1013,7 @@
 
     let body;
     if (p.loading) {
-      body = '<div class="empty">Fetching agents from Telenow…</div>';
+      body = loadingInline('Fetching agents from Telenow…');
     } else if (!p.agents) {
       body = `<div class="empty"><h2>Could not load agents</h2>
         <p><button class="btn secondary" id="pickerRetry">Try again</button></p></div>`;
@@ -678,7 +1040,9 @@
             <div>
               <h1 style="margin:0;">Agents in Telenow</h1>
               <p class="hint" style="margin:4px 0 0;">
-                ${p.agents ? esc(String(p.agents.length)) + ' available · ' + esc(String(addedCount)) + ' added' : 'Loading…'}
+                ${p.agents
+                  ? esc(String(p.agents.length)) + ' available · ' + esc(String(addedCount)) + ' added'
+                  : '<span class="dots" style="vertical-align:middle;"><i></i><i></i><i></i></span>'}
               </p>
             </div>
             <button class="btn secondary" id="pickerClose" style="flex:0 0 auto;">Close</button>
@@ -715,10 +1079,10 @@
       <span class="pill ${a.is_active ? 'ok' : ''}" style="flex:0 0 auto;">
         <span class="dot"></span>${a.is_active ? 'Active' : 'Inactive'}
       </span>
-      <button class="btn ${a.added ? 'secondary' : ''}" data-add-agent="${esc(a.id)}"
+      <button class="btn ${a.added ? 'secondary' : ''}${busy ? ' busy' : ''}" data-add-agent="${esc(a.id)}"
               title="${a.added ? 'Remove from this store' : 'Add to this store'}"
               style="flex:0 0 auto;min-width:92px;"${busy ? ' disabled' : ''}>
-        ${busy ? '…' : (a.added ? '✓ Added' : 'Add')}
+        ${a.added ? '✓ Added' : 'Add'}
       </button>
     </div>`;
   }
@@ -811,7 +1175,13 @@
 
   function viewCalls() {
     if (!connected()) return notConnected('call history');
-    if (S.calls === null) return '<div class="empty">Loading calls…</div>';
+    if (S.calls === null) {
+      return skPage(`<div class="toolbar">
+          <div class="sk" style="width:150px;height:34px;border-radius:8px;"></div>
+          <div class="sk" style="width:150px;height:34px;border-radius:8px;"></div>
+          <div class="sk" style="width:88px;height:34px;border-radius:8px;"></div>
+        </div>${skTable(8, 7)}`);
+    }
     return `
       <h1>Call history</h1>
       <p class="page-sub">Calls from the ${esc(String(S.callScope ?? 0))} agent(s) you added to this store.</p>
@@ -853,7 +1223,11 @@
   }
 
   function viewLeads() {
-    if (S.leads === null) return '<div class="empty">Loading leads…</div>';
+    if (S.leads === null) {
+      return skPage(`<div class="toolbar">
+          <div class="sk" style="width:88px;height:34px;border-radius:8px;"></div>
+        </div>${skTable(7, 5)}`);
+    }
     return `
       <h1>Leads</h1>
       <p class="page-sub">New customers captured from Shopify, and the callback we placed.</p>
@@ -898,7 +1272,11 @@
   }
 
   function viewSettings() {
-    if (!S.settings) return '<div class="empty">Loading…</div>';
+    if (!S.settings) {
+      return skPage(`<div class="grid grid-3">
+        <div style="grid-column:1/-1;">${skForm(3, 0)}</div>
+        ${skForm(4, 70)}${skForm(4, 140)}</div>`);
+    }
     return `
       <h1>Settings</h1>
       <p class="page-sub">Connect Telenow and tune the scheduled jobs.</p>
@@ -1028,7 +1406,7 @@
     }
     if (!S.agent) {
       return `<p><button class="btn secondary" data-go="agents">&larr; Back to agents</button></p>
-        <div class="empty">Loading agent…</div>`;
+        ${skPage(skDetail())}`;
     }
 
     const a = S.agent;
@@ -1269,7 +1647,7 @@
     if (nums === null) {
       return `<div class="card">
         <h2>&#9990; Test over telephony</h2>
-        <p class="hint">Loading your phone numbers…</p></div>`;
+        ${loadingInline('Loading your phone numbers…', true)}</div>`;
     }
 
     // No number bought yet — send them to Telenow to get one.
@@ -1496,7 +1874,7 @@
     }
     if (!S.call) {
       return `<p><button class="btn secondary" data-go="calls">&larr; Back to calls</button></p>
-        <div class="empty">Loading call…</div>`;
+        ${skPage(skDetail())}`;
     }
 
     const c = S.call;
@@ -1587,7 +1965,7 @@
       return '<p class="hint">This call was not recorded.</p>';
     }
     if (rec === null) {
-      return '<p class="hint">Loading the recording…</p>';
+      return loadingInline('Loading the recording…', true);
     }
     if (rec && rec.error) {
       return `<div class="banner warn"><span>⚠</span><div>${esc(rec.error)}</div></div>`;
@@ -1677,15 +2055,15 @@
           ? `<span class="pill ok"><span class="dot"></span>Set up</span>
              <button class="btn secondary" data-open-tpl="${esc(done.agentId)}" style="flex:0 0 auto;">View agent</button>`
           : `<span class="hint" style="font-size:11.5px;">Creates an agent in Telenow</span>
-             <button class="btn" data-${WIZARD_TEMPLATES.has(t.key) ? 'wizard' : 'setup'}-tpl="${esc(t.key)}" style="flex:0 0 auto;"${st ? ' disabled' : ''}>
-               ${st ? 'Setting up…' : 'Setup'}</button>`}
+             <button class="btn${st ? ' busy' : ''}" data-${WIZARD_TEMPLATES.has(t.key) ? 'wizard' : 'setup'}-tpl="${esc(t.key)}" style="flex:0 0 auto;"${st ? ' disabled' : ''}>
+               Setup</button>`}
       </div>
     </div>`;
   }
 
   function viewTemplates() {
     if (!connected()) return notConnected('agent templates');
-    if (S.templates === null) return '<div class="empty">Loading templates…</div>';
+    if (S.templates === null) return skPage(skCards(6));
 
     const t = S.templates;
     return `
@@ -2767,7 +3145,7 @@
         <h1 style="margin-bottom:4px;">Set up ${esc(w.name)}</h1>
         ${stepBar(0)}
         ${w.error ? `<div class="banner err"><span>✕</span><div>${esc(w.error)}</div></div>`
-          : '<div class="empty">Loading models, voices and numbers…</div>'}`;
+          : loadingInline('Loading models, voices and numbers…') + skForm(4, 90)}`;
     }
     const last = w.step === 2;
     return `
@@ -2779,8 +3157,8 @@
       ${w.step === 0 ? wizStep1(c) : w.step === 1 ? wizStep2(c) : wizStep3(c)}
       <div style="display:flex;justify-content:space-between;gap:10px;margin-top:20px;">
         <button class="btn secondary" id="wizBack"${w.step === 0 ? ' disabled' : ''}>&larr; Back</button>
-        <button class="btn" id="wizNext"${w.publishing ? ' disabled' : ''}>
-          ${last ? (w.publishing ? 'Publishing…' : 'Publish agent') : 'Next &rarr;'}</button>
+        <button class="btn${w.publishing ? ' busy' : ''}" id="wizNext"${w.publishing ? ' disabled' : ''}>
+          ${last ? 'Publish agent' : 'Next &rarr;'}</button>
       </div>`;
   }
 
@@ -2801,7 +3179,7 @@
     S.playing = voiceId;
     render();
     try {
-      const r = await fetch(new URL('/api/voice-preview', location.origin), {
+      const r = await Progress.track(fetch(new URL('/api/voice-preview', location.origin), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2811,7 +3189,7 @@
           provider: c.ttsProvider, voice: voiceId, model: c.ttsModel,
           text: c.opener,
         }),
-      });
+      }));
       if (!r.ok) {
         const data = await r.json().catch(() => ({}));
         throw new Error(data.message || `HTTP ${r.status}`);
@@ -3125,7 +3503,7 @@
   }
 
   function viewEscalations() {
-    if (S.escalations === null) return '<div class="empty">Loading issues…</div>';
+    if (S.escalations === null) return skPage(skTable(6, 5));
     const e = S.escalations;
     const total = (e.orders || []).length + (e.calls || []).length;
 
@@ -3211,10 +3589,24 @@
     settings: viewSettings, store: viewStore,
   };
 
+  // render() also runs for in-view updates (toggles, typing, polling). Replaying
+  // the enter animation on those would make the page twitch, so it is keyed to
+  // an actual view change.
+  let renderedView = null;
+
   function render() {
     contentEl.innerHTML =
       (S.error ? `<div class="banner err"><span>✕</span><div>${esc(S.error)}</div></div>` : '') +
       (VIEWS[S.view] || viewHome)();
+
+    if (S.view !== renderedView) {
+      renderedView = S.view;
+      contentEl.classList.remove('view-in');
+      void contentEl.offsetWidth; // restart the animation from the top
+      contentEl.classList.add('view-in');
+      // A view change is a navigation: put the reader back at the top.
+      contentEl.scrollIntoView({ block: 'start', behavior: 'auto' });
+    }
 
     document.querySelectorAll('.nav-item').forEach((b) =>
       b.classList.toggle('active', b.dataset.view === ({ agent: 'agents', call: 'calls' }[S.view] || S.view)));
@@ -3323,14 +3715,13 @@
       b.addEventListener('click', () => openAgent(b.dataset.openTpl)));
 
     const clearMissing = $('#clearMissing');
-    if (clearMissing) clearMissing.addEventListener('click', async () => {
-      clearMissing.disabled = true;
+    if (clearMissing) clearMissing.addEventListener('click', withBusy(clearMissing, async () => {
       for (const id of (S.missingAgents || [])) {
         try { await api('/api/agents/saved/' + encodeURIComponent(id), { method: 'DELETE' }); } catch (e) {}
       }
       await loadAgents();
       render();
-    });
+    }));
 
     const fetchBtn = $('#fetchAgentsBtn');
     if (fetchBtn) fetchBtn.addEventListener('click', openPicker);
@@ -3412,10 +3803,10 @@
     if (callNext) callNext.addEventListener('click', () => pageCalls(1));
 
     const validateBtn = $('#validateBtn');
-    if (validateBtn) validateBtn.addEventListener('click', validateKey);
+    if (validateBtn) validateBtn.addEventListener('click', withBusy(validateBtn, validateKey));
 
     const saveWinBack = $('#saveWinBack');
-    if (saveWinBack) saveWinBack.addEventListener('click', saveWinBackDays);
+    if (saveWinBack) saveWinBack.addEventListener('click', withBusy(saveWinBack, saveWinBackDays));
   }
 
   // ── Actions ─────────────────────────────────────────────────────────────────
@@ -3604,7 +3995,7 @@
       return true;
     }
     if (shop && (!CAME_FROM_AUTH || fragmentTokenExpired())) {
-      location.href = '/auth?shop=' + encodeURIComponent(shop);
+      leaveTo('/auth?shop=' + encodeURIComponent(shop), 'Reconnecting to Shopify…');
       return true;
     }
     // No shop to re-auth with (or the retry already failed): explain the two
@@ -3624,7 +4015,7 @@
       ev.preventDefault();
       const s = document.getElementById('reauthShop').value.trim().toLowerCase();
       if (/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(s)) {
-        location.href = '/auth?shop=' + encodeURIComponent(s);
+        leaveTo('/auth?shop=' + encodeURIComponent(s), 'Connecting your store…');
       }
     });
     return true;
