@@ -259,14 +259,24 @@
     background: var(--accent-soft); color: var(--accent-text);
     display: grid; place-items: center; font-weight: 700; font-size: 12px;
   }
-  .seg { display: inline-flex; padding: 3px; gap: 3px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; }
+  .seg {
+    display: inline-flex; padding: 3px; gap: 3px; border-radius: 10px;
+    background: var(--surface-2); border: 1px solid var(--line);
+  }
   .seg-btn {
     font: inherit; font-size: 13px; font-weight: 600; border: 0; cursor: pointer;
-    background: transparent; color: var(--muted); padding: 7px 14px; border-radius: 8px;
-    transition: background .15s ease, color .15s ease;
+    background: transparent; padding: 7px 14px; border-radius: 8px;
+    /* Plain --muted lands at 4.36:1 on the track, just under AA, so pull it a
+       little toward --text. */
+    color: color-mix(in srgb, var(--muted) 78%, var(--text));
+    transition: background-color .15s ease, color .15s ease;
   }
-  .seg-btn:hover { color: var(--text); }
-  .seg-btn.active { background: var(--accent); color: var(--accent-text); }
+  .seg-btn:hover:not(.active) { color: var(--text); background: color-mix(in srgb, var(--text) 7%, transparent); }
+  .seg-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* Never var(--accent-text) here: that token is tuned for the pale
+     --accent-soft ground, and in light mode it is the very same purple as
+     --accent, which renders the label invisible. A solid accent fill takes white. */
+  .seg-btn.active { background: var(--accent); color: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .12); }
   /* ── Wizard stepper ──────────────────────────────────────────────────────── */
   /* Circles joined by a rail. The connector's fill is a child element rather
      than a background gradient so the part-filled in-progress segment can
@@ -315,7 +325,14 @@
     font-size: 11px; border: 1px solid var(--line); background: var(--bg);
     color: var(--text); cursor: pointer; transition: background .15s ease, color .15s ease;
   }
-  .play:hover { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  .play:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+  /* The dark theme's accent is lighter, so white on it lands at only 4.2:1 —
+     deepen the fill on both solid-accent controls to clear AA at 13px. */
+  html[data-theme="dark"] .seg-btn.active,
+  html[data-theme="dark"] .play:hover {
+    background: color-mix(in srgb, var(--accent) 86%, #000);
+    border-color: color-mix(in srgb, var(--accent) 86%, #000);
+  }
   .spin {
     width: 12px; height: 12px; border-radius: 50%; display: inline-block;
     border: 2px solid var(--line); border-top-color: var(--accent);
@@ -2507,9 +2524,11 @@
       <div class="card">
         <h2>Knowledge base <span class="hint" style="font-weight:400;">— optional</span></h2>
         <p class="hint">Give the agent your policies — returns, COD rules, delivery timelines — so it answers from them instead of guessing.</p>
-        <div class="seg" style="margin:12px 0;">
-          <button class="seg-btn${c.kbMode !== 'new' ? ' active' : ''}" data-kbmode="pick">Use an existing one</button>
-          <button class="seg-btn${c.kbMode === 'new' ? ' active' : ''}" data-kbmode="new">Write a new one</button>
+        <div class="seg" role="group" aria-label="Knowledge base source" style="margin:12px 0 14px;">
+          <button class="seg-btn${c.kbMode !== 'new' ? ' active' : ''}" data-kbmode="pick"
+            aria-pressed="${c.kbMode !== 'new'}">Use an existing one</button>
+          <button class="seg-btn${c.kbMode === 'new' ? ' active' : ''}" data-kbmode="new"
+            aria-pressed="${c.kbMode === 'new'}">Write a new one</button>
         </div>
         ${c.kbMode === 'new'
           ? `<div class="field">
@@ -2522,7 +2541,9 @@
                <div class="hint" style="margin-top:6px;">Plain sentences work best. The agent quotes from this instead of improvising.</div>
              </div>`
           : (kbs.length
-            ? selectOf('wKb', kbs, c.knowledgeBaseId, { blank: 'None' })
+            ? `<label for="wKb">Which knowledge base</label>
+               ${selectOf('wKb', kbs, c.knowledgeBaseId, { blank: 'None — answer from the prompt only' })}
+               <div class="hint" style="margin-top:6px;">The agent quotes from this instead of improvising.</div>`
             : `<div class="banner warn"><span>⚠</span>
                 <div>No knowledge bases in your workspace yet. Switch to <b>Write a new one</b> to create your first.</div></div>`)}
       </div>
