@@ -121,23 +121,39 @@
   .main { min-width: 0; display: flex; flex-direction: column; }
   .topbar {
     display: flex; align-items: center; gap: 12px;
-    padding: 12px 24px; border-bottom: 1px solid var(--line);
+    padding: 11px 20px; border-bottom: 1px solid var(--line);
     background: var(--surface); position: sticky; top: 0; z-index: 5;
   }
+  /* Each chip is one label/value pair: the label stays quiet so the value
+     carries the weight. A long org or store name truncates rather than
+     pushing the controls on the right off the bar. */
   .org-chip {
-    display: flex; align-items: center; gap: 8px;
-    background: var(--surface-2); border: 1px solid var(--line);
-    border-radius: 8px; padding: 6px 12px; font-size: 13px; color: var(--muted);
+    display: inline-flex; align-items: center; gap: 7px; min-width: 0;
+    background: var(--surface-2); border-radius: 9px;
+    padding: 6px 11px; font-size: 12.5px; color: var(--muted);
   }
-  .org-chip b { font-weight: 600; color: var(--text); }
+  .org-chip .ico { width: 14px; height: 14px; flex: 0 0 auto; opacity: .75; }
+  .org-chip b {
+    font-weight: 600; color: var(--text); font-size: 13px; max-width: 170px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .spacer { flex: 1; }
   .icon-btn {
-    background: none; border: 1px solid var(--line); border-radius: 8px;
-    width: 34px; height: 34px; cursor: pointer; color: var(--text);
+    display: grid; place-items: center;
+    background: none; border: 1px solid var(--line); border-radius: 9px;
+    width: 34px; height: 34px; cursor: pointer; color: var(--muted);
+    transition: background-color .15s ease, color .15s ease, border-color .15s ease;
   }
-  .icon-btn:hover { background: var(--surface-2); }
+  .icon-btn svg { width: 17px; height: 17px; }
+  .icon-btn:hover { background: var(--surface-2); color: var(--text); border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+  .icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* Show the destination rather than the current state: a moon while light,
+     a sun while dark. Swapped in CSS so the toggle never touches the DOM. */
+  .ico-sun { display: none; }
+  html[data-theme="dark"] .ico-sun { display: block; }
+  html[data-theme="dark"] .ico-moon { display: none; }
   .avatar {
-    width: 34px; height: 34px; border-radius: 8px; background: var(--accent);
+    width: 34px; height: 34px; border-radius: 9px; background: var(--accent);
     color: #fff; display: grid; place-items: center; font-weight: 700; font-size: 12px;
     flex: 0 0 auto;
   }
@@ -201,7 +217,7 @@
   .btn:disabled { opacity: .55; cursor: not-allowed; }
   .pill {
     display: inline-flex; align-items: center; gap: 5px;
-    border-radius: 999px; padding: 2px 9px; font-size: 11.5px; font-weight: 600;
+    border-radius: 999px; padding: 3px 10px; font-size: 12px; font-weight: 600;
     background: var(--surface-2); color: var(--muted);
   }
   .pill.ok { background: var(--ok-soft); color: var(--ok); }
