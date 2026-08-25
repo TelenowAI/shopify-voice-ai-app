@@ -34,4 +34,7 @@ api_version = "2026-07"
   shop_deletion_url = "https://shop.telenow.ai/webhooks/shopify"
 
 [build]
-automatically_update_urls_on_dev = true
+# false, not true: with true the CLI silently rewrites application_url and
+# [auth].redirect_urls above to the temporary tunnel URL on every shopify app dev
+# run - which would re-break OAuth right after the domain move.
+automatically_update_urls_on_dev = false
