@@ -2,7 +2,7 @@
 
 client_id = "5aef351a70518eb6484369ba20f78ecc"
 name = "telenowvoiceai"
-application_url = "https://shopify.telenow.ai"
+application_url = "https://shop.telenow.ai"
 embedded = true
 
 [events]
@@ -12,7 +12,7 @@ api_version = "unstable"
   handle = "order-created"
   topic = "Order"
   actions = [ "create" ]
-  uri = "https://shopify.telenow.ai/events/orders"
+  uri = "https://shop.telenow.ai/events/orders"
   api_version = "unstable"
 
 [access_scopes]
@@ -20,7 +20,7 @@ api_version = "unstable"
 scopes = "read_checkouts,read_customers,read_fulfillments,read_orders,write_orders"
 
 [auth]
-redirect_urls = [ "https://shopify.telenow.ai/auth/callback" ]
+redirect_urls = [ "https://shop.telenow.ai/auth/callback" ]
 
 [webhooks]
 api_version = "2026-07"

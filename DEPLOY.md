@@ -26,12 +26,12 @@ are not part of a Render deploy.
 | Instance type | **Starter** ($7/mo) or higher | [Free services cannot attach a disk](https://render.com/docs/free), and free instances spin down — which times out Shopify webhooks and stops the sweeps entirely. |
 | Disk | Attach one, any size (~$0.25/GB/mo) | Without it, `store.json` — every merchant's OAuth token and Telenow API key — is wiped on every deploy. |
 | `DATA_DIR` | The disk's mount path, e.g. `/var/data` | Must point **at the mounted disk**. A relative `./data` lands on the ephemeral container filesystem. |
-| `HOST` | **`https://shopify.telenow.ai`** — required | See the custom-domain note below. Without it the app advertises the `*.onrender.com` address everywhere. |
+| `HOST` | **`https://shop.telenow.ai`** — required | See the custom-domain note below. Without it the app advertises the `*.onrender.com` address everywhere. |
 
 > **`HOST` is mandatory once a custom domain is in front.** `RENDER_EXTERNAL_URL`
 > — the fallback the app uses when `HOST` is unset — *always* resolves to the
 > `*.onrender.com` address and **never** to a custom domain. So on a bare Render
-> deploy you can omit `HOST`, but with `shopify.telenow.ai` in front you must set
+> deploy you can omit `HOST`, but with `shop.telenow.ai` in front you must set
 > it explicitly, or every OAuth callback, webhook target and NDR URL the app hands
 > out will still say `shopify-telenow-ai-app.onrender.com`.
 
@@ -41,16 +41,16 @@ are not part of a Render deploy.
 
 ### Custom domain
 
-1. Render → your service → **Settings → Custom Domains → Add** `shopify.telenow.ai`.
+1. Render → your service → **Settings → Custom Domains → Add** `shop.telenow.ai`.
 2. Add the DNS record Render shows you (a `CNAME` for `shopify` pointing at
    `shopify-telenow-ai-app.onrender.com`) at your `telenow.ai` DNS provider.
 3. Wait for Render to verify it and issue the TLS certificate.
-4. **Then** set `HOST=https://shopify.telenow.ai` and redeploy.
+4. **Then** set `HOST=https://shop.telenow.ai` and redeploy.
 
 Verify before going further — this must show the custom domain, not `onrender.com`:
 
 ```bash
-curl -s https://shopify.telenow.ai/ | grep -o 'https://[^<]*auth?shop=[^<]*'
+curl -s https://shop.telenow.ai/ | grep -o 'https://[^<]*auth?shop=[^<]*'
 ```
 
 Everything else (`SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`, `SHOPIFY_SCOPES`,
@@ -62,8 +62,8 @@ unset — it places real calls at startup.
 
 **1. Set the Partners URLs** (Partners → your app → App setup):
 
-- App URL: `https://shopify.telenow.ai`
-- Allowed redirection URL: `https://shopify.telenow.ai/auth/callback`
+- App URL: `https://shop.telenow.ai`
+- Allowed redirection URL: `https://shop.telenow.ai/auth/callback`
 
 Exactly that one redirect entry — it must match `CALLBACK_PATH` in
 [src/auth.js:24](src/auth.js:24). Remove any leftover `shopify.dev` or
@@ -73,7 +73,7 @@ Exactly that one redirect entry — it must match `CALLBACK_PATH` in
 session token:
 
 ```bash
-open "https://shopify.telenow.ai/auth?shop=telenow.myshopify.com"
+open "https://shop.telenow.ai/auth?shop=telenow.myshopify.com"
 ```
 
 It redirects to `/app?shop=telenow.myshopify.com#t=<token>` — the `#t=` fragment
