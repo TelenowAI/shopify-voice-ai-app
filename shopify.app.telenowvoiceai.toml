@@ -21,13 +21,12 @@ api_version = "unstable"
 [webhooks]
 api_version = "2026-07"
 
-  # Shopify's automated review posts to these three URLs directly, so they
-  # must be declared here — registering the topics at runtime is not visible
-  # to the check.
-  [webhooks.privacy_compliance]
-  customer_data_request_url = "https://shop.telenow.ai/webhooks/shopify"
-  customer_deletion_url = "https://shop.telenow.ai/webhooks/shopify"
-  shop_deletion_url = "https://shop.telenow.ai/webhooks/shopify"
+  # Mandatory GDPR topics. The review check reads these from the deployed app
+  # config — registering topics at runtime is not visible to it. Format per
+  # shopify.dev/docs/apps/build/compliance/privacy-law-compliance.
+  [[webhooks.subscriptions]]
+  compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
+  uri = "https://shop.telenow.ai/webhooks/shopify"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
