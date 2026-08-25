@@ -96,7 +96,9 @@ authRouter.get(CALLBACK_PATH, async (req, res) => {
     // a self-hosted redirect.
     let embedded = null;
     try {
-      embedded = shopify.auth.getEmbeddedAppUrl({ rawRequest: req, rawResponse: res });
+      // getEmbeddedAppUrl is async — redirecting the bare call sends the merchant
+      // to the literal URL "/auth/[object Promise]".
+      embedded = await shopify.auth.getEmbeddedAppUrl({ rawRequest: req, rawResponse: res });
     } catch (err) {
       // No ?host= on the callback: a direct hit, or a local run outside admin.
       console.warn('[auth] no embedded host on callback:', err.message);
