@@ -18,7 +18,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import express from 'express';
-import { DeliveryMethod } from '@shopify/shopify-api';
+import { DeliveryMethod, InvalidWebhookError } from '@shopify/shopify-api';
 
 import { shopify, HOST } from '../shopify.js';
 import { deleteShop, collectCustomerData, redactCustomer } from '../store.js';
@@ -185,6 +185,13 @@ function safeParse(s) {
 // applies express.text({ type: '*/*' }) for this path so req.body is the raw
 // string. shopify.webhooks.process() does HMAC + routing + the HTTP response.
 shopifyWebhookRouter.post('/', async (req, res) => {
+  // A request with no signature is unauthenticated, not malformed. process()
+  // answers 400 when the header is absent, and Shopify's "verifies webhooks
+  // with HMAC signatures" check posts exactly that and requires a 401.
+  if (!req.get('X-Shopify-Hmac-Sha256')) {
+    res.status(401).send('Unauthorized: missing HMAC signature');
+    return;
+  }
   try {
     await shopify.webhooks.process({
       rawBody: typeof req.body === 'string' ? req.body : req.body?.toString('utf8') ?? '',
@@ -193,8 +200,12 @@ shopifyWebhookRouter.post('/', async (req, res) => {
     });
   } catch (err) {
     // process() normally writes the response; if it threw before that, respond.
+    // An HMAC failure is a rejected request, so it must not surface as a 500.
     console.error('[webhook] process error:', err.message);
-    if (!res.headersSent) res.status(500).send(err.message);
+    if (res.headersSent) return;
+    const unauthorized = err instanceof InvalidWebhookError
+      || /hmac|signature|unauthoriz/i.test(err.message || '');
+    res.status(unauthorized ? 401 : 500).send(unauthorized ? 'Unauthorized' : err.message);
   }
 });
 

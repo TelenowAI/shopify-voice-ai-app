@@ -89,6 +89,25 @@ authRouter.get(CALLBACK_PATH, async (req, res) => {
     // Send the merchant to the settings page. Mint a signed session token and
     // pass it via the URL FRAGMENT (not query/logs) — the UI reads it from
     // location.hash and sends it as a Bearer token on every /api/* call.
+    // An embedded app has to hand the merchant back INTO the admin, not to its
+    // own origin. Outside the admin frame App Bridge never initialises, so no
+    // session token is ever issued — which is why both "immediately redirects to
+    // app UI after authentication" and the embedded session-token check fail on
+    // a self-hosted redirect.
+    let embedded = null;
+    try {
+      embedded = shopify.auth.getEmbeddedAppUrl({ rawRequest: req, rawResponse: res });
+    } catch (err) {
+      // No ?host= on the callback: a direct hit, or a local run outside admin.
+      console.warn('[auth] no embedded host on callback:', err.message);
+    }
+    if (embedded) {
+      res.redirect(embedded);
+      return;
+    }
+
+    // Standalone fallback: the token rides in the URL FRAGMENT, not the query,
+    // so it stays out of server logs and Referer headers.
     const token = mintSessionToken(session.shop);
     res.redirect(`/app?shop=${encodeURIComponent(session.shop)}#t=${encodeURIComponent(token)}`);
   } catch (err) {
