@@ -5,7 +5,9 @@
 // the merchant's Telenow workspace, wired to their Shopify connector so it can
 // read the store MID-CALL rather than only reciting what the webhook sent.
 //
-// Stack choice is deliberate and applies to every template:
+// Stack choice is deliberate, PINNED, and applies to every template — the
+// merchant cannot change it through this app, because this app sells a flat
+// per-minute rate and the stack is what that minute costs (see buildAgentPayload):
 //   LLM  xai / grok-4-fast-non-reasoning   260 ms, $0.20/$0.50 per M tokens
 //   STT  deepgram / nova-3 (multi)         real-time code-switching for Hinglish
 //   TTS  smallest / lightning_v3.1_pro     $10 per M chars
@@ -13,8 +15,9 @@
 // TTS is ~half the per-minute cost, and the spread across providers is 8.3x
 // ($6 Telenow → $50 ElevenLabs). These are transactional store calls where
 // nobody is judging voice artistry, so the cheap end is the right end: roughly
-// Rs 3.7/min instead of Rs 6.4/min. A merchant who wants a premium voice can
-// switch the agent's TTS in Telenow afterwards.
+// Rs 3.7/min instead of Rs 6.4/min. That 8.3x spread is exactly why the choice
+// is not the merchant's to make here: they pay one flat price per minute
+// whichever end they pick, so the expensive end is a loss we absorb silently.
 //
 // Prompts are written SHORT on purpose. Call length is the cost driver — a
 // 39-second confirm and a 98-second chat cost 2.5x apart on identical
@@ -385,7 +388,19 @@ export function listTemplates() {
  * @param {string} storeName         display name, substituted into the prompt
  * @param {string|null} connectionId the Shopify connector; tools are omitted without it
  * @param {object} [o]               wizard overrides — every field optional, and
- *                                   anything absent falls back to the template default
+ *                                   anything absent falls back to the template default.
+ *                                   Overrides cover what the agent SAYS and who it
+ *                                   reaches: `name`, `systemPrompt`, `opener`,
+ *                                   `speakOpener`, `transferDestinations`,
+ *                                   `transferMessage`, `extraTools`, `postCallAnalysis`.
+ *                                   It deliberately carries NO model-stack fields.
+ *                                   `llmProvider`, `llmModel`, `sttProvider`,
+ *                                   `sttModel`, `ttsProvider`, `ttsVoice` and
+ *                                   `ttsModel` are IGNORED if passed — the stack is
+ *                                   pinned to STACK below, for the pricing reason
+ *                                   spelled out at the return statement. They are
+ *                                   listed here only so nobody re-adds them thinking
+ *                                   the omission was an oversight.
  */
 export function buildAgentPayload(tpl, shop, storeName, connectionId, o = {}) {
   const store = storeName || shop;
@@ -430,14 +445,41 @@ export function buildAgentPayload(tpl, shop, storeName, connectionId, o = {}) {
     systemPrompt: `${prompt}
 
 ${COMMON_RULES}`,
-    llmProvider: o.llmProvider || STACK.llmProvider,
-    llmModel: o.llmModel || STACK.llmModel,
+    // ── The model stack is PINNED. Do not reintroduce an override here. ──
+    //
+    // These fields used to read `o.llmProvider || STACK.llmProvider` and so on,
+    // which let the wizard's dropdowns pick the LLM, the STT and the TTS.
+    // That is four independent price cards being multiplied together inside ONE
+    // minute that this app sells at a FLAT rate ($0.12/min overage on Growth).
+    // Measured across what the platform can actually produce, cost per minute
+    // varied 117x end to end, and 2.9x from a merchant simply changing two
+    // dropdowns. At the premium end a minute cost ~$0.55 against $0.12 of
+    // revenue — $0.43 lost per minute, with nothing anywhere warning the
+    // merchant, the founder or us that it was happening.
+    //
+    // The failure mode is quiet and unbounded: the merchant is not doing
+    // anything wrong, the plan simply goes loss-making in proportion to how
+    // much they use it, so the better the customer the worse the bleed.
+    //
+    // Pinned, the only remaining cost variance is prompt length and carrier —
+    // about 1.7x, comfortably inside the price. So this is not a style
+    // preference or a defaults question: `o.*` reaching any of these fields is
+    // what makes the pricing safe or unsafe. Anyone re-adding a fallback here
+    // is re-opening the loss. A merchant who genuinely wants a premium voice
+    // has to be sold a plan whose price covers it — not handed a dropdown.
+    llmProvider: STACK.llmProvider,
+    llmModel: STACK.llmModel,
     llmConfig: STACK.llmConfig,
-    sttProvider: o.sttProvider || STACK.sttProvider,
-    sttConfig: { ...STACK.sttConfig, ...(o.sttModel ? { model: o.sttModel } : {}) },
-    ttsProvider: o.ttsProvider || STACK.ttsProvider,
-    ttsVoice: o.ttsVoice || STACK.ttsVoice,
-    ttsConfig: { ...STACK.ttsConfig, ...(o.ttsModel ? { model: o.ttsModel } : {}) },
+    sttProvider: STACK.sttProvider,
+    // Still spread rather than passed by reference: these used to be built with
+    // `{ ...STACK.sttConfig, ...override }`, so a caller that edits the payload
+    // it got back has never been able to reach into STACK. Handing out the
+    // shared object would make one agent's edit silently change every later
+    // agent this process builds.
+    sttConfig: { ...STACK.sttConfig },
+    ttsProvider: STACK.ttsProvider,
+    ttsVoice: STACK.ttsVoice,
+    ttsConfig: { ...STACK.ttsConfig },
     sessionConfig: SESSION,
     telephonyConfig: {
       // Inbound and outbound read DIFFERENT keys. An inbound call reads

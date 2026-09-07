@@ -1094,35 +1094,43 @@ export async function provisionWorkspace(externalId, opts = {}) {
   // "absent" here and as an explicit choice in a future server version.
   const body = { externalId: shop, name: String(args.name || shop) };
   if (args.plan) body.plan = String(args.plan);
-  // ★ A CAP OF ZERO IS OMITTED, NOT SENT, AND ONLY ON CREATE. The shipped
-  // caller computes it as `Number(billing.capUsd) || 0`, so a shop with no
-  // billing row yet — every free install, and every install before its
-  // subscription webhook lands — would ask for a ceiling of $0. Upstream that
-  // is not "unset", it is a real cap of nothing: `clamp_spend_cap` passes 0
+  // ★ A CAP OF ZERO IS OMITTED, NOT SENT, AND ONLY ON CREATE. Upstream, 0 is
+  // not "unset": it is a real cap of NOTHING. `clamp_spend_cap` passes 0
   // through unchanged and `check_spend` then refuses every call the merchant
-  // makes, on a workspace that reports `status: "active"`. Omitting the field
-  // instead means the org inherits the PARTNER's own operator-configured
-  // ceiling — `clamp_spend_cap` returns `(partner ceiling, false)` for a `None`
-  // — which is the most this org could ever have been granted anyway, so the
-  // install works and nothing is over-provisioned relative to the partner.
+  // makes, on a workspace that authenticates fine and reports
+  // `status: "active"` — a shop that is dead on arrival with no error anywhere
+  // to say why. Omitting the field instead means the org inherits the PARTNER's
+  // own operator-configured ceiling — `clamp_spend_cap` returns
+  // `(partner ceiling, false)` for a `None` — which is the most this org could
+  // ever have been granted anyway, so the install works and nothing is
+  // over-provisioned relative to the partner.
   //
-  // ★ BUT DO NOT READ THAT AS PER-SHOP CONTAINMENT: TODAY IT IS NOT. An earlier
-  // version of this comment claimed "a real ceiling arrives moments later
-  // through updatePartnerWorkspace()". It does not. Nothing in this repo calls
-  // updatePartnerWorkspace — the app_subscriptions/update webhook
-  // (src/webhooks/shopify.js) calls refreshEntitlement(shop) and stops there —
-  // so a free or Starter install keeps the WHOLE partner budget as its ceiling
-  // indefinitely. The partner-level cap still bounds total damage, but the
-  // per-shop bound that src/webhooks/ndr.js's unauthenticated endpoint is
-  // supposed to sit behind does not exist until one of two things lands: the
-  // subscription handler pushes { plan, monthlySpendCapUsd } upstream through
-  // updatePartnerWorkspace(), or create sends a non-zero floor instead of
-  // omitting. Both live outside this file. The omit-vs-send-0 choice itself is
-  // still right — 0 is a real cap of nothing, not "unset" — so what is missing
-  // is the follow-up, not this branch.
+  // ★ THIS IS A GUARD AGAINST A CALLER BUG, NOT THE ORDINARY PATH, AND THE
+  // DIFFERENCE IS THE WHOLE POINT OF THE BRANCH. The shipped caller —
+  // tryPartnerProvision() in src/provisioning.js — no longer forwards the
+  // Shopify usage cap here (`Number(billing.capUsd) || 0`, which was 0 for
+  // every install, because every shop installs on Starter). It now sends
+  // costCeilingUsd(plan): a COST ceiling priced off the plan through
+  // plans.costCeilingFor() — starter $10, growth $135, scale $360 — and
+  // documented to return a POSITIVE number for every input, including plan
+  // handles this build has never heard of, falling back to a floor rather than
+  // to 0. So in the shipped app `cap > 0` always holds, the field is always
+  // sent, and every workspace this route creates is bounded on its own.
+  //
+  // ★ DO NOT "TIDY" LINE 2 BELOW TO `if (cap !== null)`. That edit does not
+  // restore a missing capability; it re-opens the ability to send a literal 0
+  // on create, i.e. to convert some future caller's arithmetic slip into a
+  // workspace that can never place a call. The per-shop containment that
+  // src/webhooks/ndr.js's unauthenticated endpoint sits behind comes from the
+  // caller's positive number, not from this arm — and it no longer depends on
+  // create alone either: provisioning.syncWorkspaceSpendCap() re-sends
+  // { plan, monthlySpendCapUsd } through updatePartnerWorkspace() on every
+  // app_subscriptions/update (src/webhooks/shopify.js), on the billing callback
+  // and cancel routes in src/server.js, and on the six-hourly reconcile sweep.
   //
   // updatePartnerWorkspace() does send a 0 verbatim, because there it is an
-  // explicit instruction rather than a missing value.
+  // explicit instruction from a caller that already holds the workspace, rather
+  // than a value that never arrived.
   const cap = numberOrNull(args.monthlySpendCapUsd);
   if (cap !== null && cap > 0) body.monthlySpendCapUsd = cap;
   if (args.countryHint) body.countryHint = String(args.countryHint).trim().toUpperCase();
@@ -1148,9 +1156,9 @@ export async function provisionWorkspace(externalId, opts = {}) {
   //      attempts for ONE shop: provisioning.js builds `plan` from the billing
   //      row, `metadata.shopifySubscriptionId` from a webhook that has usually
   //      not landed yet, `countryHint` from an async lookup that can time out,
-  //      and `monthlySpendCapUsd` is omitted at 0 and present once billing
-  //      arrives. A key derived from the shop domain alone would therefore
-  //      cover several different requests.
+  //      and `monthlySpendCapUsd` is priced off that same plan, so it moves
+  //      whenever the plan does. A key derived from the shop domain alone would
+  //      therefore cover several different requests.
   //
   //   2. A REPLAY NEVER REACHES THE HANDLER, SO IT NEVER RESTORES. A cached
   //      entry is served straight out of Redis without running create at all.
@@ -1479,12 +1487,28 @@ export async function getPartnerWorkspaceByExternalId(externalId) {
 /**
  * Update a workspace's plan, spend ceiling or status — contract (3) above.
  *
- * ★ NOTHING IN THIS REPO CALLS THIS YET, and that is a live gap rather than a
- * spare part. It is meant to run on every app_subscriptions/update so the
- * upstream ceiling tracks the plan the merchant is actually paying Shopify for;
- * the webhook handler in src/webhooks/shopify.js currently stops at
- * refreshEntitlement(shop). Until it does, every workspace keeps whatever
- * ceiling create left it with — see the spend-cap note in provisionWorkspace().
+ * ★ THIS IS HOW A PLAN CHANGE REACHES THE PLATFORM, and it has exactly one
+ * caller: provisioning.syncWorkspaceSpendCap(). That function reads the shop's
+ * entitlement, prices it with plans.costCeilingFor(), and PATCHes
+ * { plan, monthlySpendCapUsd } here for shops whose workspace this app
+ * provisioned (`telenowKeySource === 'partner'`); pool-leased workspaces are
+ * skipped, because their ceiling was set by hand by the operator who minted
+ * them. It runs on every app_subscriptions/update (src/webhooks/shopify.js,
+ * sequenced AFTER refreshEntitlement so it reads the plan the merchant just
+ * landed on rather than the one they left), on the billing callback and the
+ * cancel route in src/server.js, and on the six-hourly reconcile sweep — which
+ * is also what repairs every workspace provisioned before the ceiling existed,
+ * with no migration to run.
+ *
+ * Without that caller the ceiling would be frozen at whatever create left it
+ * with, which for every shop is Starter's, since every shop installs on
+ * Starter — see the spend-cap note in provisionWorkspace() for the create half.
+ *
+ * FAIL LOUDLY HERE. syncWorkspaceSpendCap() is the layer that swallows, by
+ * contract, so that a webhook or a boot sweep is not broken by an upstream bad
+ * day; it logs and lets the next transition or sweep retry. Softening this into
+ * a resolve-on-error would only hide the failure from the one place that knows
+ * what to do about it.
  *
  * ONLY THE FIELDS GIVEN ARE SENT. Every one of them is an absolute value rather
  * than a delta (which is why this route needs no Idempotency-Key: replaying it

@@ -23,7 +23,7 @@ import { DeliveryMethod, InvalidWebhookError } from '@shopify/shopify-api';
 import { shopify, HOST } from '../shopify.js';
 import { deleteShop, collectCustomerData, redactCustomer } from '../store.js';
 import { refreshEntitlement } from '../billing.js';
-import { releaseWorkspace } from '../provisioning.js';
+import { releaseWorkspace, syncWorkspaceSpendCap } from '../provisioning.js';
 import { removeTelenowHook } from './telenow.js';
 
 import { handleAbandonedCheckout } from '../automations/abandonedCheckout.js';
@@ -120,11 +120,41 @@ shopify.webhooks.addHandlers({
   // return and the reconciliation sweep can never disagree about what a shop is
   // entitled to — and a truncated or reordered delivery self-heals instead of
   // persisting a wrong plan until someone notices.
+  //
+  // THE SECOND STEP IS THE ONE THAT WAS MISSING, and its absence is why every
+  // upgraded shop sat on its install-time spend ceiling forever.
+  //
+  // The ceiling is a COST limit — what Telenow is allowed to spend on this
+  // shop's behalf — and it is derived from the plan. At install every shop is on
+  // Starter, so the ceiling written at provision time is Starter's. Nothing then
+  // re-sent it: this callback refreshed the entitlement and stopped, and
+  // updatePartnerWorkspace had no caller anywhere in the app. A merchant who
+  // upgraded to Scale therefore kept a Starter-shaped ceiling upstream, and —
+  // because a non-positive requested cap is read upstream as "no ceiling of my
+  // own" — a shop provisioned with Starter's zero inherited the partner's WHOLE
+  // budget instead. Either way the number upstream stopped describing the
+  // merchant the moment their plan changed.
+  //
+  // So the ceiling is re-sent here, on every subscription transition Shopify
+  // tells us about: upgrade, downgrade, freeze for a failed payment, cancel,
+  // expiry. It runs AFTER the refresh and not in parallel with it, because
+  // syncWorkspaceSpendCap reads the entitlement back out of the store — racing
+  // the two would push the ceiling for the plan the shop just LEFT.
+  //
+  // syncWorkspaceSpendCap never throws by contract (it no-ops for shops with no
+  // partner-provisioned workspace, which is most of them), so a failure upstream
+  // cannot turn this delivery into a non-200 and start a Shopify retry storm.
+  // The awaited chain inside one runHandler is belt-and-braces on top of that:
+  // if the contract is ever broken, the rejection lands in runHandler's catch
+  // and is logged, exactly like every other handler failure here.
   APP_SUBSCRIPTIONS_UPDATE: {
     deliveryMethod: DeliveryMethod.Http,
     callbackUrl: CALLBACK_URL,
     callback: (_topic, shop) =>
-      runHandler('app_subscriptions/update', () => refreshEntitlement(shop)),
+      runHandler('app_subscriptions/update', async () => {
+        await refreshEntitlement(shop);
+        await syncWorkspaceSpendCap(shop);
+      }),
   },
 
   // ── App lifecycle ───────────────────────────────────────────────────────────

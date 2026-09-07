@@ -329,25 +329,10 @@
     background: var(--line); overflow: hidden;
   }
   .wstep-line i { display: block; height: 100%; background: var(--accent); border-radius: 2px; transition: width .35s ease; }
-  .voice {
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    text-align: left; padding: 11px 13px; border-radius: 10px; cursor: pointer;
-    background: var(--card); border: 1.5px solid var(--line); color: var(--text);
-    transition: border-color .15s ease, box-shadow .15s ease;
-  }
-  .voice:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
-  .play {
-    flex: 0 0 auto; width: 30px; height: 30px; border-radius: 50%; padding: 0;
-    display: inline-flex; align-items: center; justify-content: center;
-    font-size: 11px; border: 1px solid var(--line); background: var(--bg);
-    color: var(--text); cursor: pointer; transition: background .15s ease, color .15s ease;
-  }
-  .play:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
   /* The dark theme's accent is lighter, so white on it lands at only 4.2:1 —
      deepen the fill on both solid-accent controls to clear AA at 13px. */
   html[data-theme="dark"] #avatar,
-  html[data-theme="dark"] .seg-btn.active,
-  html[data-theme="dark"] .play:hover {
+  html[data-theme="dark"] .seg-btn.active {
     background: color-mix(in srgb, var(--accent) 86%, #000);
     border-color: color-mix(in srgb, var(--accent) 86%, #000);
   }
@@ -357,7 +342,6 @@
     animation: spin .7s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .voice.active { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
   .toasts { position: fixed; right: 16px; bottom: 16px; z-index: 60; display: flex; flex-direction: column; gap: 8px; }
   .toast {
     background: var(--card); color: var(--text); border: 1px solid var(--line);
@@ -1086,7 +1070,6 @@
     confirm: null,
     wiz: null,
     kbs: null,
-    playing: null,
     ndrUrl: null,
     integrations: null,
     escalations: null,
@@ -1972,7 +1955,15 @@
   // few snake_case exceptions (stt_config.smart_format, session_config.memory_type).
   // Every lookup below binds to the exact key the API returns.
 
-  /** Look up a provider entry in a catalog section ("llm"|"stt"|"tts"|"telephony"). */
+  /**
+   * Look up a provider entry in a catalog section ("llm"|"stt"|"tts"|"telephony").
+   *
+   * Returns null when the catalog never arrived, and EVERY caller below is
+   * written to survive that by printing the raw id. That is load-bearing, not
+   * defensive habit: the catalog is fetched on one screen only, its fetch is
+   * allowed to fail, and a label helper that threw on a missing entry would
+   * take the whole agent page down over a decoration.
+   */
   function catProvider(section, id) {
     const list = S.catalog && S.catalog[section];
     if (!Array.isArray(list) || !id) return null;
@@ -2427,6 +2418,15 @@
     try {
       // The catalog is a large, near-static payload the server caches per shop;
       // fetch it alongside but never let it fail the view.
+      //
+      // This is now the ONLY place the app reads /api/catalog, and it reads it
+      // as a DICTIONARY, never as a menu: the wizard's pickers are gone, so
+      // nothing here can change what an agent runs. It buys two things the
+      // agent itself does not carry — readable names for the raw ids the API
+      // returns ("xai" → "xAI"), and the per-provider latency the "Expected
+      // latency" card quotes. Both are decoration, which is why the fetch is
+      // allowed to fail: catProvider() then finds no list, and every label
+      // helper below falls back to printing the raw id rather than throwing.
       const [detail] = await Promise.all([
         api('/api/agents/' + encodeURIComponent(id)),
         S.catalog ? Promise.resolve(null) : api('/api/catalog').then((c) => { S.catalog = c; }).catch(() => null),
@@ -2924,20 +2924,45 @@
 
 
   // ── Setup wizard ────────────────────────────────────────────────────────────
-  // Three steps: Context (how the agent sounds and what it says), Access (what
-  // it can reach and when it fires), Review (confirm, then publish).
+  // Three steps: Context (what the agent says and knows), Access (what it can
+  // reach and when it fires), Review (confirm, then publish).
   //
   // Everything arrives pre-filled from the template. The merchant is confirming
   // a working configuration, not assembling one — the only genuinely empty
   // field is the knowledge base.
+  //
+  // What is deliberately NOT here is the model stack. It used to be the first
+  // thing the wizard asked for — six dropdowns and a voice shortlist — and it
+  // was the one setting a merchant could move that changed what a minute costs
+  // us while the price they pay stayed flat. See SHIPPED_STACK below: the
+  // wizard now states the stack instead of offering it.
 
   const WIZ_STEPS = ['Context', 'Access', 'Review'];
 
-  /** Up to 4 voices per provider — the picker is for choosing, not browsing. */
-  function voicesFor(providerId) {
-    const p = catProvider('tts', providerId);
-    return (p && Array.isArray(p.voices) ? p.voices : []).slice(0, 4);
-  }
+  /**
+   * The stack every agent this app creates runs on, said in the merchant's words.
+   *
+   * PINNED, and deliberately not a choice. This app sells minutes at one flat
+   * price, and the stack is most of what a minute costs. The pickers that used
+   * to live in the wizard let a merchant swap the LLM, the transcriber and the
+   * voice inside that fixed price: at the expensive end a minute cost about
+   * $0.55 against $0.12 of overage revenue, so every call lost money and
+   * nothing in the product said so. Choice removed; templates.js pins the stack
+   * server-side and this block only SAYS what it pinned, so a merchant can
+   * still SEE what their agent runs.
+   *
+   * These labels mirror STACK in src/templates.js (xai / grok-4-fast-non-reasoning,
+   * deepgram / nova-3, smallest / lightning_v3.1_pro, voice "meher"). They are
+   * spelled out here rather than read from /api/catalog because the wizard has
+   * no other reason left to fetch the catalog, and four display strings are not
+   * worth a network round-trip that can fail and block setup.
+   */
+  const SHIPPED_STACK = {
+    voice: 'Meher',
+    llm: 'xAI Grok 4 Fast',
+    stt: 'Deepgram Nova-3',
+    tts: 'Smallest Lightning v3.1 Pro',
+  };
 
   /** White tick for a completed node. Inline for the same CSP reason as the rail. */
   const WIZ_CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"'
@@ -3067,57 +3092,12 @@
   }
 
   function wizStep1(c) {
-    const llm = (S.catalog?.llm || []).map((p) => ({ value: p.id, label: p.name || p.id }));
-    const llmModels = ((catProvider('llm', c.llmProvider) || {}).models || [])
-      .map((m) => ({ value: m.id, label: m.name || m.id }));
-    const stt = (S.catalog?.stt || []).map((p) => ({ value: p.id, label: p.name || p.id }));
-    const sttModels = (((catProvider('stt', c.sttProvider) || {}).configFields || [])
-      .find((f) => f.key === 'model')?.options || []).map((o) => ({ value: o.value, label: o.label }));
-    const tts = (S.catalog?.tts || []).map((p) => ({ value: p.id, label: p.name || p.id }));
-    const ttsModels = (((catProvider('tts', c.ttsProvider) || {}).configFields || [])
-      .find((f) => f.key === 'model')?.options || []).map((o) => ({ value: o.value, label: o.label }));
-    const voices = voicesFor(c.ttsProvider);
     const kbs = (S.kbs || []).map((k) => ({ value: k.id, label: k.name + (k.documents ? ` (${k.documents} docs)` : '') }));
 
     return `
-      <div class="grid grid-3" style="margin-bottom:16px;">
-        <div class="card">
-          <h2>Language model</h2>
-          <label>Provider</label>${selectOf('wLlmP', llm, c.llmProvider)}
-          <label style="margin-top:10px;display:block;">Model</label>${selectOf('wLlmM', llmModels, c.llmModel)}
-        </div>
-        <div class="card">
-          <h2>Speech to text</h2>
-          <label>Provider</label>${selectOf('wSttP', stt, c.sttProvider)}
-          <label style="margin-top:10px;display:block;">Model</label>${selectOf('wSttM', sttModels, c.sttModel)}
-        </div>
-        <div class="card">
-          <h2>Text to speech</h2>
-          <label>Provider</label>${selectOf('wTtsP', tts, c.ttsProvider)}
-          <label style="margin-top:10px;display:block;">Model</label>${selectOf('wTtsM', ttsModels, c.ttsModel)}
-        </div>
-      </div>
-
       <div class="card" style="margin-bottom:16px;">
-        <h2>Choose a voice</h2>
-        <p class="hint">Four from ${esc(providerName('tts', c.ttsProvider))}. Switch provider above to hear others.</p>
-        <div class="grid grid-4" style="margin-top:10px;">
-          ${voices.length ? voices.map((v) => `
-            <div class="voice${c.ttsVoice === v.id ? ' active' : ''}" data-voice="${esc(v.id)}">
-              <div style="min-width:0;">
-                <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(v.name || v.id)}</div>
-                <div class="hint">${esc([v.language, v.gender].filter(Boolean).join(' · '))}</div>
-              </div>
-              <button class="play" data-play="${esc(v.id)}" title="Play a sample" aria-label="Play a sample of ${esc(v.name || v.id)}">
-                ${S.playing === v.id ? '<span class="spin"></span>' : '▶'}</button>
-            </div>`).join('')
-            : '<p class="hint">This provider exposes no named voices — its default is used.</p>'}
-        </div>
-        <div class="banner" style="margin-top:12px;"><span>ℹ</span>
-          <div>Want a different voice? These four are a shortlist —
-          ${esc(String(((catProvider('tts', c.ttsProvider) || {}).voices || []).length))} come with this provider.
-          Press ▶ to hear any of them, or switch the text-to-speech provider above for a different set.</div>
-        </div>
+        <h2>Voice</h2>
+        <p class="hint">This agent speaks as ${esc(SHIPPED_STACK.voice)} on the tuned model stack included in your plan.</p>
       </div>
 
       <div class="card" style="margin-bottom:16px;">
@@ -3807,7 +3787,6 @@
   }
 
   function wizStep3(c) {
-    const voice = voicesFor(c.ttsProvider).find((v) => v.id === c.ttsVoice);
     const num = (S.numbers || []).find((n) => n.id === c.fromNumberId);
     const kb = (S.kbs || []).find((k) => k.id === c.knowledgeBaseId);
     return `
@@ -3815,10 +3794,10 @@
         <div class="card">
           <h2>Voice &amp; models</h2>
           <div class="kv">
-            ${kv('Language model', providerName('llm', c.llmProvider) + ' · ' + modelName('llm', c.llmProvider, c.llmModel))}
-            ${kv('Speech to text', providerName('stt', c.sttProvider) + ' · ' + (c.sttModel || 'default'))}
-            ${kv('Text to speech', providerName('tts', c.ttsProvider) + ' · ' + (c.ttsModel || 'default'))}
-            ${kv('Voice', voice ? [voice.name, voice.language, voice.gender].filter(Boolean).join(' · ') : (c.ttsVoice || 'default'))}
+            ${kv('Voice', SHIPPED_STACK.voice)}
+            ${kv('Language model', SHIPPED_STACK.llm)}
+            ${kv('Speech to text', SHIPPED_STACK.stt)}
+            ${kv('Text to speech', SHIPPED_STACK.tts)}
             ${kv('Knowledge base', c.kbMode === 'new' && (c.kbName || '').trim()
               ? c.kbName.trim() + ' (new)' : (kb ? kb.name : 'None'))}
             ${kv('Post-call analysis', c.postCallAnalysis ? 'On' : 'Off')}
@@ -3876,15 +3855,15 @@
     const w = S.wiz;
     if (!w) return '';
     const c = w.config;
-    // openWizard renders before the catalog, numbers and knowledge bases are
-    // fetched, so config is null on that first pass. Passing it to a step
-    // would throw inside render() and silently abort the whole page.
+    // openWizard renders before the numbers and knowledge bases are fetched,
+    // so config is null on that first pass. Passing it to a step would throw
+    // inside render() and silently abort the whole page.
     if (!c) {
       return `<p><button class="btn secondary" id="wizCancel">&larr; Back to templates</button></p>
         <h1 style="margin-bottom:4px;">Set up ${esc(w.name)}</h1>
         ${stepBar(0)}
         ${w.error ? `<div class="banner err"><span>✕</span><div>${esc(w.error)}</div></div>`
-          : loadingInline('Loading models, voices and numbers…') + skForm(4, 90)}`;
+          : loadingInline('Loading your numbers and knowledge bases…') + skForm(4, 90)}`;
     }
     const last = w.step === 2;
     return `
@@ -3901,50 +3880,7 @@
       </div>`;
   }
 
-  /**
-   * Play a sample of one voice.
-   *
-   * Audio arrives as bytes from our own server (the browser never holds the
-   * Telenow key), so it is played from a blob URL — which is revoked on end to
-   * avoid leaking one object URL per press.
-   */
-  let previewAudio = null;
-  async function playVoice(voiceId) {
-    const c = S.wiz?.config;
-    if (!c || S.playing) return;
-    // Stop whatever is already playing before starting another.
-    if (previewAudio) { try { previewAudio.pause(); } catch (e) {} previewAudio = null; }
-
-    S.playing = voiceId;
-    render();
-    try {
-      const r = await Progress.track(fetch(new URL('/api/voice-preview', location.origin), {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: 'Bearer ' + (await sessionToken()),
-        },
-        body: JSON.stringify({
-          provider: c.ttsProvider, voice: voiceId, model: c.ttsModel,
-          text: c.opener,
-        }),
-      }));
-      if (!r.ok) {
-        const data = await r.json().catch(() => ({}));
-        throw new Error(data.message || `HTTP ${r.status}`);
-      }
-      const url = URL.createObjectURL(await r.blob());
-      previewAudio = new Audio(url);
-      previewAudio.addEventListener('ended', () => URL.revokeObjectURL(url));
-      await previewAudio.play();
-    } catch (err) {
-      toast('Could not play that voice: ' + err.message, 'err');
-    }
-    S.playing = null;
-    render();
-  }
-
-  /** Open the wizard for one template, pre-filled from it plus the catalog. */
+  /** Open the wizard for one template, pre-filled from it. */
   async function openWizard(key) {
     const tpl = (S.templates?.templates || []).find((t) => t.key === key);
     if (!tpl) return;
@@ -3952,9 +3888,10 @@
     S.view = 'wizard';
     render();
 
-    // The wizard needs the catalog (models and voices), the numbers and the KBs.
+    // The wizard needs the numbers and the knowledge bases — nothing else. It
+    // used to pull /api/catalog as well, to fill the model and voice pickers;
+    // those are gone, so setup no longer waits on a fetch that can fail.
     await Promise.all([
-      S.catalog ? null : api('/api/catalog').then((c) => { S.catalog = c; }).catch(() => null),
       S.numbers === null ? loadNumbers() : null,
       S.kbs === null ? api('/api/knowledge-bases')
         .then((r) => { S.kbs = r.knowledgeBases || []; })
@@ -3969,16 +3906,11 @@
 
     // A wizard opened and then abandoned mid-fetch must not overwrite a newer one.
     if (!S.wiz || S.wiz.key !== key) return;
-    if (!S.catalog) {
-      S.wiz.error = 'Could not load the voice and model catalogue. Reload the page and try again.';
-      render();
-      return;
-    }
     S.wiz.config = {
-      // Defaults mirror templates.js STACK — the merchant is confirming, not assembling.
-      llmProvider: 'xai', llmModel: 'grok-4-fast-non-reasoning',
-      sttProvider: 'deepgram', sttModel: 'nova-3',
-      ttsProvider: 'smallest', ttsModel: 'lightning_v3.1_pro', ttsVoice: 'meher',
+      // No provider, model or voice field lives here any more. The stack is
+      // pinned server-side in templates.js, so there is nothing for the wizard
+      // to hold, nothing to post, and no dropdown that can move the cost of a
+      // minute past the flat price this app charges for it.
       systemPrompt: tpl.prompt,
       opener: tpl.opener,
       speakOpener: true,
@@ -4033,12 +3965,6 @@
     const c = w.config;
     const val = (id) => { const el = $(id); return el ? el.value : undefined; };
     if (w.step === 0) {
-      c.llmProvider = val('#wLlmP') ?? c.llmProvider;
-      c.llmModel = val('#wLlmM') ?? c.llmModel;
-      c.sttProvider = val('#wSttP') ?? c.sttProvider;
-      c.sttModel = val('#wSttM') ?? c.sttModel;
-      c.ttsProvider = val('#wTtsP') ?? c.ttsProvider;
-      c.ttsModel = val('#wTtsM') ?? c.ttsModel;
       c.systemPrompt = val('#wPrompt') ?? c.systemPrompt;
       c.opener = val('#wOpener') ?? c.opener;
       const sp = $('#wSpeakOpener'); if (sp) c.speakOpener = sp.checked;
@@ -4175,9 +4101,6 @@
       const r = await api('/api/templates/' + encodeURIComponent(w.key) + '/publish', {
         method: 'POST',
         body: JSON.stringify({
-          llmProvider: c.llmProvider, llmModel: c.llmModel,
-          sttProvider: c.sttProvider, sttModel: c.sttModel,
-          ttsProvider: c.ttsProvider, ttsModel: c.ttsModel, ttsVoice: c.ttsVoice,
           systemPrompt: c.systemPrompt, opener: c.opener, speakOpener: c.speakOpener,
           knowledgeBaseId: kbId || undefined,
           postCallAnalysis: c.postCallAnalysis,
@@ -4442,20 +4365,6 @@
     if (wizCancel) wizCancel.addEventListener('click', closeWizard);
     document.querySelectorAll('[data-wizstep]').forEach((b) =>
       b.addEventListener('click', () => wizGoTo(Number(b.dataset.wizstep))));
-    // Provider changes reset the dependent model/voice lists, so re-read the
-    // step and re-render rather than leaving a stale model selected.
-    ['#wLlmP','#wSttP','#wTtsP'].forEach((sel) => {
-      const el = $(sel);
-      if (!el) return;
-      el.addEventListener('change', () => {
-        collectWizard();
-        const c = S.wiz.config;
-        if (sel === '#wLlmP') c.llmModel = (catProvider('llm', c.llmProvider)?.models || [])[0]?.id || '';
-        if (sel === '#wSttP') c.sttModel = '';
-        if (sel === '#wTtsP') { c.ttsModel = ''; c.ttsVoice = (voicesFor(c.ttsProvider)[0] || {}).id || ''; }
-        render();
-      });
-    });
     document.querySelectorAll('[data-kbmode]').forEach((b) =>
       b.addEventListener('click', () => {
         collectWizard();
@@ -4489,11 +4398,6 @@
     const quiet = $('#wQuiet');
     if (quiet) quiet.addEventListener('change', () => { collectWizard(); render(); });
 
-    document.querySelectorAll('[data-play]').forEach((b) =>
-      b.addEventListener('click', (ev) => { ev.stopPropagation(); playVoice(b.dataset.play); }));
-
-    document.querySelectorAll('[data-voice]').forEach((b) =>
-      b.addEventListener('click', () => { collectWizard(); S.wiz.config.ttsVoice = b.dataset.voice; render(); }));
     const spk = $('#wSpeakOpener');
     if (spk) spk.addEventListener('change', () => { collectWizard(); render(); });
 

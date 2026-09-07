@@ -74,14 +74,38 @@
 // A key is therefore only returned once metering is wired, and the wiring is
 // re-attempted on every request until it is. See ensureMetering().
 //
+// EVERY WORKSPACE CARRIES A COST CEILING, AND IT IS NOT THE MERCHANT'S CAP.
+// A pool entry gets its ceiling by hand, from the operator who minted it. A
+// partner-minted workspace gets it from us, on the create call and again on every
+// plan change — see costCeilingUsd() and syncWorkspaceSpendCap(). The value is
+// what TELENOW is allowed to SPEND on this shop's behalf, derived from what the
+// shop can contractually pay us; it is never `billing.capUsd`, which is a Shopify
+// approval limit that reads 0 on the tier every shop installs on. A ceiling of 0
+// upstream means "no ceiling of my own, use the partner's whole budget", so the
+// naive mapping is the difference between a bounded workspace and an unbounded
+// one — and the bound is the containment the unauthenticated carrier NDR endpoint
+// (src/webhooks/ndr.js) is supposed to sit behind.
+//
 // SECURITY: never log a `vai_live_…` key. Log the workspace ref instead — that
-// is what the operator needs to find the entry, and it is not a credential.
+// is what the operator needs to find the entry, and it is not a credential. The
+// same goes for `tnp_live_…`: the partner key is read from the environment and
+// never travels through a log line, an error message or a settings row.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { getEntitlement } from './billing.js';
+// NAMESPACE IMPORT, NOT A NAMED ONE, and for the same reason tryPartnerProvision()
+// and resolveShopCountry() import dynamically: `costCeilingFor` lands in
+// src/plans.js on its own schedule, and a static NAMED import of an export that is
+// not there yet is a link-time SyntaxError that takes the whole server down at
+// boot. A namespace import binds whatever the module actually exports and lets
+// costCeilingUsd() below degrade to a documented floor instead. plans.js itself is
+// a leaf module (it imports only @shopify/shopify-api), so there is no cycle to
+// pay for here.
+import * as plans from './plans.js';
 import { getSettings, updateSettings } from './settings.js';
 import { leaseKey, releaseKey, markKeyDead, keypoolStatus, getHook, deleteHook } from './store.js';
 import { TelenowClient } from './telenow.js';
@@ -147,6 +171,25 @@ const SHOP_COUNTRY_TIMEOUT_MS = 4_000;
  */
 const SHOP_COUNTRY_BACKFILL_COOLDOWN_MS = 15 * 60 * 1000;
 
+/**
+ * The ceiling to send when plans.costCeilingFor() cannot be reached.
+ *
+ * It is Starter's floor, i.e. the SMALLEST ceiling in the table, and that
+ * direction is the whole point. The two ways to be wrong here are not symmetric:
+ * a ceiling that is too low throttles one shop's calling and shows up as a
+ * merchant complaint an operator can fix in a minute, while a ceiling that is too
+ * high — and 0, upstream, means "no ceiling at all" — is an unbounded workspace
+ * behind an unauthenticated endpoint, which shows up as a bill. So the fallback is
+ * deliberately the conservative one, and it is a real positive number rather than
+ * 0 or an omission for exactly that reason.
+ *
+ * Duplicating Starter's number here is a knowing cost: plans.js owns the table and
+ * this is a floor for the case where the table cannot be read at all, so the two
+ * cannot be derived from one another without reintroducing the import that is
+ * being guarded against.
+ */
+const FALLBACK_COST_CEILING_USD = 10;
+
 const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
   : path.resolve(__dirname, '..', 'data');
@@ -171,8 +214,33 @@ const POOL_FILE = path.join(DATA_DIR, 'keypool.json');
  */
 const inFlight = new Map();
 
+/**
+ * In-flight spend-ceiling pushes, keyed by shop. Same shape and same reason as
+ * `inFlight` above.
+ *
+ * Shopify delivers app_subscriptions/update more than once for a single plan
+ * change — the pending→active transition, the trial ending, a retry of a
+ * delivery it did not see acked — and the boot reconciliation sweep can land on
+ * top of any of those. Every one of them wants to push the same PATCH. Without
+ * this map a plan change fires three or four identical partner-API writes in the
+ * same second, which is a self-inflicted burst against the exact endpoint that has
+ * to stay reachable for the ceiling to be correctable at all. Everyone awaits the
+ * first promise; the entry is dropped in a `finally`, so a failed push is retried
+ * by the next webhook rather than cached as a permanent failure.
+ *
+ * @type {Map<string, Promise<void>>}
+ */
+const spendCapInFlight = new Map();
+
 /** The partner seam logs once per process, not once per request (see below). */
 let partnerSeamLogged = false;
+
+/**
+ * The cost-ceiling seam logs once per process too — it is an instance-wide
+ * condition (plans.js not exporting costCeilingFor yet), so a line per shop would
+ * repeat the same sentence for every install on the server.
+ */
+let costCeilingSeamLogged = false;
 
 /**
  * The shop-country seam logs once per process too.
@@ -493,6 +561,192 @@ function discardDeadKey(shop, status) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Spend ceiling
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * What Telenow may spend on this shop's behalf in a month, in USD.
+ *
+ * READ THE DIFFERENCE BETWEEN THIS AND `billing.capUsd`, because confusing the
+ * two is the defect this function exists to remove. `capUsd` is the USAGE CAP the
+ * merchant approved on Shopify's own screen: the most Shopify will let us CHARGE
+ * them for overage. It is a revenue limit, it is 0 on Starter, and 0 is what every
+ * shop on this server installs with. The number this returns is a COST limit — the
+ * most we let the platform burn on carrier minutes, model tokens and TTS for that
+ * shop — and it comes from the plan, via plans.costCeilingFor(), never from the
+ * merchant's approval.
+ *
+ * Guarded rather than called straight for two independent failure modes, both of
+ * which must resolve to a positive number:
+ *
+ *  - plans.costCeilingFor may not exist in this build (see the namespace import at
+ *    the top of the file);
+ *  - it may return something unusable — 0, NaN, a negative — from a plan handle
+ *    this build has never heard of.
+ *
+ * Either way we fall back to FALLBACK_COST_CEILING_USD and NEVER to 0, because 0
+ * is not "unset" on the partner plane: telenow.updatePartnerWorkspace() sends a 0
+ * verbatim as an explicit instruction, and provisionWorkspace() omits it, and both
+ * readings mean the workspace inherits the partner's entire budget. Returning 0
+ * from here would reproduce the original bug through the code that fixes it.
+ *
+ * @param {string} planHandle
+ * @returns {number} USD, always > 0
+ */
+function costCeilingUsd(planHandle) {
+  try {
+    if (typeof plans.costCeilingFor === 'function') {
+      const usd = Number(plans.costCeilingFor(planHandle));
+      if (Number.isFinite(usd) && usd > 0) return usd;
+    }
+  } catch (err) {
+    if (!costCeilingSeamLogged) {
+      costCeilingSeamLogged = true;
+      console.error(`[provisioning] plans.costCeilingFor threw (${err.message}) — every workspace will ` +
+        `be capped at the $${FALLBACK_COST_CEILING_USD} floor until it is fixed.`);
+    }
+    return FALLBACK_COST_CEILING_USD;
+  }
+
+  if (!costCeilingSeamLogged) {
+    costCeilingSeamLogged = true;
+    console.warn(`[provisioning] plans.costCeilingFor is unavailable or returned a non-positive value ` +
+      `for plan="${planHandle}" — falling back to the $${FALLBACK_COST_CEILING_USD} floor for every ` +
+      'workspace. Paid shops will be throttled below what they bought until plans.js exports it.');
+  }
+  return FALLBACK_COST_CEILING_USD;
+}
+
+/**
+ * The plan handle to price this shop's ceiling against.
+ *
+ * getEntitlement() is the canonical read and is documented never to throw and to
+ * serve from `settings.billing` for five minutes, so calling it here costs an
+ * Admin round trip only when a sync lands on a shop nobody has looked at recently
+ * — acceptable on the webhook and boot paths this runs on, and it means a caller
+ * that forgot to refreshEntitlement() first still sends the right number.
+ *
+ * Every failure resolves to 'starter', which is the SMALLEST ceiling. An
+ * entitlement we could not read must not be allowed to widen a spend limit.
+ *
+ * @param {string} shop
+ * @returns {Promise<string>}
+ */
+async function planHandleFor(shop) {
+  try {
+    const ent = await getEntitlement(shop);
+    const handle = String(ent?.plan || '').trim().toLowerCase();
+    if (handle) return handle;
+  } catch (err) {
+    // Documented as impossible; handled anyway, because this function sits under
+    // a "never throws" contract and a surprise here would break it.
+    console.error(`[provisioning] entitlement read for ${shop} failed: ${err.message} — pricing the ` +
+      'spend ceiling as Starter.');
+  }
+
+  try {
+    const stored = String(getSettings(shop)?.billing?.plan || '').trim().toLowerCase();
+    if (stored) return stored;
+  } catch {
+    // Nothing to read; fall through to the floor.
+  }
+  return 'starter';
+}
+
+/**
+ * Push this shop's cost ceiling upstream, so an upgrade is not a ceiling the
+ * workspace keeps from install day forever.
+ *
+ * THE HALF THAT HAS NEVER EXISTED. tryPartnerProvision() sets a ceiling once, at
+ * create time, and until this function landed `telenow.updatePartnerWorkspace()`
+ * had ZERO call sites anywhere in the repo — the app_subscriptions/update webhook
+ * refreshes the entitlement and stops. So a shop that installed on Starter and
+ * upgraded to Scale kept Starter's ceiling (and, before this change, kept a
+ * ceiling of 0, meaning the partner's entire budget) with nothing on any path to
+ * correct it. Charging a merchant $149 for a workspace we then throttle at $10 is
+ * as wrong as the unbounded version, in the other direction; both are fixed by the
+ * same call, which is why it re-sends `plan` alongside the number.
+ *
+ * A NO-OP FOR MOST SHOPS, ON PURPOSE, and silently so — it is expected to be
+ * called unconditionally from billing paths that have no idea how a given shop was
+ * provisioned. It returns without a word when:
+ *
+ *   - TELENOW_PARTNER_KEY is unset (there is no partner plane to talk to);
+ *   - the shop's key came from the pool, not the partner API. A pool workspace's
+ *     ceiling was set by hand by the operator who minted it, and PATCHing it from
+ *     here would silently overwrite an operator's deliberate number with a
+ *     plan-derived one on a workspace we do not own the lifecycle of;
+ *   - there is no workspace ref to address.
+ *
+ * NEVER THROWS. It runs on webhook handlers and on boot, where a rejection would
+ * abandon the rest of the caller's work — the entitlement refresh, the rest of a
+ * reconciliation sweep — over a ceiling that the next plan change would have
+ * pushed anyway. A failure is logged and the workspace keeps whatever ceiling it
+ * already had, which is the safe stale state in both directions.
+ *
+ * @param {string} shop
+ * @returns {Promise<void>}
+ */
+export async function syncWorkspaceSpendCap(shop) {
+  if (!shop) return;
+
+  const pending = spendCapInFlight.get(shop);
+  if (pending) return pending;
+
+  const promise = pushSpendCap(shop).finally(() => spendCapInFlight.delete(shop));
+  spendCapInFlight.set(shop, promise);
+  return promise;
+}
+
+/**
+ * The body of syncWorkspaceSpendCap, serialised per shop by the map above.
+ *
+ * @param {string} shop
+ * @returns {Promise<void>}
+ */
+async function pushSpendCap(shop) {
+  // Cheapest gate first: no partner plane, nothing to do, and no reason to read a
+  // settings row or an entitlement for the entire pool-provisioned install base.
+  if (!process.env.TELENOW_PARTNER_KEY) return;
+
+  let settings;
+  try {
+    settings = getSettings(shop) || {};
+  } catch (err) {
+    console.error(`[provisioning] could not read settings for ${shop} while syncing its spend ceiling: ${err.message}`);
+    return;
+  }
+
+  if ((settings.telenowKeySource || 'none') !== 'partner') return;
+
+  const ref = settings.telenowWorkspaceRef || null;
+  if (!ref) return;
+
+  const plan = await planHandleFor(shop);
+  const ceiling = costCeilingUsd(plan);
+
+  try {
+    const telenow = await import('./telenow.js');
+    if (typeof telenow.updatePartnerWorkspace !== 'function') {
+      throw new Error('NotImplemented: telenow.updatePartnerWorkspace');
+    }
+    // `plan` goes with it deliberately: upstream reads it for its own reporting
+    // and entitlement, and a workspace whose plan says starter while its ceiling
+    // says $360 is the kind of disagreement that gets debugged twice.
+    await telenow.updatePartnerWorkspace(ref, { plan, monthlySpendCapUsd: ceiling });
+    // One line, and the ref is not a credential (see the header). This is what an
+    // operator greps to prove that a merchant's upgrade actually reached the
+    // platform, which no log line could say before this function existed.
+    console.log(`[provisioning] spend ceiling for ${shop} synced: plan=${plan} ` +
+      `ceiling=$${ceiling}/mo on workspace ${ref}.`);
+  } catch (err) {
+    console.error(`[provisioning] could not sync the spend ceiling for ${shop} ` +
+      `(plan=${plan}, ceiling=$${ceiling}, workspace ${ref}): ${err.message} — the workspace keeps its ` +
+      'previous ceiling; the next plan change or boot sweep retries.');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Partner provisioning — the v1.1 seam
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -549,11 +803,39 @@ async function tryPartnerProvision(shop) {
     // except minting is irreversible, so it would ship a wrong number per install.
     // Omitted (rather than guessed) when the shop's country is unknown.
     const countryHint = await resolveShopCountry(shop);
+
+    // THE CEILING IS A COST LIMIT DERIVED FROM THE PLAN, NOT THE MERCHANT'S CAP.
+    //
+    // This line used to read `monthlySpendCapUsd: Number(billing.capUsd) || 0`,
+    // and that mapping shipped an UNCAPPED workspace on every single install.
+    // Three facts compose into it:
+    //
+    //   1. `billing.capUsd` is the Shopify usage cap — the most Shopify will let
+    //      us CHARGE the merchant for overage. It is a revenue ceiling, not a cost
+    //      one, and the two are not the same quantity in either direction.
+    //   2. It is 0 on Starter, and EVERY shop installs on Starter: the entitlement
+    //      row is written before any subscription exists, so the value read here at
+    //      provisioning time is 0 for literally every workspace we have minted.
+    //   3. Upstream, a non-positive requested cap is not "cap of zero", it is "no
+    //      ceiling of my own" — provisionWorkspace() omits the field entirely at
+    //      <= 0 — so the workspace inherits the PARTNER's whole budget. One shop
+    //      could therefore spend the entire partner balance, and that per-shop
+    //      bound is exactly the containment the unauthenticated carrier NDR
+    //      endpoint in src/webhooks/ndr.js is documented to sit behind.
+    //
+    // costCeilingUsd() answers the question actually being asked — how much may we
+    // SPEND on this shop — from the plan, and is guaranteed positive, so the field
+    // is always sent and the workspace is always bounded. It is re-sent on every
+    // plan change by syncWorkspaceSpendCap(); without that half, this number would
+    // be frozen at whatever the shop installed on.
+    const planHandle = billing.plan || 'starter';
+    const monthlySpendCapUsd = costCeilingUsd(planHandle);
+
     const result = await telenow.provisionWorkspace({
       externalId: shop,
       name: `${shop.replace('.myshopify.com', '')} (Shopify)`,
-      plan: billing.plan || 'starter',
-      monthlySpendCapUsd: Number(billing.capUsd) || 0,
+      plan: planHandle,
+      monthlySpendCapUsd,
       ...(countryHint ? { countryHint } : {}),
       metadata: { platform: 'shopify', shopifySubscriptionId: billing.subscriptionId || null },
     });
@@ -579,7 +861,8 @@ async function tryPartnerProvision(shop) {
     console.log(`[provisioning] ${shop} provisioned workspace ${result.workspaceId || '(unknown ref)'} ` +
       `via partner API — number ${result?.number?.e164 || '(none attached)'} ` +
       `provider=${provider || 'unknown'} country=${country || 'unknown'}; ` +
-      `shop country=${countryHint || 'unknown'}`);
+      `shop country=${countryHint || 'unknown'}; plan=${planHandle} ` +
+      `spend ceiling=$${monthlySpendCapUsd}/mo`);
     if (countryHint && country && country !== countryHint) {
       console.warn(`[provisioning] COUNTRY PREFERENCE UNMET for ${shop}: asked the partner API for ` +
         `${countryHint}, got ${country}.`);

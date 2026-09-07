@@ -62,6 +62,24 @@
 //      protects the merchant's data, which lives in the workspace they had.
 //      It RUNS BEFORE (f) in the code, because (f) ends by draining the pool to
 //      exhaustion on purpose and nothing after it can lease anything at all.
+//   h) EVERY PLAN CARRIES A NON-ZERO COST CEILING, AND IT REACHES THE WIRE.
+//      The shipped code sent `monthlySpendCapUsd: Number(billing.capUsd) || 0`
+//      on provision, and every shop is on Starter at install time — whose capUsd
+//      is 0. Upstream a non-positive requested cap is not "spend nothing", it is
+//      "no ceiling of my own", so the workspace inherits the PARTNER's whole
+//      budget; and nothing corrected it later either, because
+//      updatePartnerWorkspace() had no call site anywhere in this repo. Every
+//      workspace this app ever provisioned was therefore effectively uncapped —
+//      which is also the containment the UNAUTHENTICATED carrier NDR endpoint in
+//      src/webhooks/ndr.js is supposed to sit behind. It runs AFTER (f) because
+//      the partner plane mints rather than leases and needs no pool inventory.
+//   i) THE MODEL STACK IS PINNED AND A MERCHANT CANNOT MOVE IT. The app sells
+//      minutes at a flat price but used to let the wizard pick the LLM, the STT
+//      and the TTS inside that minute, so cost per minute varied 2.9x from two
+//      dropdowns against a fixed $0.12 of overage revenue. buildAgentPayload()
+//      must now return the shipped STACK no matter what the caller passes, and
+//      the check carries a positive control (name/opener DO still apply) so a
+//      harness that has stopped passing overrides at all cannot pass it.
 //
 // Run:  node test/billing.mjs        (or npm run test:billing)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,8 +102,20 @@ const SHOP_LIMIT = 'limit-shop.myshopify.com';
 const SHOP_DEFERRED = 'deferred-shop.myshopify.com';
 const SHOP_Q1 = 'quarantine-one.myshopify.com';
 const SHOP_Q2 = 'quarantine-two.myshopify.com';
+const SHOP_PARTNER = 'partner-shop.myshopify.com';
 
 const TEST_NUMBER = '+919876543210';
+
+/**
+ * The workspace the faked partner plane mints, and the credential it hands back.
+ *
+ * The ref is asserted on (the PATCH has to target the workspace that create
+ * returned, or the ceiling lands on somebody else's org); the key is never
+ * printed, compared against a log, or included in any `detail` string — same
+ * rule as the pool's vai_live_ values.
+ */
+const PARTNER_WORKSPACE_ID = 'pw-test-0001';
+const PARTNER_MINTED_KEY = 'vai_live_partnermint_0001';
 
 /**
  * The usage line item gid Shopify hands back. The query string is not
@@ -260,24 +290,96 @@ function paidSubscription(name, { status = 'ACTIVE', capUsd = 200, balanceUsedUs
   };
 }
 
-// ── Admin GraphQL interception ───────────────────────────────────────────────
+// ── Admin GraphQL and partner-plane interception ─────────────────────────────
 
 /** Every appUsageRecordCreate the app sent, in order. THE money assertion. */
 const usageRecords = [];
 
-function installAdminGraphQLStub() {
+/**
+ * Every request the app sent to the Telenow PARTNER plane (`/api/partner/v1/…`),
+ * in order, as `{ method, path, body }`. THE spend-ceiling assertion.
+ *
+ * Faked here rather than in test/mock-telenow.mjs on purpose. The point of
+ * section (h) is what src/telenow.js actually PUTS ON THE WIRE — a cap of 0 is
+ * omitted from a create body rather than sent, so "the app asked for a ceiling"
+ * and "the app asked for nothing and inherited the partner's whole budget" are
+ * distinguishable only by reading the serialised body. Recording it at the fetch
+ * boundary means the real partner client, its real omit-at-zero rule and the
+ * real provisioning caller are all under test; only the server is imaginary.
+ */
+const partnerRequests = [];
+
+/** The partner requests of one method whose path ends in `suffix`. */
+const partnerCalls = (method, suffix) =>
+  partnerRequests.filter((r) => r.method === method && r.path.endsWith(suffix));
+
+function installFetchStubs() {
   const realFetch = globalThis.fetch.bind(globalThis);
-  const json = (payload) =>
+  const jsonAt = (status, payload) =>
     new Response(JSON.stringify(payload), {
-      status: 200,
+      status,
       headers: { 'Content-Type': 'application/json' },
     });
+  const json = (payload) => jsonAt(200, payload);
 
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : String(input?.url || '');
-    // Only the Shopify Admin API is faked. The mock Telenow server is a real
-    // socket on localhost and must keep going through the real fetch, or this
-    // harness stops testing the Telenow client at all.
+    const method = String(init?.method || 'GET').toUpperCase();
+    let parsed = null;
+    try {
+      parsed = new URL(url);
+    } catch {
+      /* a relative or malformed url is not one of ours — fall through */
+    }
+
+    // ── The Telenow partner plane ────────────────────────────────────────────
+    // It lives on the same origin as the mock Telenow (TELENOW_API_BASE), so it
+    // is matched on the path, not the host: `/api/partner/v1`, which is where
+    // src/telenow.js mounts it — NOT `/api/v1/partner`.
+    if (parsed && parsed.pathname.startsWith('/api/partner/v1')) {
+      let body = null;
+      try {
+        body = init?.body ? JSON.parse(init.body) : null;
+      } catch {
+        // Kept as the raw string: an unparseable body is itself a failure, and
+        // the assertions below read `body?.monthlySpendCapUsd` off it as
+        // undefined, which is exactly the "no ceiling was asked for" verdict.
+        body = String(init?.body || '');
+      }
+      partnerRequests.push({ method, path: parsed.pathname, body });
+
+      if (method === 'POST' && parsed.pathname.endsWith('/workspaces')) {
+        // A 201, the ordinary create outcome. `monthlySpendCapUsd` is echoed
+        // back exactly as asked rather than clamped, so a wrong number in the
+        // request cannot be laundered into a right one by the fake server.
+        return jsonAt(201, {
+          workspaceId: PARTNER_WORKSPACE_ID,
+          orgId: 'org-test-partner',
+          externalId: body?.externalId ?? null,
+          apiKey: PARTNER_MINTED_KEY,
+          plan: body?.plan ?? null,
+          monthlySpendCapUsd: body?.monthlySpendCapUsd ?? null,
+          spendCapClamped: false,
+          status: 'active',
+          number: { id: 'num-partner-1', e164: '+14155559900', country: 'US', provider: 'twilio' },
+        });
+      }
+
+      // PATCH /workspaces/{id} — the ceiling correction on a plan change.
+      return jsonAt(200, {
+        success: true,
+        workspaceId: decodeURIComponent(parsed.pathname.split('/').pop() || ''),
+        orgId: 'org-test-partner',
+        plan: body?.plan ?? null,
+        monthlySpendCapUsd: body?.monthlySpendCapUsd ?? null,
+        spendCapClamped: false,
+        status: 'active',
+      });
+    }
+
+    // Beyond that, only the Shopify Admin API is faked. The mock Telenow server
+    // is a real socket on localhost and must keep going through the real fetch,
+    // or this harness stops testing the Telenow client at all.
     if (!/^https:\/\/[^/]+\.myshopify\.com\/admin\/api\//.test(url)) {
       return realFetch(input, init);
     }
@@ -344,7 +446,7 @@ async function main() {
   // shop, reviewer and paying merchant alike.
   delete process.env.TELENOW_PARTNER_KEY;
 
-  installAdminGraphQLStub();
+  installFetchStubs();
 
   // Capture the http.Server server.js creates so we can close it afterwards.
   const origListen = http.Server.prototype.listen;
@@ -361,6 +463,7 @@ async function main() {
   const usage = await import('../src/usage.js');
   const billing = await import('../src/billing.js');
   const provisioning = await import('../src/provisioning.js');
+  const templates = await import('../src/templates.js');
   const { placeCall } = await import('../src/automations/_base.js');
   const { shopify } = await import('../src/shopify.js');
   await import('../src/server.js'); // starts the real app on TEST_PORT
@@ -825,6 +928,247 @@ async function main() {
       !drainedRefs.includes(refQ1), `refQ1=${refQ1} drained=${drainedRefs.join(',')}`);
     check('quarantine: no workspace was leased to two shops at once',
       new Set(drainedRefs).size === drainedRefs.length);
+
+    // ═══ h) EVERY PLAN CARRIES A COST CEILING, AND IT REACHES THE WIRE ═══════
+    //
+    // Runs after (f) on purpose: the partner plane MINTS a workspace rather than
+    // leasing one, so it is the one provisioning path that still works with the
+    // pool drained to nothing.
+    //
+    // The distinction this whole section turns on: `capUsd` is what the MERCHANT
+    // approved Shopify to charge them, and `costCeilingUsd` is what Telenow is
+    // allowed to SPEND on their behalf. Sending the first as the second is the
+    // shipped bug — on Starter it is 0, and a non-positive requested cap means
+    // "no ceiling of my own" upstream, i.e. the partner's entire budget.
+
+    const hasCostCeilingFor = typeof plans.costCeilingFor === 'function';
+    check('ceiling: src/plans.js exports costCeilingFor()', hasCostCeilingFor);
+    const costCeilingFor = hasCostCeilingFor ? plans.costCeilingFor : () => 0;
+
+    const ceilings = Object.keys(plans.PLANS).map((handle) => [handle, costCeilingFor(handle)]);
+    check('ceiling: every plan carries a non-zero cost ceiling',
+      ceilings.length === 3 && ceilings.every(([, v]) => Number.isFinite(v) && v > 0),
+      ceilings.map(([h, v]) => `${h}=${v}`).join(' '));
+    check('ceiling: costCeilingFor() agrees with the PLANS entry it reads from',
+      ceilings.every(([h, v]) => plans.PLANS[h].costCeilingUsd === v),
+      ceilings.map(([h]) => `${h}=${plans.PLANS[h].costCeilingUsd}`).join(' '));
+
+    // The frozen cross-file contract's literal numbers. Deliberately asserted by
+    // VALUE rather than recomputed from round(0.45 * (priceUsd + capUsd)): a test
+    // that re-derives the formula would agree with a plans.js that had the same
+    // arithmetic slip, and these three numbers are what the provisioning and
+    // webhook agents code against. If a founder decision moves them, this line is
+    // meant to be the thing that notices.
+    check('ceiling: the contract values are Starter 10 / Growth 135 / Scale 360',
+      costCeilingFor('starter') === 10 && costCeilingFor('growth') === 135 &&
+        costCeilingFor('scale') === 360,
+      `starter=${costCeilingFor('starter')} growth=${costCeilingFor('growth')} ` +
+      `scale=${costCeilingFor('scale')}`);
+
+    // Starter's price and cap are BOTH zero, so anything derived purely from them
+    // is zero — which is the exact value that reads as "uncapped" upstream. Its
+    // ceiling therefore has to be a floor applied after the derivation, not the
+    // derivation's output.
+    check('ceiling: Starter\'s ceiling is a FLOOR, not the 0 its own price and cap imply',
+      plans.PLANS.starter.priceUsd === 0 && plans.PLANS.starter.capUsd === 0 &&
+        costCeilingFor('starter') > 0,
+      `price=${plans.PLANS.starter.priceUsd} cap=${plans.PLANS.starter.capUsd} ` +
+      `ceiling=${costCeilingFor('starter')}`);
+    check('ceiling: an unknown plan handle falls back to Starter\'s floor, never to 0',
+      costCeilingFor('enterprise-2027') === costCeilingFor('starter') &&
+        costCeilingFor('enterprise-2027') > 0 && costCeilingFor(undefined) > 0 &&
+        costCeilingFor(null) > 0 && costCeilingFor('') > 0,
+      `unknown=${costCeilingFor('enterprise-2027')} undefined=${costCeilingFor(undefined)}`);
+    check('ceiling: a bigger plan may spend more, so the ladder is monotonic',
+      costCeilingFor('starter') < costCeilingFor('growth') &&
+        costCeilingFor('growth') < costCeilingFor('scale'));
+
+    // ── THE REGRESSION: a Starter install must not ask for a cap of zero ──────
+    process.env.TELENOW_PARTNER_KEY = 'tnp_live_billing_harness';
+    install(SHOP_PARTNER);
+    const partnerEnt = await billing.refreshEntitlement(SHOP_PARTNER);
+    check('ceiling: the partner fixture is on Starter with an approved cap of $0 — the shipped bug\'s input',
+      partnerEnt.plan === 'starter' && Number(partnerEnt.capUsd || 0) === 0,
+      `plan=${partnerEnt.plan} capUsd=${partnerEnt.capUsd}`);
+
+    const partnerKey = await provisioning.ensureWorkspace(SHOP_PARTNER);
+    const partnerSettings = settingsMod.getSettings(SHOP_PARTNER);
+    check('ceiling: with TELENOW_PARTNER_KEY set the shop is MINTED, not leased',
+      Boolean(partnerKey) && partnerSettings.telenowKeySource === 'partner' &&
+        partnerSettings.telenowWorkspaceRef === PARTNER_WORKSPACE_ID,
+      `source=${partnerSettings.telenowKeySource} ref=${partnerSettings.telenowWorkspaceRef}`);
+
+    const createCalls = partnerCalls('POST', '/workspaces');
+    const createBody = createCalls[0]?.body || {};
+    check('ceiling: exactly one workspace was created for the fixture shop',
+      createCalls.length === 1, `creates=${createCalls.length}`);
+    // ★ THE ASSERTION THIS SECTION EXISTS FOR. src/telenow.js OMITS the field
+    // when the caller asks for 0 or less, so a caller that still sends
+    // `Number(billing.capUsd) || 0` produces a body with no monthlySpendCapUsd in
+    // it at all — undefined, which fails this the same way an explicit 0 would.
+    check('ceiling: the create asks for a NON-ZERO monthlySpendCapUsd on a Starter install',
+      Number(createBody.monthlySpendCapUsd) > 0,
+      `sent=${JSON.stringify(createBody.monthlySpendCapUsd)}`);
+    check('ceiling: … and the number asked for is exactly Starter\'s cost ceiling',
+      Number(createBody.monthlySpendCapUsd) === costCeilingFor('starter'),
+      `sent=${createBody.monthlySpendCapUsd} expected=${costCeilingFor('starter')}`);
+    check('ceiling: the create still names the plan it is provisioning',
+      createBody.plan === 'starter', `plan=${createBody.plan}`);
+
+    // ── The ceiling is RE-SENT when the plan changes ─────────────────────────
+    // Without this the shop is capped at Starter's $10 forever, which is the
+    // mirror-image failure: a paying Growth merchant whose calls stop connecting.
+    check('ceiling: src/provisioning.js exports syncWorkspaceSpendCap()',
+      typeof provisioning.syncWorkspaceSpendCap === 'function');
+
+    /**
+     * Call it and report rather than propagate. The contract says it NEVER
+     * throws — it runs on webhook and boot paths where a failure must not break
+     * the caller — so "did it throw" is itself one of the things under test, and
+     * an escaping error must become a FAIL line, not a dead harness.
+     */
+    async function callSync(shop) {
+      if (typeof provisioning.syncWorkspaceSpendCap !== 'function') {
+        return { threw: new Error('syncWorkspaceSpendCap is not exported') };
+      }
+      try {
+        await provisioning.syncWorkspaceSpendCap(shop);
+        return { threw: null };
+      } catch (err) {
+        return { threw: err };
+      }
+    }
+
+    setSubscriptions(SHOP_PARTNER, [paidSubscription('Telenow Growth')]);
+    const upgradedEnt = await billing.refreshEntitlement(SHOP_PARTNER);
+    check('ceiling: the fixture shop really did upgrade to Growth',
+      upgradedEnt.plan === 'growth', `plan=${upgradedEnt.plan}`);
+
+    const patchesBefore = partnerCalls('PATCH', PARTNER_WORKSPACE_ID).length;
+    const syncUpgrade = await callSync(SHOP_PARTNER);
+    const patches = partnerCalls('PATCH', PARTNER_WORKSPACE_ID);
+    const patchBody = patches[patches.length - 1]?.body || {};
+    check('ceiling: an upgrade RE-SENDS the ceiling to the workspace that was minted',
+      !syncUpgrade.threw && patches.length === patchesBefore + 1,
+      `patches=${patches.length} threw=${syncUpgrade.threw?.message || 'no'}`);
+    check('ceiling: the re-sent ceiling is Growth\'s, not the Starter one from install',
+      Number(patchBody.monthlySpendCapUsd) === costCeilingFor('growth') &&
+        Number(patchBody.monthlySpendCapUsd) > costCeilingFor('starter'),
+      `sent=${patchBody.monthlySpendCapUsd} expected=${costCeilingFor('growth')}`);
+    check('ceiling: the plan handle rides along with it, so upstream agrees on both',
+      patchBody.plan === 'growth', `plan=${patchBody.plan}`);
+
+    // ── The quiet no-ops ─────────────────────────────────────────────────────
+    // Both of these run on the SAME webhook path as the case above, for shops
+    // that path cannot know are different in advance. A throw here would abort an
+    // app_subscriptions/update handler mid-flight; a stray PATCH would aim a
+    // ceiling at a workspace ref this app does not own.
+    const beforePoolSync = partnerRequests.length;
+    const poolSync = await callSync(SHOP_STARTER);
+    check('ceiling: syncWorkspaceSpendCap is a silent no-op for a POOL-provisioned shop',
+      !poolSync.threw && partnerRequests.length === beforePoolSync &&
+        settingsMod.getSettings(SHOP_STARTER).telenowKeySource === 'pool',
+      `requests=${partnerRequests.length - beforePoolSync} threw=${poolSync.threw?.message || 'no'}`);
+
+    delete process.env.TELENOW_PARTNER_KEY;
+    const beforeUnkeyedSync = partnerRequests.length;
+    const unkeyedSync = await callSync(SHOP_PARTNER);
+    check('ceiling: … and a silent no-op with TELENOW_PARTNER_KEY unset, on a partner shop',
+      !unkeyedSync.threw && partnerRequests.length === beforeUnkeyedSync,
+      `requests=${partnerRequests.length - beforeUnkeyedSync} threw=${unkeyedSync.threw?.message || 'no'}`);
+
+    const strangerSync = await callSync('never-installed.myshopify.com');
+    const emptySync = await callSync('');
+    check('ceiling: it never throws for a shop it has never heard of, or for no shop at all',
+      !strangerSync.threw && !emptySync.threw,
+      `stranger=${strangerSync.threw?.message || 'no'} empty=${emptySync.threw?.message || 'no'}`);
+
+    // ═══ i) THE MODEL STACK IS PINNED ════════════════════════════════════════
+    //
+    // Pure — no server, no network, no store. The app sells a minute at one
+    // price and used to let the merchant choose what runs inside it, so two
+    // dropdowns moved cost per minute 2.9x against $0.12 of overage revenue. The
+    // fix is that `o.*` no longer wins over STACK, and this is the check that
+    // stops it being reinstated in six months by someone restoring a picker.
+    const tpl = templates.getTemplate('cod');
+    const stackOf = (p) => ({
+      llmProvider: p.llmProvider,
+      llmModel: p.llmModel,
+      llmConfig: p.llmConfig,
+      sttProvider: p.sttProvider,
+      sttConfig: p.sttConfig,
+      ttsProvider: p.ttsProvider,
+      ttsVoice: p.ttsVoice,
+      ttsConfig: p.ttsConfig,
+    });
+
+    const shippedAgent = templates.buildAgentPayload(tpl, SHOP_GROWTH, 'Acme Store', 'conn-1');
+    // Every field the wizard's provider/model/voice pickers used to write, set to
+    // the expensive end of what the platform can produce — the ~$0.55/min stack
+    // that loses $0.43 on a $0.12 minute.
+    const overriddenAgent = templates.buildAgentPayload(tpl, SHOP_GROWTH, 'Acme Store', 'conn-1', {
+      llmProvider: 'openai',
+      llmModel: 'gpt-4o',
+      llmConfig: { temperature: 1 },
+      sttProvider: 'assemblyai',
+      sttModel: 'best',
+      ttsProvider: 'elevenlabs',
+      ttsVoice: 'rachel',
+      ttsModel: 'eleven_multilingual_v2',
+    });
+
+    check('stack: a merchant-supplied LLM provider and model are ignored',
+      overriddenAgent.llmProvider === shippedAgent.llmProvider &&
+        overriddenAgent.llmModel === shippedAgent.llmModel,
+      `provider=${overriddenAgent.llmProvider} model=${overriddenAgent.llmModel}`);
+    check('stack: a merchant-supplied STT provider and model are ignored',
+      overriddenAgent.sttProvider === shippedAgent.sttProvider &&
+        overriddenAgent.sttConfig?.model === shippedAgent.sttConfig?.model,
+      `provider=${overriddenAgent.sttProvider} model=${overriddenAgent.sttConfig?.model}`);
+    check('stack: a merchant-supplied TTS provider, voice and model are ignored',
+      overriddenAgent.ttsProvider === shippedAgent.ttsProvider &&
+        overriddenAgent.ttsVoice === shippedAgent.ttsVoice &&
+        overriddenAgent.ttsConfig?.model === shippedAgent.ttsConfig?.model,
+      `provider=${overriddenAgent.ttsProvider} voice=${overriddenAgent.ttsVoice} ` +
+      `model=${overriddenAgent.ttsConfig?.model}`);
+    check('stack: the WHOLE stack block is identical with and without overrides',
+      JSON.stringify(stackOf(overriddenAgent)) === JSON.stringify(stackOf(shippedAgent)),
+      JSON.stringify(stackOf(overriddenAgent)));
+
+    // Pinned by value as well as by equality: without this, a change that made
+    // buildAgentPayload ignore overrides AND silently move the default stack
+    // would still pass every check above.
+    check('stack: and it is the stack the app ships — xai / deepgram / smallest',
+      shippedAgent.llmProvider === 'xai' &&
+        shippedAgent.llmModel === 'grok-4-fast-non-reasoning' &&
+        shippedAgent.sttProvider === 'deepgram' &&
+        shippedAgent.sttConfig?.model === 'nova-3' &&
+        shippedAgent.ttsProvider === 'smallest' &&
+        shippedAgent.ttsVoice === 'meher' &&
+        shippedAgent.ttsConfig?.model === 'lightning_v3.1_pro',
+      `${shippedAgent.llmProvider}/${shippedAgent.llmModel} ${shippedAgent.sttProvider}/` +
+      `${shippedAgent.sttConfig?.model} ${shippedAgent.ttsProvider}/${shippedAgent.ttsVoice}`);
+
+    // POSITIVE CONTROL. "The overrides were ignored" also passes when overrides
+    // stopped being read at all, or when this harness is calling a function that
+    // no longer takes them — and the wizard genuinely does still own the agent's
+    // name, its opener and its prompt. Those must keep working; only the priced
+    // parts of the payload are pinned.
+    const customisedAgent = templates.buildAgentPayload(tpl, SHOP_GROWTH, 'Acme Store', 'conn-1', {
+      name: 'My COD agent',
+      opener: 'Hello from {store_name}, quick question.',
+      systemPrompt: 'You are a very specific agent for {store_name}.',
+    });
+    check('stack control: the merchant still owns the name, the opener and the prompt',
+      customisedAgent.name === 'My COD agent' &&
+        customisedAgent.telephonyConfig?.agentMsg === 'Hello from Acme Store, quick question.' &&
+        customisedAgent.systemPrompt.startsWith('You are a very specific agent for Acme Store.'),
+      `name=${customisedAgent.name}`);
+    check('stack control: … and pinning the stack did not empty the payload out',
+      Array.isArray(customisedAgent.metadata?.tools) &&
+        customisedAgent.metadata.tools.length > 0 &&
+        customisedAgent.sessionConfig?.maxDuration === 300,
+      `tools=${customisedAgent.metadata?.tools?.length}`);
 
     // ═══ Leak check on the browser-facing entitlement ════════════════════════
     // pendingState is the CSRF nonce for /billing/callback. It lives on the same

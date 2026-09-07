@@ -41,7 +41,7 @@ import {
   getEntitlement, checkAccess, refreshEntitlement,
   requestSubscription, raiseCap, cancelSubscription, entitlementForClient,
 } from './billing.js';
-import { ensureWorkspace, poolStatus } from './provisioning.js';
+import { ensureWorkspace, poolStatus, syncWorkspaceSpendCap } from './provisioning.js';
 import { publicPlans, PLANS, planByHandle } from './plans.js';
 import { rollIfNeeded, usedMinutes } from './usage.js';
 import { runWinBackSweep } from './automations/winBack.js';
@@ -163,6 +163,28 @@ app.get('/billing/callback', async (req, res) => {
     }),
     new Promise((resolve) => setTimeout(resolve, 4000).unref?.()),
   ]);
+
+  // Push the new plan's COST ceiling upstream — the limit on what Telenow may
+  // spend on this shop's behalf, which is derived from the plan and therefore
+  // wrong the instant the plan changes.
+  //
+  // ORDERING IS DELIBERATE, on both sides. It runs after refreshEntitlement
+  // because it reads the plan back out of the store, so firing it earlier would
+  // push the ceiling for the plan the merchant just left. And it runs after the
+  // lease race because a brand-new paid shop has no workspace until that race
+  // finishes: sync before the lease and there is no ref to address, the call
+  // no-ops, and the shop that just paid us keeps the ceiling it was provisioned
+  // with. The race caps this at ~4s, so on the slow path the lease is still in
+  // flight and this does no-op — the app_subscriptions/update webhook and the
+  // six-hourly sweep are the backstops that catch that case.
+  //
+  // NOT awaited: the merchant is mid-redirect back into the admin and a Telenow
+  // round trip must not be in front of that. syncWorkspaceSpendCap never throws
+  // by contract; the .catch() is there so that if the contract is ever broken,
+  // an unhandled rejection cannot take the process down behind a merchant who
+  // has already been redirected away.
+  syncWorkspaceSpendCap(shop).catch((err) =>
+    console.error('[billing] callback spend-cap sync failed for', shop + ':', err.message));
 
   // The merchant has just approved a plan or a higher ceiling, so this is the
   // moment any inbound line parked for billing comes back. Awaited, unlike the
@@ -402,6 +424,22 @@ app.post('/api/billing/cancel', async (req, res) => {
     // a subscription that lapsed on Shopify's side would otherwise keep telling
     // this shop it is on a paid plan for the rest of the cache window.
     const ent = result.cancelled ? await getEntitlement(shop) : await refreshEntitlement(shop);
+
+    // A downgrade has to TIGHTEN the spend ceiling, and this is the only path
+    // that reaches it from inside the app. Dropping to Starter without re-sending
+    // it would leave a shop that has stopped paying us $149 a month still
+    // authorised to burn Growth's cost ceiling upstream — the failure is quieter
+    // than the upgrade one and strictly more expensive, because there is no
+    // longer any revenue behind the spend.
+    //
+    // Placed after the entitlement read for the same reason as the callback's:
+    // syncWorkspaceSpendCap reads the plan back out of the store, so it must see
+    // the value the cancel just settled rather than the plan being left. Not
+    // awaited — the merchant is watching a button, not a Telenow round trip, and
+    // the webhook and the sweep both re-send it if this one is slow or lost.
+    syncWorkspaceSpendCap(shop).catch((err) =>
+      console.error('[billing] cancel spend-cap sync failed for', shop + ':', err.message));
+
     res.json({ cancelled: Boolean(result.cancelled), entitlement: entitlementForClient(ent) });
   } catch (err) {
     // err.message here comes from the Admin API, not from a merchant-safe
@@ -518,8 +556,9 @@ async function telenowFor(shop, res, need = 'read') {
 // safe to call from a hot path.
 //
 // KNOWN GAP, stated rather than papered over: the enforcement points reachable
-// from THIS file are the plan screen, the billing callback and the six-hourly
-// sweep. The tight one — re-checking immediately after each call is metered —
+// from THIS file are the plan screen, the billing callback, the boot-time
+// reconcileShops() pass and the six-hourly sweep that repeats it. The tight one
+// — re-checking immediately after each call is metered —
 // belongs in recordCallUsage (src/webhooks/telenow.js), which is owned
 // elsewhere; until it calls this too, a shop that exhausts its allowance mid-
 // period keeps its inbound line for at most one sweep interval. The per-
@@ -715,10 +754,33 @@ app.get('/api/agents/:id', async (req, res) => {
   }
 });
 
-// GET /api/catalog — provider catalog, used to turn raw ids ("xai",
-// "lightning_v3.1_pro") into human labels. Cached per shop for the process
-// lifetime: it is a large, near-static payload and the detail view hits it
-// on every open.
+// GET /api/catalog — READ-ONLY LABEL SOURCE. Nothing here may ever feed a
+// picker again.
+//
+// This route survives only because the agent detail view has to render what an
+// agent IS: catProvider(), providerName(), voiceName(), modelName() and
+// configLabel() in public/app.html turn stored ids ("xai", "grok-4-fast",
+// "lightning_v3.1_pro") into words a merchant can read. Delete the route and
+// those helpers resolve against an undefined catalog and the page renders raw
+// ids, or throws.
+//
+// What it must NEVER do again is offer a CHOICE. The app sells minutes at one
+// flat price while the model stack inside a minute is what actually costs money,
+// so a merchant free to pick their own LLM, STT and TTS could move cost per
+// minute by ~2.9x from two dropdowns and ~117x across everything the platform
+// can serve — at the top end roughly $0.55 of cost against $0.12 of overage
+// revenue, losing money on every minute with nothing anywhere warning us. The
+// stack is now fixed to the STACK constant the app ships (src/templates.js), the
+// wizard's provider/model/voice pickers are gone, and this payload is what is
+// left over: a dictionary for rendering, not a menu.
+//
+// So when adding to this file: read from it to LABEL something, never to
+// populate a <select>, and never let a value the browser sends back reach
+// buildAgentPayload. The rate card is already stripped twice (see stripRateCard
+// below); this comment is the third guard, on the part no code can enforce.
+//
+// Cached per shop for the process lifetime: it is a large, near-static payload
+// and the detail view hits it on every open.
 const catalogCache = new Map();
 app.get('/api/catalog', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
@@ -1138,50 +1200,41 @@ app.post('/api/ndr-endpoint/rotate', async (req, res) => {
   res.json({ url: `${HOST}/webhooks/ndr/${token}` });
 });
 
-// POST /api/voice-preview — synthesise a sample of one voice and stream the
-// audio back, so the wizard's play buttons work without the browser ever
-// holding the Telenow key.
+// REMOVED: POST /api/voice-preview. Do not bring it back in the shape it had.
 //
-// The upstream endpoint currently accepts a user JWT only, so an org API key
-// gets 401. That is translated into a 501 with an explanation rather than
-// passed through as a bare auth error, because it is not the merchant's
-// credentials that are wrong — the capability simply is not exposed to keys yet.
-app.post('/api/voice-preview', async (req, res) => {
-  const shop = await requireInstalledShop(req, res);
-  if (!shop) return;
-  const client = await telenowFor(shop, res, 'spend');
-  if (!client) return;
-
-  const provider = String(req.body?.provider || '').trim();
-  const voice = String(req.body?.voice || '').trim();
-  if (!provider) {
-    res.status(400).json({ error: 'bad_request', message: 'provider is required' });
-    return;
-  }
-  // Short and capped: a preview costs real TTS characters on every press.
-  const text = String(req.body?.text || '').trim().slice(0, 180)
-    || 'Hello, this is a quick call from your store about the order you just placed.';
-
-  try {
-    const { bytes, contentType } = await client.previewVoice({
-      provider, voice, text,
-      config: req.body?.model ? { model: String(req.body.model) } : undefined,
-    });
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Cache-Control', 'no-store');
-    res.send(Buffer.from(bytes));
-  } catch (err) {
-    if (err?.status === 401 || err?.status === 403) {
-      res.status(501).json({
-        error: 'preview_unavailable',
-        message: 'Voice preview is not available to API keys yet. '
-          + 'Open the agent in Telenow to hear voices.',
-      });
-      return;
-    }
-    telenowFail(res, err, 'voice preview');
-  }
-});
+// It synthesised a sample of one voice and streamed the audio back so the
+// wizard's ▶ play buttons could work without the browser ever holding the
+// Telenow key. Those buttons are gone: the merchant no longer picks a provider,
+// a model or a voice anywhere in this app, because every agent now runs the one
+// PINNED stack in templates.js (see buildAgentPayload — the fields read STACK
+// directly and ignore any caller override). There is nothing left for a sample
+// to preview that the merchant could have chosen.
+//
+// The route had to go rather than merely stop being called, because it was the
+// LAST merchant-reachable path in the whole app that let request input decide
+// which paid AI vendor we bill. It read `provider`, `voice` and `model` straight
+// off req.body, ran them through telenowFor(shop, res, 'spend') — the shop's own
+// org key — and POSTed to /api/providers/tts/{provider}/preview with no
+// allowlist. A merchant holding a valid session token could name 'elevenlabs'
+// and charge premium TTS characters to their workspace budget, 180 chars per
+// press, with no cap on the number of presses. That is precisely the flat-rate
+// margin hole the pinned stack exists to close, reopened through a side door.
+//
+// It could not actually spend TODAY: upstream requires a user JWT on that
+// handler and returns 401 to an X-API-Key, which the route translated into a
+// 501. That is a latent bypass, not a live loss — which is exactly why deleting
+// it is the right call rather than leaving it. The day upstream adds key auth to
+// that handler the route silently becomes a real unpinned spend path, and
+// nothing in this app is watching for that change.
+//
+// If a "hear your agent" feature is ever wanted, it must ignore the request body
+// entirely and pin provider/voice/config to templates.js STACK, so a preview can
+// only ever synthesise the voice the agent actually runs. Note that STACK is
+// module-private in templates.js today, so that feature starts by exporting it —
+// not by reintroducing a body-driven provider argument.
+//
+// TelenowClient.previewVoice (src/telenow.js) is now unreferenced; it belongs to
+// that file's owner to delete.
 
 // GET /api/escalations — issues raised by the agents, from the two sources that
 // are actually readable.
@@ -1923,6 +1976,86 @@ function sanitizeSettingsPatch(body = {}) {
 
 const SWEEP_INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS) || 6 * 60 * 60 * 1000; // 6h
 
+/**
+ * Walk every installed shop and bring its derived state back in line with the
+ * two systems of record: Shopify (what the merchant is paying for) and Telenow
+ * (what their workspace is allowed to spend, and whether their inbound line is
+ * live).
+ *
+ * Reconciliation backstop for the app_subscriptions/update webhook.
+ *
+ * Webhooks get lost — a deploy mid-delivery, a 500 from a cold start, a topic
+ * that silently failed to register. When the lost one says "this merchant's card
+ * was declined", the app keeps serving a plan nobody is paying for; when it says
+ * "they upgraded", the app keeps blocking a merchant who has paid, which is the
+ * worse of the two. Re-reading every shop from the Admin API makes the webhook
+ * an optimisation rather than a dependency. Each shop is caught on its own so
+ * one revoked token cannot stop the others being reconciled, and the function as
+ * a whole never rejects — both of its callers are fire-and-forget.
+ *
+ * WHY THIS IS SPLIT OUT OF tick(), AND WHY IT RUNS AT BOOT WHILE tick() DOES
+ * NOT: nothing in here can place a call. It re-reads entitlements, re-sends a
+ * spend ceiling and parks or restores a number — all idempotent, all
+ * state-compared, none of them dialling a shopper. The automation sweeps around
+ * it are the opposite: runWinBackSweep and friends put REAL OUTBOUND CALLS on
+ * the wire, which is why SWEEP_RUN_ON_BOOT is documented in DEPLOY.md as "leave
+ * commented out" and why an operator must not be made to enable it to get the
+ * repair below. Fusing the two is what made the ceiling repair unreachable in
+ * practice: the interval timer restarts from zero on every process start, so a
+ * container that redeploys, crashes or scales more often than SWEEP_INTERVAL_MS
+ * (6h) would never once reach this loop.
+ */
+async function reconcileShops() {
+  let rows = [];
+  try {
+    rows = listShops();
+  } catch (err) {
+    console.error('[reconcile] could not list shops:', err.message);
+    return;
+  }
+  for (const row of rows) {
+    try {
+      await refreshEntitlement(row.shop);
+    } catch (err) {
+      console.error('[reconcile] entitlement refresh failed for', row.shop + ':', err.message);
+    }
+    // Re-send the spend ceiling on the same pass, for the same reason the
+    // entitlement is re-read: the webhook that should have carried the plan
+    // change is an optimisation, not a dependency. A lost app_subscriptions/
+    // update leaves the ceiling describing a plan the shop is no longer on,
+    // and unlike a stale entitlement — which the line above has just corrected
+    // — nothing else in the app would ever notice.
+    //
+    // This is also the path that repairs every workspace provisioned before the
+    // ceiling existed, without anyone running a migration: those all went out
+    // with the field omitted, which the Rust side reads as "no ceiling of my
+    // own" and silently backs with the whole partner budget — the containment
+    // the unauthenticated NDR endpoint is supposed to sit behind. Because this
+    // function runs once unconditionally at startup, that repair is bounded by
+    // the deploy itself: the estate is walked within seconds of the process
+    // coming up, and again on every sweep thereafter. It is NOT waiting on the
+    // 6h timer, which a frequently-restarting host may never reach.
+    //
+    // syncWorkspaceSpendCap no-ops for shops with no partner-provisioned
+    // workspace, which is the common case, so this costs nothing for most rows.
+    try {
+      await syncWorkspaceSpendCap(row.shop);
+    } catch (err) {
+      console.error('[reconcile] spend-cap sync failed for', row.shop + ':', err.message);
+    }
+    // Reconciling inbound straight after the entitlement read is what makes
+    // this loop the backstop for the one gate nothing else can reach: a shop
+    // that ran out of minutes on inbound calls alone never touches a route,
+    // so this loop is the only thing that will take its number down. It is
+    // also the path that restores a number after a webhook we never received.
+    try {
+      await enforceInboundAccess(row.shop);
+    } catch (err) {
+      console.error('[reconcile] inbound reconcile failed for', row.shop + ':', err.message);
+    }
+  }
+}
+
 function startSchedulers() {
   const tick = async () => {
     try {
@@ -1940,37 +2073,27 @@ function startSchedulers() {
     } catch (err) {
       console.error('[scheduler] post-purchase sweep error:', err.message);
     }
-    // Reconciliation backstop for the app_subscriptions/update webhook.
-    //
-    // Webhooks get lost — a deploy mid-delivery, a 500 from a cold start, a
-    // topic that silently failed to register. When the lost one says "this
-    // merchant's card was declined", the app keeps serving a plan nobody is
-    // paying for; when it says "they upgraded", the app keeps blocking a
-    // merchant who has paid, which is the worse of the two. Re-reading every
-    // shop from the Admin API on the sweep makes the webhook an optimisation
-    // rather than a dependency. Each shop is caught on its own so one revoked
-    // token cannot stop the others being reconciled.
-    for (const row of listShops()) {
-      try {
-        await refreshEntitlement(row.shop);
-      } catch (err) {
-        console.error('[scheduler] entitlement refresh failed for', row.shop + ':', err.message);
-      }
-      // Reconciling inbound straight after the entitlement read is what makes
-      // this loop the backstop for the one gate nothing else can reach: a shop
-      // that ran out of minutes on inbound calls alone never touches a route,
-      // so this sweep is the only thing that will take its number down. It is
-      // also the path that restores a number after a webhook we never received.
-      try {
-        await enforceInboundAccess(row.shop);
-      } catch (err) {
-        console.error('[scheduler] inbound reconcile failed for', row.shop + ':', err.message);
-      }
-    }
+    await reconcileShops();
   };
-  // Don't run immediately at boot (let the process settle); first run after one
-  // interval. Set SWEEP_RUN_ON_BOOT=1 to run once at startup for testing.
+
+  // Two different boot policies, on purpose.
+  //
+  // The call-placing sweeps do NOT run at boot: let the process settle, first
+  // run after one interval, and SWEEP_RUN_ON_BOOT=1 is the testing-only escape
+  // hatch that fires them immediately (DEPLOY.md tells operators to leave it
+  // commented out, because on a crash-looping host it would ring the same
+  // shoppers on every restart).
+  //
+  // The reconciliation DOES run at boot, unconditionally, because it places no
+  // calls and because deferring it is the whole defect: the ceiling repair and
+  // the inbound backstop would otherwise be hostage to a timer that never
+  // survives long enough to fire. It is not awaited so a slow Admin API cannot
+  // hold up the listen callback, and it never rejects, so there is nothing to
+  // catch — the .catch is belt-and-braces against an unhandled rejection taking
+  // the process down if that ever stops being true.
   if (process.env.SWEEP_RUN_ON_BOOT === '1') tick();
+  else reconcileShops().catch((err) => console.error('[reconcile] boot pass failed:', err.message));
+
   const t = setInterval(tick, SWEEP_INTERVAL_MS);
   t.unref?.(); // don't keep the process alive solely for the timer
   console.log(`[scheduler] sweeps every ${Math.round(SWEEP_INTERVAL_MS / 3600000)}h`);

@@ -108,6 +108,61 @@ const FEATURES = {
  * the gate is a plain `count >= max` and Infinity makes that read correctly with
  * no special case. It never reaches JSON — publicPlans() does not expose it.
  */
+/*
+ * TWO KINDS OF MONEY LIVE IN THE OBJECTS BELOW, AND THEY POINT IN OPPOSITE
+ * DIRECTIONS. Read this before touching any number in this map.
+ *
+ *   priceUsd, overagePerMinuteUsd, capUsd  — money the MERCHANT pays US. These are
+ *     revenue, they are merchant-visible, they appear on Shopify's approval screen
+ *     and in the Partner Dashboard listing, and changing one is a billing event
+ *     (see the header of this file).
+ *
+ *   costCeilingUsd — money WE let TELENOW SPEND on that shop's behalf in a billing
+ *     period. This is cost, not revenue. It is never shown to the merchant, never
+ *     charged to anyone, and never leaves the server except as the
+ *     `monthlySpendCapUsd` we hand the partner API when a workspace is provisioned
+ *     or its plan changes. It exists so that a shop cannot burn unbounded LLM, STT,
+ *     TTS and carrier spend against a bounded amount of revenue.
+ *
+ * CONFUSING THE TWO IS HOW A PLAN SILENTLY BECOMES LOSS-MAKING. Nothing in the
+ * billing path errors when the ceiling is wrong; the shop keeps working, calls keep
+ * connecting, and the only symptom is an invoice from upstream that is larger than
+ * the invoice we sent the merchant. That is why the ceiling lives here, next to the
+ * price it is derived from, rather than in provisioning.js next to the code that
+ * sends it — if the price ever moves, the ceiling is in the same diff.
+ *
+ * WHERE 0.45 COMES FROM. Our worst realistic delivered cost — the most expensive
+ * stack this app can produce, on the longest prompts, over the priciest carrier —
+ * is about 35% of the revenue that stack earns. The ceiling is set at 0.45 of what
+ * the merchant is contractually able to pay us in a full billing period (the plan
+ * fee plus the whole usage cap they approved), so the rule of thumb is
+ *
+ *     costCeilingUsd ≈ round(0.45 * (priceUsd + capUsd))
+ *
+ * The extra ten points over 35% are deliberate headroom: a ceiling that bites in a
+ * normal busy month is an outage, not a safeguard. What it can never do is exceed
+ * what the merchant is able to pay, which is the property that actually matters —
+ * at 0.45 the worst case is a thin month, never an unbounded loss.
+ *
+ * The shipped figures are the founder-approved points on that ladder: Growth 135
+ * and Scale 360 sit above the raw arithmetic (107.55 and 292.05 respectively) so
+ * that a shop running hot at the top of its approved cap is not throttled mid-call,
+ * while still landing well under the $239 and $649 those merchants can be billed.
+ *
+ * WHY STARTER'S 10 IS A HARD FLOOR AND NOT A COMPUTED VALUE. Starter has priceUsd 0
+ * and capUsd 0, so the formula gives 0 — and 0 is the single most dangerous number
+ * this field can carry. Upstream, a non-positive requested cap does not mean "spend
+ * nothing", it means "I am not asking for a ceiling of my own", and the workspace
+ * silently inherits the partner account's entire budget. A free shop would then be
+ * the least constrained shop on the platform, which is exactly backwards, and it is
+ * the containment the unauthenticated NDR webhook is supposed to sit behind. So
+ * Starter is pinned at $10: enough to deliver its 25 included minutes with room to
+ * spare, small enough that an abused free install cannot cost real money, and above
+ * zero so the request is always read upstream as a real ceiling. Any future plan
+ * whose formula result rounds to 0 must be pinned the same way — costCeilingFor()
+ * enforces that as a last line of defence, but the value in this map should already
+ * be positive on its own.
+ */
 export const PLANS = Object.freeze({
   starter: Object.freeze({
     handle: 'starter',
@@ -119,6 +174,7 @@ export const PLANS = Object.freeze({
     rank: 0,
     overagePerMinuteUsd: 0,
     capUsd: 0,
+    costCeilingUsd: 10,
   }),
   growth: Object.freeze({
     handle: 'growth',
@@ -130,6 +186,7 @@ export const PLANS = Object.freeze({
     rank: 1,
     overagePerMinuteUsd: 0.12,
     capUsd: 200,
+    costCeilingUsd: 135,
   }),
   scale: Object.freeze({
     handle: 'scale',
@@ -141,6 +198,7 @@ export const PLANS = Object.freeze({
     rank: 2,
     overagePerMinuteUsd: 0.10,
     capUsd: 500,
+    costCeilingUsd: 360,
   }),
 });
 
@@ -169,6 +227,33 @@ export function planByName(name) {
 /** Internal handle → plan; unknown handles resolve to starter, same reasoning. */
 export function planByHandle(handle) {
   return Object.prototype.hasOwnProperty.call(PLANS, handle) ? PLANS[handle] : PLANS.starter;
+}
+
+/**
+ * Internal handle → the USD amount we allow Telenow to spend on that shop in a
+ * billing period. This is the ONLY way the ceiling should ever be read; callers
+ * must not reach into PLANS[handle].costCeilingUsd themselves, because the whole
+ * value of this function is the guarantee below.
+ *
+ * IT NEVER RETURNS 0, null, undefined or NaN. That guarantee is the point, not a
+ * convenience. Upstream treats a non-positive `monthlySpendCapUsd` as "no ceiling
+ * of my own" and falls back to the partner account's entire budget, so every way
+ * this function could fail softly — an unknown handle from a stale entitlement, a
+ * handle read off a webhook body, a plan row that somehow lost the field — must
+ * still produce a real, positive number. A thrown error would be no better: the
+ * callers are webhook and boot paths that must not break, so they would end up
+ * sending nothing at all, which upstream reads as the same unbounded budget.
+ *
+ * Unknown or malformed input therefore lands on Starter's floor. That is the
+ * deliberately conservative direction: the worst outcome of guessing low is a shop
+ * that hits its ceiling and gets looked at, while the worst outcome of guessing
+ * high is the uncapped workspace this field exists to prevent.
+ */
+export function costCeilingFor(planHandle) {
+  const floor = PLANS.starter.costCeilingUsd;
+  const plan = planByHandle(planHandle);
+  const ceiling = Number(plan?.costCeilingUsd);
+  return Number.isFinite(ceiling) && ceiling > 0 ? ceiling : floor;
 }
 
 /**
