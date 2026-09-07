@@ -7,7 +7,7 @@
 [![Node](https://img.shields.io/badge/Node-%3E%3D18-339933)](https://nodejs.org)
 [![Powered by Telenow](https://img.shields.io/badge/Powered_by-Telenow-6C2BD9)](https://telenow.ai)
 
-**Shopify Voice AI** is a free, open-source embedded Shopify app that turns store events into real outbound phone calls placed by an AI voice agent. When a shopper abandons a checkout, places a Cash-on-Delivery order, or a fulfillment ships, the app triggers a natural, multilingual voice call — **abandoned cart recovery**, **COD confirmation** and **RTO reduction**, **order confirmation calls**, **delivery updates**, **failed-delivery (NDR) retry**, **win-back**, and **instant lead callback** — then writes the call outcome straight back onto the Shopify order as tags, notes, and a metafield. It connects to [Telenow](https://telenow.ai), a separate voice-AI calling service that needs its own account and a `vai_live_…` API key and is billed on usage by Telenow (never through Shopify). The result: store events become real AI phone conversations — including live "where is my order?" Q&A and a **Hindi / multilingual voice agent** — with the disposition logged on the order, no glue code required.
+**Shopify Voice AI** is an open-source embedded Shopify app that turns store events into real outbound phone calls placed by an AI voice agent. When a shopper abandons a checkout, places a Cash-on-Delivery order, or a fulfillment ships, the app triggers a natural, multilingual voice call — **abandoned cart recovery**, **COD confirmation** and **RTO reduction**, **order confirmation calls**, **delivery updates**, **failed-delivery (NDR) retry**, **win-back**, and **instant lead callback** — then writes the call outcome straight back onto the Shopify order as tags, notes, and a metafield. Voice calling is powered by [Telenow](https://telenow.ai) and is provisioned automatically by the app — merchants never create a Telenow account or handle an API key. All plans are billed through Shopify's Billing API. The result: store events become real AI phone conversations — including live "where is my order?" Q&A and a **Hindi / multilingual voice agent** — with the disposition logged on the order, no glue code required.
 
 ## Table of Contents
 
@@ -37,14 +37,14 @@ Every automation is independently toggleable, with its own agent, delay, quiet-h
 - **Win-back / re-engagement** — scheduled sweep that re-activates lapsed customers whose last order is older than *N* days, with an optional discount.
 - **Instant lead callback (speed to lead)** — fires on `customers/create`; phones a new customer or captured lead within seconds of sign-up (delay defaults to `0`). Every lead is captured to a built-in **Leads** view even when no call is placed.
 - **Review, feedback & NPS calls** — scheduled stub to collect ratings and feedback X days after fulfillment.
-- **Two-way live Q&A** — the agent can answer the shopper in real time during the call ("where is my order?", product and order lookups) using your existing Telenow agent's tools.
+- **Two-way live Q&A** — the agent can answer the shopper in real time during the call ("where is my order?", product and order lookups) using the store-lookup tools wired into your agents.
 - **Order write-back** — on every call result the app writes order **tags**, appends an order **note**, and sets a `telenow.last_call` order **metafield** (`session_id`, `status`, `disposition`, `duration`, `ended_at`) so your team and theme always know the outcome.
-- **Multilingual / Hindi voice agent** — uses your existing Telenow agents for a natural voice in English, Hindi and other Indian languages, plus global languages.
+- **Multilingual / Hindi voice agent** — a natural voice in English, Hindi and other Indian languages, plus global languages.
 - **Quiet hours** — calls are suppressed inside each automation's local quiet-hours window, and re-checked at fire time for delayed calls.
-- **Per-automation controls** — choose the Telenow agent ID, delay (minutes), quiet-hours window, and free-form filters per automation.
+- **Per-automation controls** — choose the agent, delay (minutes), quiet-hours window, and free-form filters per automation.
 - **Extra use-case stubs** — `src/automations/extras.js` ships ready-to-fill stubs for back-in-stock callback, payment-failed retry, subscription renewal reminder, upsell/cross-sell, replenishment reminder, and high-value-order fraud check.
 
-> **Free app — requires a Telenow account.** The app is free to install. Telenow is a separate third-party service that bills for call usage on its own platform; you connect it with your own `vai_live_…` API key (Telenow → Developers → API Keys). No charges go through Shopify.
+> **Billed through Shopify.** Plans: Starter $0/mo (25 AI voice minutes), Growth $39/mo (300 minutes, then $0.12/min up to a $200 monthly maximum), Scale $149/mo (1,500 minutes, then $0.10/min up to $500). Every charge is created with the Shopify Billing API — `appSubscriptionCreate` for the subscription and `appUsageRecordCreate` for metered minutes. No payment ever happens outside Shopify.
 
 ## 🚀 Installation
 
@@ -76,11 +76,12 @@ Copy `.env.example` to `.env` and fill in the values:
 | `SHOPIFY_SCOPES` | | Defaults to `read_orders,write_orders,read_customers,read_checkouts,read_fulfillments`. Must match the Partners app config. |
 | `SHOPIFY_API_VERSION` | | Admin REST version for write-backs (default `2025-10`). |
 | `TELENOW_API_BASE` | | Telenow API base (default `https://api.telenow.ai`). |
+| `TELENOW_KEY_POOL` | ✅ | JSON array of pre-minted calling workspaces the server leases from, one per shop (or drop the same array in `${DATA_DIR}/keypool.json`). See [DEPLOY.md § Telenow key pool](DEPLOY.md#10-telenow-key-pool). |
 | `DATA_DIR` | | Where the file store persists (default `./data`). |
-| `DEFAULT_PHONE_COUNTRY` | | ISO-2 country for E.164 normalization of local numbers (default `IN`). |
+| `DEFAULT_PHONE_COUNTRY` | | Optional, usually leave unset. Last-resort ISO-2 fallback for E.164 normalization of numbers that carry no country code; the app resolves the country per shop from Shopify first (`explicit → shop's country → this → US`). Setting it pins every merchant on the instance to one market. |
 | `SWEEP_INTERVAL_MS` / `SWEEP_RUN_ON_BOOT` | | Scheduler cadence (default 6h) / run sweeps once at boot for testing. |
 
-> The **Telenow API key is not an env var** — each merchant pastes their own `vai_live_…` key in the settings page (`/app`), stored per shop.
+> Merchants never supply a Telenow key. The server leases a calling workspace per shop from an operator-managed pool (`TELENOW_KEY_POOL`, see `src/provisioning.js`) and stores the key server-side; it is never sent to the browser.
 
 ## 🧩 How it works
 
@@ -97,12 +98,12 @@ The store "talks to" Telenow: a Shopify event hits this app over an HMAC-verifie
 
 ## 🔐 OAuth / install flow
 
-Auth uses Shopify **OAuth (offline token)** for the store, plus a per-shop Telenow **API key** (`X-API-Key`) the merchant pastes in the settings page and that is validated via `GET /api/v1/me`.
+Auth uses Shopify **OAuth (offline token)** for the store. The same offline token also drives Shopify Billing (`shopify.billing.request/check`). The per-shop Telenow key is leased server-side at install and validated via `GET /api/v1/me`; it never reaches the browser.
 
 1. Merchant visits `HOST/auth?shop=THEIR-STORE.myshopify.com` (or `HOST/?shop=…`, which redirects).
 2. App runs `shopify.auth.begin` → Shopify consent → `GET /auth/callback`.
-3. On callback the app: persists the **offline access token**, **registers all Shopify webhooks**, and (if a Telenow key is already set) **subscribes the Telenow result webhook**. It then redirects to `/app`.
-4. In `/app` the merchant pastes their Telenow API key (validated via `GET /api/v1/me`), picks an **agent ID** per automation, toggles automations, and sets delays/quiet-hours. Saving a new key (re)subscribes the Telenow webhook via `POST /api/v1/hooks`.
+3. On callback the app: persists the **offline access token**, **registers all Shopify webhooks**, **leases a calling workspace** for the shop from the pool, and **subscribes the Telenow result webhook** for it via `POST /api/v1/hooks`. It then redirects to `/app`.
+4. In `/app` the merchant is already on the free Starter plan with a calling workspace and number provisioned. They publish an agent from a template, toggle automations, and set delays/quiet-hours. Paid plans are chosen on the **Plans** screen, which hands off to Shopify's own approval page.
 
 ## 🤖 Automations & the data written back
 
@@ -141,9 +142,9 @@ We verify by recomputing the HMAC over the **raw body** with that secret (consta
 ## 🛡️ Security notes
 
 - **HMAC in both directions.** Inbound Shopify webhooks are verified by `@shopify/shopify-api` against `SHOPIFY_API_SECRET`; inbound Telenow webhooks are verified against the per-hook signing secret. Bad signatures get `401`. Webhook routes receive the **raw body** (mounted before the JSON parser) so the bytes match exactly.
-- **Session-token auth for the settings API.** The embedded app's settings/leads API authorizes off a signed session token (`Authorization: Bearer …`), not the non-secret `?shop=` query, so one tenant can't read another's leads or overwrite its API key.
+- **Session-token auth for the settings API.** The embedded app's settings/leads API authorizes off a signed session token (`Authorization: Bearer …`), not the non-secret `?shop=` query, so one tenant can't read another's leads or overwrite its settings.
 - **E.164 normalization.** Phone numbers from Shopify are normalized to E.164 before dialing (`src/util/phone.js`); un-normalizable numbers are skipped, never dialed.
-- **Never log the API key.** The Telenow `X-API-Key` is never logged or sent to the browser — the settings page only ever sees a masked hint. Phone numbers are masked in logs.
+- **Never log the API key.** The leased Telenow `X-API-Key` lives server-side only: it is never logged, never rendered into the settings page, and never sent to the browser in any form. Phone numbers are masked in logs.
 - **Open-redirect / SSRF guard.** The `?shop=` parameter is validated against `*.myshopify.com` and sanitized via the library before any OAuth redirect.
 - **Quiet hours.** Calls are suppressed inside each automation's local quiet-hours window (and re-checked at fire time for delayed calls).
 - **Webhook dedupe.** Shopify redelivers webhooks (and `checkouts/update` fires many times per cart), so the app refuses to place a second call for the same entity within a TTL, clearing the mark if placement itself fails so a genuine retry still goes through.
@@ -154,7 +155,8 @@ We verify by recomputing the HMAC over the **raw body** with that secret (consta
 - [ ] **Durable scheduling for delays + sweeps.** Delayed calls use `setTimeout` and win-back/reviews use `setInterval` — neither survives a restart or scales across instances. Use a job queue (BullMQ/Redis, SQS) or `node-cron` with a leader lock.
 - [ ] **Host on HTTPS** with a stable `HOST`. Re-register webhooks if the URL changes.
 - [x] **Mandatory GDPR webhooks.** `customers/data_request`, `customers/redact`, `shop/redact` are registered, HMAC-verified, and act on the data we hold: data_request collects the customer's local call records, customers/redact erases them (call map + dedupe attempts), shop/redact purges all shop data. **Remaining for production:** forward redaction/export to Telenow for the actual voice recordings/transcripts (TODOs marked in `src/webhooks/shopify.js`).
-- [ ] **App review.** Provide a test store, production HTTPS, and public docs (https://telenow.ai/docs). Confirm requested scopes match the Partners app config exactly.
+- [x] **App review.** Testing instructions (req 4.5.4) live in `docs/REVIEW-TESTING.md` and are pasted into the Partner Dashboard verbatim. The app needs no external credentials; a development-store charge is created with `test: true`.
+- [ ] **Seed and watch the calling-workspace pool.** `TELENOW_KEY_POOL` must be populated before the first install, and `/healthz` reports `total / leased / free / quarantined / dead`. Alarm at fewer than 5 free — a dry pool answers `503 provisioning` on every call route. See [DEPLOY.md § Telenow key pool](DEPLOY.md#10-telenow-key-pool).
 - [ ] **Per-customer call frequency caps / suppression list** (don't call the same shopper repeatedly across automations).
 - [ ] **Replace the win-back last-order proxy.** `winBack.js` approximates last-order date with `customer.updated_at`; maintain a true `last_order_at` index from `orders/create`, or use a Customer Segment query.
 - [ ] **Persist `fulfilledAt`** on `orders/fulfilled` to activate the reviews/NPS sweep.
@@ -219,11 +221,11 @@ src/
 
 ## 📞 About Telenow
 
-[Telenow](https://telenow.ai) is a multilingual AI voice-calling platform that places and answers natural-sounding phone calls with AI voice agents — in English, Hindi, and other Indian and global languages — and reports every call's outcome back to your systems. This Shopify app is a free connector to that service; you bring your own Telenow account and `vai_live_…` API key, and Telenow bills for call usage on its own platform.
+[Telenow](https://telenow.ai) is a multilingual AI voice-calling platform that places and answers natural-sounding phone calls with AI voice agents — in English, Hindi, and other Indian and global languages — and reports every call's outcome back to your systems. This Shopify app provisions and manages its own Telenow calling workspace for each store. Merchants pay Shopify; nothing is billed by Telenow to the merchant.
 
 - Website: [telenow.ai](https://telenow.ai)
 - Docs: [telenow.ai/docs](https://telenow.ai/docs)
-- Pricing: [telenow.ai/#pricing](https://telenow.ai/#pricing)
+- Plans and pricing: see the app's listing on the Shopify App Store.
 
 ## 📄 License
 

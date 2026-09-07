@@ -1,6 +1,31 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "5aef351a70518eb6484369ba20f78ecc"
+# ─────────────────────────────────────────────────────────────────────────────
+# client_id MUST stay identical in this file and in shopify.app.telenowvoiceai.toml.
+#
+# There are two Partner apps with the name "telenowvoiceai". Only
+# 1181346b04d8d62d945cce9aa5fa90d7 is the one that is listed and under review;
+# 5aef351a70518eb6484369ba20f78ecc is an unlisted duplicate created by an early
+# `shopify app init`. This file is the CLI *default* config — the one a bare
+# `shopify app deploy` uses when nobody remembers to run
+# `shopify app config use telenowvoiceai` first. While it named the duplicate,
+# that deploy silently published to an app no reviewer can see: the work landed,
+# the listing did not change, and the failure looked exactly like the work not
+# working.
+#
+# With the Billing API in play this is no longer merely confusing, it is fatal.
+# An access token is issued by one app, and `currentAppInstallation.
+# activeSubscriptions` is scoped to the app that issued it. Serve the app with
+# credentials from one client_id while the merchant's subscription was created
+# under the other and the entitlement read returns an empty array for every
+# paying merchant — the app then locks its own customers out of the product they
+# just paid for, with no error anywhere to explain why.
+#
+# So: if you ever change the client_id, change it in BOTH toml files in the same
+# commit, and change SHOPIFY_API_KEY / SHOPIFY_API_SECRET in the deployed
+# environment to match (see DEPLOY.md). Never let the two files disagree.
+# ─────────────────────────────────────────────────────────────────────────────
+client_id = "1181346b04d8d62d945cce9aa5fa90d7"
 name = "telenowvoiceai"
 application_url = "https://shop.telenow.ai"
 embedded = true

@@ -119,8 +119,17 @@ async function main() {
       sessionId: 'offline_session_test',
     });
     store.saveHook(SHOP, { id: 'hook_test', secret: mock.createdHooks[0]?.secret || 'whsec_test_123' });
+    // telenowKeySource and telenowLeasedAt are not decoration: they describe a
+    // shop whose workspace the APP provisioned. A key with source 'none' is the
+    // pre-billing shape — a merchant-pasted vai_live_ key — and resolveKey()
+    // now discards those on sight and leases from the pool instead, so seeding
+    // without them would put this shop on the migration path and every call
+    // below would skip with "calling workspace not ready".
     settings.updateSettings(SHOP, {
       telenowApiKey: 'vai_live_testkey_roundtrip',
+      telenowKeySource: 'pool',
+      telenowWorkspaceRef: 'ws-roundtrip',
+      telenowLeasedAt: new Date().toISOString(),
       automations: {
         leadCallback: { enabled: true, agentId: 'agent-uuid-test', delayMinutes: 0 },
       },

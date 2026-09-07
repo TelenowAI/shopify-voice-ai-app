@@ -26,6 +26,8 @@ import express from 'express';
 
 import { HOST, addOrderTags, appendOrderNote, setOrderMetafield } from '../shopify.js';
 import { getSettings } from '../settings.js';
+import { getEntitlement, reportUsage } from '../billing.js';
+import { rollIfNeeded, addMinutes, settleBilled } from '../usage.js';
 import {
   getHook,
   saveHook,
@@ -213,10 +215,119 @@ telenowWebhookRouter.post('/', async (req, res) => {
   // ACK immediately; process write-back in the background.
   res.status(200).json({ ok: true });
 
+  // ACK FIRST, METER AFTER — the order of these two statements is the whole
+  // safety property. Telenow retries any delivery it did not get a 200 for, so
+  // if metering ran before the response and were slow (getEntitlement can reach
+  // the Admin API) or threw, Telenow would resend the same call.ended and we
+  // would count the minute twice. Metering therefore runs detached, and its
+  // failure can never turn a delivery we already accepted into a retry.
+  //
+  // The remaining redelivery window — a delivery that crosses with our 200 on
+  // the wire — is closed inside addMinutes(), which is idempotent on
+  // session_id, and again by reportUsage()'s idempotencyKey on Shopify's side.
+  if ((payload.event_type || '') === 'call.ended') {
+    recordCallUsage(auth.shop, payload).catch((err) => console.error('[usage]', err.message));
+  }
+
   handleResult(auth.shop, auth.call, payload).catch((err) =>
     console.error(`[telenow] write-back failed for ${auth.shop}:`, err.message),
   );
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Metering
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Meter one completed call against the shop's plan, and bill Shopify for
+ * whatever of it fell past the included allowance.
+ *
+ * This is the ONLY place a minute is ever counted. `call.ended` is the single
+ * event that carries a real, finished duration — `call.analyzed` arrives later
+ * for the same session with the same field, which is why the caller filters on
+ * event_type rather than metering everything that verifies. Counting both would
+ * double every merchant's usage; the session-id guard inside addMinutes() would
+ * in fact catch it, but relying on a downstream guard to undo a wrong decision
+ * upstream is how the second such bug goes unnoticed.
+ *
+ * Ordering: the entitlement is read FIRST because both of the steps after it
+ * need it — rollIfNeeded() anchors the period on `currentPeriodEnd`, and
+ * addMinutes() needs the plan to know what is included and therefore what is
+ * billable. getEntitlement() never throws and is cached, so this is normally a
+ * settings read, not a round trip.
+ *
+ * @param {string} shop
+ * @param {object} payload  the call.ended body
+ */
+async function recordCallUsage(shop, payload) {
+  const sessionId = typeof payload.session_id === 'string' ? payload.session_id : '';
+
+  const ent = await getEntitlement(shop);
+  const usage = rollIfNeeded(shop, ent);
+
+  // `duration` is seconds and is documented on every call.ended body, but a
+  // truncated or pre-answer delivery can omit it. addMinutes() treats a missing
+  // or non-numeric duration as zero minutes while still recording the session
+  // id, so a later redelivery of the same call cannot be counted either — the
+  // right outcome, since we have no evidence the call consumed anything.
+  const { billableMinutes, usedMinutes } = addMinutes(shop, sessionId, payload.duration, ent);
+
+  console.log(
+    `[usage] shop=${shop} session=${sessionId || '?'} duration=${payload.duration ?? '?'}s ` +
+      `used=${usedMinutes}min billable=${billableMinutes}min plan=${ent.plan}`,
+  );
+
+  // Starter always reports 0 billable minutes (its ceiling is a hard stop in
+  // checkAccess, never an invoice), so this is implicitly the paid-plan branch;
+  // reportUsage() re-checks the plan and the usage line item itself.
+  if (billableMinutes <= 0) return;
+
+  // The period label is the window addMinutes just counted against, not today,
+  // so a usage record created moments after a period rolls is still described
+  // as belonging to the period the call actually happened in.
+  const periodLabel = String(usage.periodStart || '').slice(0, 10) || undefined;
+
+  try {
+    const res = await reportUsage(shop, { sessionId, minutes: billableMinutes, periodLabel });
+    if (res.reported) {
+      // Shopify holds the charge now, so the minutes addMinutes() put in escrow
+      // are settled for good: drop them from pendingBillMinutes and leave
+      // billedMinutes where it is.
+      settleBilled(shop, billableMinutes, true);
+      console.log(
+        `[usage] billed shop=${shop} session=${sessionId} ` +
+          `${res.minutes}min $${res.amountUsd} (${res.id || 'no id'})`,
+      );
+    } else {
+      // reportUsage() declined before it ever reached Shopify — no usage line
+      // item on the subscription, for one. Nothing was recorded, so hand the
+      // minutes back: billedMinutes rewinds and the next call re-offers them.
+      // That is what makes a mis-provisioned subscription recoverable once an
+      // operator fixes it, instead of a permanent hole in the invoice.
+      settleBilled(shop, billableMinutes, false);
+      console.log(`[usage] not billed shop=${shop} session=${sessionId}: ${res.reason}`);
+    }
+  } catch (err) {
+    // Two very different failures arrive here and only one is safe to rewind.
+    //
+    // A userErrors rejection is Shopify answering "no": the usage record does
+    // not exist, so handing the minutes back costs nothing and recovers the
+    // revenue. Anything else — a timeout, a socket reset, a 5xx — is genuinely
+    // ambiguous, because the mutation may well have committed before the
+    // response was lost. The idempotencyKey is scoped to THIS session id, so
+    // minutes folded into a later call would carry a different key and Shopify
+    // would not dedupe them. We therefore leave those in escrow and under-charge
+    // ourselves rather than risk billing the merchant twice for one call.
+    const definitivelyRejected = /appUsageRecordCreate rejected/.test(err.message || '');
+    if (definitivelyRejected) settleBilled(shop, billableMinutes, false);
+    console.error(
+      `[usage] FAILED to bill ${billableMinutes}min for shop=${shop} session=${sessionId}: ` +
+        `${err.message} — ${definitivelyRejected
+          ? 'rejected by Shopify, so these minutes are back on offer.'
+          : 'outcome unknown, so these minutes are held and will not be retried.'}`,
+    );
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Outcome → Shopify write-back

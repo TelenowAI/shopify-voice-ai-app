@@ -29,14 +29,15 @@ const DATA_DIR = process.env.DATA_DIR
 
 const DB_FILE = path.join(DATA_DIR, 'store.json');
 
-/** @typedef {{ shops: object, settings: object, callMap: object, hooks: object }} DB */
+/** @typedef {{ shops: object, settings: object, callMap: object, hooks: object,
+ *              keypool: object }} DB */
 
 /** In-memory cache of the whole DB. Loaded once at startup. */
 let db = load();
 
 function emptyDb() {
   return { shops: {}, settings: {}, callMap: {}, hooks: {}, attempts: {}, leads: {}, leadSeq: {},
-    fulfillments: {} };
+    fulfillments: {}, keypool: {} };
 }
 
 function load() {
@@ -137,6 +138,19 @@ export function deleteShop(shop) {
   delete db.shops[shop];
   delete db.settings[shop];
   delete db.hooks[shop];
+  // The shop's KEYPOOL ROW IS DELIBERATELY NOT DELETED. It is the only surviving
+  // record that the workspace behind that ref still holds this merchant's call
+  // recordings, transcripts and customer phone numbers; drop the row and the
+  // next boot sees an unknown ref in the pool source, registers it as `free`,
+  // and hands the departing merchant's data to whoever installs next. So the
+  // quarantine record must outlive the shop it came from — that is the whole
+  // point of it. It is purged only by scripts/keypool.js after a real wipe.
+  //
+  // Instead we make the row terminal: releaseWorkspace() normally quarantines
+  // before we get here, but deleteShop is also reached from shop/redact (48h
+  // post-uninstall) and from paths where the release never ran, so an entry
+  // still marked `leased` is quarantined now rather than left looking live.
+  quarantineShopEntry(shop);
   // Drop any callMap entries belonging to this shop.
   for (const [sid, entry] of Object.entries(db.callMap)) {
     if (entry?.shop === shop) delete db.callMap[sid];
@@ -511,4 +525,419 @@ export function pruneFulfillments(shop, days = 90) {
   }
   if (n) persist();
   return n;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Key pool — leased Telenow calling workspaces
+//
+// The merchant never supplies a Telenow API key any more (that off-platform
+// signup is what got the app paused). An operator mints a batch of workspaces
+// ahead of time and seeds them via TELENOW_KEY_POOL or ${DATA_DIR}/keypool.json;
+// this module hands one to each shop and remembers who holds what.
+//
+// SPLIT OF RESPONSIBILITY — credentials vs. bookkeeping. The seed material
+// (apiKey, numberE164, numberId, plus the optional provider/country labels on
+// the number) is held in memory only and is NEVER copied into
+// store.json. Two reasons: store.json is already the most sensitive file on the
+// box and duplicating a second live secret into it buys nothing, and an operator
+// must be able to rotate a workspace's key by editing the seed alone, with no
+// migration. What IS persisted is the lease — which ref belongs to which shop,
+// and what state that ref is in.
+//
+// STATES.  free → leased → quarantined, with dead as a terminal branch.
+//   free         never handed out (or wiped and returned by an operator)
+//   leased       bound to exactly one shop
+//   quarantined  the shop is gone, but the workspace still holds their data
+//   dead         the credential no longer authenticates (Telenow answered 401)
+// NOTHING in this process ever moves an entry back to `free`. See releaseKey().
+//
+// src/provisioning.js also parses the same seed, but only to report *why* a
+// lease failed. Leasing happens here and nowhere else: two code paths popping
+// from one pool would eventually hand a single workspace to two merchants.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const POOL_FILE = path.join(DATA_DIR, 'keypool.json');
+
+/**
+ * ref → { ref, apiKey, numberE164, numberId, provider, country }.
+ * In-memory only; see above.
+ */
+let poolSource = null;
+
+// PROVIDER AND COUNTRY ARE OPTIONAL, AND ABSENT MEANS UNKNOWN — NEVER 'IN'.
+//
+// The seed shipped before these two fields existed, so every entry an operator
+// has already written lacks them. Defaulting the country to India (which is what
+// the rest of the app used to do implicitly) would silently mark that whole
+// legacy pool as Indian and let leaseKey() hand an Indian DID to a US merchant
+// while logging a confident country match. `null` is the honest value: it never
+// matches a preferred country, so an unknown entry is only ever used as the
+// last-resort fallback — which is exactly what it is.
+//
+// Both spellings are accepted because the operator-facing pool seed and the
+// platform's own number rows disagree: /api/v1/numbers calls them `provider` and
+// `country`, while a hand-written seed that already carries `numberE164` /
+// `numberId` naturally reads `numberProvider` / `numberCountry`. Taking both
+// costs one `??` and removes a silent-drop failure mode from a config file that
+// nothing validates.
+
+/** Lowercase platform provider id ('plivo', 'twilio', …), or null if unusable. */
+function normalizeProvider(value) {
+  return typeof value === 'string' && value.trim() ? value.trim().toLowerCase() : null;
+}
+
+/** ISO-3166-1 alpha-2, uppercased ('US', 'IN', …), or null if unusable. */
+function normalizeCountry(value) {
+  return typeof value === 'string' && value.trim() ? value.trim().toUpperCase() : null;
+}
+
+/**
+ * Read the operator-seeded pool: TELENOW_KEY_POOL (a JSON array), else
+ * ${DATA_DIR}/keypool.json.
+ *
+ * Unlike load() above this NEVER exits the process on bad input. The database is
+ * irreplaceable, so a corrupt one must stop the boot; the seed is a config value
+ * an operator can retype in a minute, and crash-looping over a typo in an env
+ * var would take down every already-provisioned shop, none of which needs the
+ * pool to keep serving. A malformed seed reads as empty and says so.
+ *
+ * @returns {Array<object>} raw seed entries (validated in registerPoolEntries)
+ */
+function readPoolSeed() {
+  let raw = null;
+  let where = 'none';
+  try {
+    if (process.env.TELENOW_KEY_POOL) {
+      where = 'TELENOW_KEY_POOL';
+      raw = process.env.TELENOW_KEY_POOL;
+    } else if (fs.existsSync(POOL_FILE)) {
+      where = POOL_FILE;
+      raw = fs.readFileSync(POOL_FILE, 'utf8');
+    }
+  } catch (err) {
+    console.error(`[store] key pool seed (${where}) unreadable: ${err.message}`);
+    return [];
+  }
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      console.error(`[store] key pool seed (${where}) is not a JSON array — treating the pool as empty.`);
+      return [];
+    }
+    return parsed;
+  } catch (err) {
+    // Never echo `raw` in the message — it is a list of live API keys.
+    console.error(`[store] key pool seed (${where}) is not valid JSON: ${err.message}`);
+    console.error('[store] treating the pool as EMPTY — new shops cannot be provisioned until fixed.');
+    return [];
+  }
+}
+
+/** Load the seed once, on the first keypool call. */
+function ensurePoolLoaded() {
+  if (poolSource !== null) return;
+  poolSource = new Map();
+  registerPoolEntries(readPoolSeed());
+}
+
+/**
+ * Register seed entries with the store: an unknown ref is inserted as `free`,
+ * and a ref already on the books is left EXACTLY as it is.
+ *
+ * That second half is the load-bearing one. The same array is re-supplied on
+ * every boot, so if registration reset state, one restart would flip every
+ * quarantined workspace back to free and re-issue the previous merchants' call
+ * recordings to whoever installs next. Registration therefore only ever adds.
+ *
+ * Credentials ARE refreshed for known refs — that is how a key rotation reaches
+ * a shop already leasing the ref. It is the lease STATE that is immutable here,
+ * not the secret behind it.
+ *
+ * `provider` and `country` are OPTIONAL and additive: an entry seeded before they
+ * existed still registers, still leases, and is simply treated as unknown-origin.
+ * Only `ref` and `apiKey` are load-bearing, and that has not changed — a bad or
+ * missing provider/country degrades one entry to "unknown", never to rejected,
+ * because a number that dials is worth more than a number that is labelled.
+ *
+ * @param {Array<{ref: string, apiKey: string, numberE164?: string, numberId?: string,
+ *                provider?: string, numberProvider?: string,
+ *                country?: string, numberCountry?: string}>} entries
+ * @returns {number} how many previously-unknown refs were added
+ */
+export function registerPoolEntries(entries) {
+  if (poolSource === null) poolSource = new Map();
+  if (!Array.isArray(entries)) return 0;
+
+  let added = 0;
+  let malformed = 0;
+  for (const raw of entries) {
+    const ref = typeof raw?.ref === 'string' ? raw.ref.trim() : '';
+    const apiKey = typeof raw?.apiKey === 'string' ? raw.apiKey.trim() : '';
+    if (!ref || !apiKey) { malformed++; continue; }
+
+    poolSource.set(ref, {
+      ref,
+      apiKey,
+      numberE164: raw.numberE164 ?? null,
+      numberId: raw.numberId ?? null,
+      provider: normalizeProvider(raw.provider ?? raw.numberProvider),
+      country: normalizeCountry(raw.country ?? raw.numberCountry),
+    });
+
+    if (!db.keypool[ref]) {
+      db.keypool[ref] = { ref, shop: null, state: 'free', leasedAt: null, releasedAt: null };
+      added++;
+    }
+  }
+  if (malformed) {
+    console.error(`[store] key pool: ${malformed} entries missing ref or apiKey — ignored.`);
+  }
+  if (added) persist();
+  return added;
+}
+
+/**
+ * Merge the persisted lease row with the in-memory secret for its ref.
+ * @param {{ref: string}} entry  the persisted lease row
+ * @param {{apiKey: string, numberE164?: string|null, numberId?: string|null,
+ *          provider?: string|null, country?: string|null}} creds
+ * @returns {{ ref: string, apiKey: string, numberE164: string|null, numberId: string|null,
+ *            provider: string|null, country: string|null }}
+ */
+function mergePoolEntry(entry, creds) {
+  return {
+    ref: entry.ref,
+    apiKey: creds.apiKey,
+    numberE164: creds.numberE164 ?? null,
+    numberId: creds.numberId ?? null,
+    provider: creds.provider ?? null,
+    country: creds.country ?? null,
+  };
+}
+
+/**
+ * Bind a workspace to a shop, or return the one it already holds.
+ *
+ * Idempotent per shop by design: provisioning.js calls this on a self-heal path
+ * and again behind an in-flight map at boot, and an implementation that popped a
+ * fresh entry each time would burn a workspace per restart while stranding the
+ * merchant's data in the ones it abandoned.
+ *
+ * COUNTRY IS A PREFERENCE, NEVER A REQUIREMENT. A merchant whose shoppers are in
+ * the US is far better served by a US caller ID — a foreign DID dialling a North
+ * American mobile is routinely blocked or spam-filtered, which is the same defect
+ * that would fail a Shopify reviewer's test call. But an unmatched country must
+ * never turn into a refusal: a working foreign number still connects, while a
+ * null lease means the install answers 503 and the merchant has no app at all.
+ * So the country only reorders the scan; it never shortens it.
+ *
+ * @param {string} shop
+ * @param {{ preferCountry?: string|null }} [opts]  ISO-3166-1 alpha-2, case-insensitive
+ * @returns {{ ref: string, apiKey: string, numberE164: string|null, numberId: string|null,
+ *             provider: string|null, country: string|null }|null}
+ */
+export function leaseKey(shop, opts = {}) {
+  if (!shop) return null;
+  ensurePoolLoaded();
+
+  const preferCountry = normalizeCountry(opts?.preferCountry);
+
+  const held = Object.values(db.keypool).find((e) => e?.state === 'leased' && e.shop === shop);
+  if (held) {
+    const creds = poolSource.get(held.ref);
+    if (creds) return mergePoolEntry(held, creds);
+    // Leased, but no longer in the seed: the operator pulled it while the shop
+    // was using it. There is no credential to return and there never will be for
+    // this ref, so retire it and lease a different one. `dead` rather than
+    // `free`, because the workspace may still hold that shop's data.
+    held.state = 'dead';
+    held.releasedAt = new Date().toISOString();
+    console.error(`[store] keypool ref ${held.ref} is leased but missing from the seed — marking it dead.`);
+    persist();
+  }
+
+  // A shop reclaiming its OWN quarantined workspace is the one reuse that is
+  // privacy-safe, and skipping it is expensive twice over.
+  //
+  // Uninstall quarantines the entry and deleteShop wipes the settings row. A
+  // reinstall minutes later would otherwise scan past that entry, burn a second
+  // pool workspace, and leave the merchant's agents stranded in the first one —
+  // they would come back as tombstones in a store that looks freshly broken.
+  // Install → uninstall → reinstall is also exactly how a Shopify reviewer tests
+  // requirement 1.2.2, so three cycles could drain a small pool to exhaustion
+  // and answer a fresh install with 503.
+  //
+  // Bounded to 48h so a workspace does not sit unusable indefinitely waiting for
+  // a merchant who is not coming back; after that an operator wipes it through
+  // scripts/keypool.js and it returns to the pool clean. The shop match is what
+  // makes this safe — a quarantined entry is NEVER handed to a different shop.
+  const RECLAIM_WINDOW_MS = 48 * 60 * 60 * 1000;
+  for (const entry of Object.values(db.keypool)) {
+    if (entry?.state !== 'quarantined' || entry.shop !== shop) continue;
+    const released = Date.parse(entry.releasedAt || '');
+    if (!Number.isFinite(released) || Date.now() - released > RECLAIM_WINDOW_MS) continue;
+    const creds = poolSource.get(entry.ref);
+    if (!creds) continue;
+    entry.state = 'leased';
+    entry.leasedAt = new Date().toISOString();
+    entry.releasedAt = null;
+    persist();
+    console.log(`[store] keypool: rule=reclaim — ref ${entry.ref} reclaimed by ${shop} after reinstall.`);
+    return mergePoolEntry(entry, creds);
+  }
+
+  // Two passes over the same `free` set, not one pass with a filter, because the
+  // second pass MUST still run when the first finds nothing. Written as a filter
+  // it becomes one `continue` away from returning null on a full pool simply
+  // because the merchant's country is not stocked.
+  const takeFree = (wantCountry) => {
+    for (const entry of Object.values(db.keypool)) {
+      if (entry?.state !== 'free') continue;
+      const creds = poolSource.get(entry.ref);
+      if (!creds) continue; // registered once, since removed from the seed
+      // A null country is unknown, not a wildcard — see normalizeCountry above.
+      if (wantCountry && creds.country !== wantCountry) continue;
+      entry.shop = shop;
+      entry.state = 'leased';
+      entry.leasedAt = new Date().toISOString();
+      entry.releasedAt = null;
+      persist();
+      return { entry, creds };
+    }
+    return null;
+  };
+
+  if (preferCountry) {
+    const match = takeFree(preferCountry);
+    if (match) {
+      console.log(`[store] keypool: rule=country-match — ref ${match.entry.ref} (${preferCountry}) leased to ${shop}.`);
+      return mergePoolEntry(match.entry, match.creds);
+    }
+  }
+
+  const any = takeFree(null);
+  if (any) {
+    if (preferCountry) {
+      // Not a warning for the merchant — they still get a working number — but it
+      // is the ONLY signal an operator gets that a country is out of stock, and
+      // it has to fire before the pool empties rather than after.
+      console.warn(
+        `[store] keypool: rule=any-free — no free ${preferCountry} number available; `
+        + `ref ${any.entry.ref} (${any.creds.country || 'country unknown'}) leased to ${shop}. `
+        + `Mint ${preferCountry} numbers into the pool.`,
+      );
+    } else {
+      console.log(`[store] keypool: rule=any-free — ref ${any.entry.ref} leased to ${shop}.`);
+    }
+    return mergePoolEntry(any.entry, any.creds);
+  }
+
+  return null; // exhausted — the caller answers 503, never a paywall
+}
+
+/**
+ * Move a shop's entry out of service. Returns the ref, or null if it held none.
+ *
+ * THE ENTRY GOES TO `quarantined`, NEVER BACK TO `free`, AND NOTHING IN THIS
+ * PROCESS MAY CHANGE THAT. A released workspace still contains the departing
+ * merchant's call recordings, transcripts, agent configuration and their
+ * customers' phone numbers. Handing it to the next merchant who installs would
+ * disclose one merchant's protected customer data to another — a GDPR breach and
+ * a Shopify protected-customer-data violation, produced by an optimisation that
+ * reads like harmless inventory reuse.
+ *
+ * Reclaiming inventory is therefore an explicit operator act after an actual
+ * purge: `node scripts/keypool.js wipe <ref> --wiped`. Until then the entry is
+ * counted separately by keypoolStatus(), so the obligation stays visible instead
+ * of hiding inside a healthy-looking free count.
+ *
+ * @param {string} shop
+ * @returns {string|null} the quarantined ref
+ */
+export function releaseKey(shop) {
+  const ref = quarantineShopEntry(shop);
+  if (ref) persist();
+  return ref;
+}
+
+/**
+ * The state move behind releaseKey(), without the write — deleteShop() calls it
+ * too and persists once for the whole teardown. Only one entry per shop can be
+ * `leased`, so the first match is the only match.
+ */
+function quarantineShopEntry(shop) {
+  if (!shop) return null;
+  for (const entry of Object.values(db.keypool)) {
+    if (entry?.shop !== shop || entry.state !== 'leased') continue;
+    entry.state = 'quarantined';
+    entry.releasedAt = new Date().toISOString();
+    // entry.shop is left SET on purpose. It names the merchant whose data is
+    // still sitting in that workspace, which is exactly what an operator needs
+    // to know before wiping it. Nulling it here would leave a quarantined ref
+    // with no record of what has to be purged.
+    return entry.ref;
+  }
+  return null;
+}
+
+/**
+ * Retire a ref whose credential no longer authenticates (Telenow answered 401).
+ * Safe with an unknown or already-dead ref — provisioning.js calls it from an
+ * error path, where guessing wrong must not cascade.
+ *
+ * @param {string} ref
+ * @returns {boolean} whether this call changed anything
+ */
+export function markKeyDead(ref) {
+  if (!ref) return false;
+  const entry = db.keypool[ref];
+  if (!entry || entry.state === 'dead') return false;
+  entry.state = 'dead';
+  entry.releasedAt = new Date().toISOString();
+  persist();
+  return true;
+}
+
+/**
+ * Pool census for /healthz and ops alerting.
+ *
+ * byCountry/byProvider count FREE ENTRIES ONLY, deliberately. The question these
+ * answer is not "what have we bought" but "what can the next install actually
+ * get" — a pool of forty numbers is still out of stock for a US merchant if all
+ * forty are leased. Counting everything would show `US: 12` right up to the
+ * moment a US merchant is handed an Indian DID, which is the exact failure this
+ * census exists to catch.
+ *
+ * Entries seeded without the fields are bucketed under `unknown` rather than
+ * dropped, so the totals of each map always reconcile with `free`; an operator
+ * seeing a large `unknown` knows the labels are missing, not the numbers.
+ *
+ * @returns {{ total: number, leased: number, free: number, quarantined: number, dead: number,
+ *             byCountry: Record<string, number>, byProvider: Record<string, number> }}
+ */
+export function keypoolStatus() {
+  ensurePoolLoaded();
+  const status = {
+    total: 0, leased: 0, free: 0, quarantined: 0, dead: 0,
+    byCountry: {}, byProvider: {},
+  };
+  for (const entry of Object.values(db.keypool)) {
+    if (!entry) continue;
+    status.total++;
+    if (entry.state === 'leased') status.leased++;
+    else if (entry.state === 'free') {
+      status.free++;
+      // Labels live in the in-memory seed, never in store.json (see the split of
+      // responsibility above), so they are read back through poolSource here.
+      const creds = poolSource.get(entry.ref);
+      const country = creds?.country || 'unknown';
+      const provider = creds?.provider || 'unknown';
+      status.byCountry[country] = (status.byCountry[country] || 0) + 1;
+      status.byProvider[provider] = (status.byProvider[provider] || 0) + 1;
+    } else if (entry.state === 'quarantined') status.quarantined++;
+    else if (entry.state === 'dead') status.dead++;
+  }
+  return status;
 }

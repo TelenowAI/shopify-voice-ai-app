@@ -4,8 +4,8 @@
 // Routes:
 //   GET /auth?shop=<store>.myshopify.com   → start OAuth (redirects to Shopify)
 //   GET /auth/callback                     → finish OAuth, persist offline token,
-//                                            register Shopify webhooks, subscribe
-//                                            to Telenow result webhooks.
+//                                            register Shopify webhooks, lease the
+//                                            shop's calling workspace.
 //
 // After install we send the merchant to /app (the settings page).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -15,8 +15,7 @@ import express from 'express';
 import { shopify, HOST } from './shopify.js';
 import { saveShop, getShop } from './store.js';
 import { mintSessionToken } from './session.js';
-import { getSettings } from './settings.js';
-import { ensureTelenowHook } from './webhooks/telenow.js';
+import { ensureWorkspace } from './provisioning.js';
 import { WEBHOOK_TOPICS } from './webhooks/shopify.js';
 
 export const authRouter = express.Router();
@@ -72,17 +71,45 @@ authRouter.get(CALLBACK_PATH, async (req, res) => {
     // Register Shopify webhooks for this shop (idempotent).
     await registerShopifyWebhooks(session);
 
-    // Subscribe to Telenow call-result webhooks if the merchant already set an
-    // API key (they may set it later in /app — ensureTelenowHook is also called
-    // from the settings save path).
-    try {
-      const settings = getSettings(session.shop);
-      if (settings.telenowApiKey) {
-        await ensureTelenowHook(session.shop);
-      }
-    } catch (err) {
-      console.error(`[auth] Telenow hook setup skipped for ${session.shop}:`, err.message);
-    }
+    // Lease this shop a calling workspace so the app is usable the moment the
+    // merchant lands on /app — there is no key field for them to fill in any
+    // more. ensureWorkspace registers the call-result webhook itself, which is
+    // why the old ensureTelenowHook call is gone from here.
+    //
+    // Provisioning is deliberately NOT allowed to block or fail the redirect.
+    // The install is already complete and durable at this point (the offline
+    // token is saved); a pool that is momentarily empty, or a Telenow blip, must
+    // not strand the merchant on an OAuth error page they cannot retry from
+    // without reinstalling. ensureWorkspace is idempotent and every /api/* route
+    // re-runs it, so a deferred lease heals on the merchant's first real request
+    // — which shows the 503 "setting up your workspace" state instead, a screen
+    // they can simply reload.
+    //
+    // Catching the rejection is not enough to honour that: a lease that SUCCEEDS
+    // slowly holds the install open just as badly as one that fails. The path
+    // behind this call is ensureWorkspace → leaseFromPool → wireUpWorkspace →
+    // ensureTelenowHook, which issues up to three sequential Telenow requests at
+    // the client's 20s default timeout, so an unbounded await can sit on the
+    // OAuth redirect for the better part of a minute while Shopify's install
+    // flow, the merchant, and the browser all wait on a third party. Racing a 4s
+    // timer bounds that; the lease keeps running in the background and the next
+    // request picks up whatever it finished. Same pattern, same reason, as the
+    // billing callback in server.js.
+    await Promise.race([
+      ensureWorkspace(session.shop).catch((err) => {
+        console.error('[auth] workspace lease deferred:', err.message);
+        return null;
+      }),
+      new Promise((resolve) => setTimeout(resolve, 4000).unref?.()),
+    ]);
+
+    // Note what we intentionally do NOT do here: create a billing charge. Every
+    // shop installs onto the free Starter plan, which needs no subscription, and
+    // a charge started inside the OAuth callback would redirect the merchant to
+    // Shopify's approval screen mid-install — where declining or closing the tab
+    // leaves an installed app whose first impression is a payment demand, and
+    // where the return trip lands outside our callback's state. Plan selection
+    // happens later, from inside the app, on the merchant's own initiative.
 
     console.log(`[auth] installed for ${session.shop}`);
 

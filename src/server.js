@@ -20,20 +20,30 @@ import express from 'express';
 
 // Import order: shopify.js (which imports the node adapter) before anything that
 // touches the library. The webhook module also calls addHandlers() at import.
-import { shopify, HOST, getShopProfile, findFlaggedOrders, assertHostConfig } from './shopify.js';
+import {
+  shopify, HOST, getShopProfile, getShopCountry, findFlaggedOrders, assertHostConfig,
+} from './shopify.js';
 import { authRouter, rootHandler } from './auth.js';
 import { shopifyWebhookRouter } from './webhooks/shopify.js';
-import { telenowWebhookRouter, ensureTelenowHook } from './webhooks/telenow.js';
+import { telenowWebhookRouter } from './webhooks/telenow.js';
 import { ndrWebhookRouter } from './webhooks/ndr.js';
 import { eventsRouter } from './webhooks/events.js';
 import {
   getSettings, getRedactedSettings, updateSettings, AUTOMATIONS,
   getAutomation, getSavedAgents, addSavedAgent, removeSavedAgent,
 } from './settings.js';
-import { getShop, listLeads } from './store.js';
+import { getShop, listShops, listLeads } from './store.js';
 import { listTemplates, getTemplate, buildAgentPayload } from './templates.js';
 import { verifyAnySessionToken } from './session.js';
+import { toE164, resolveCountry, exampleNumberFor } from './util/phone.js';
 import { TelenowClient } from './telenow.js';
+import {
+  getEntitlement, checkAccess, refreshEntitlement,
+  requestSubscription, raiseCap, cancelSubscription, entitlementForClient,
+} from './billing.js';
+import { ensureWorkspace, poolStatus } from './provisioning.js';
+import { publicPlans, PLANS, planByHandle } from './plans.js';
+import { rollIfNeeded, usedMinutes } from './usage.js';
 import { runWinBackSweep } from './automations/winBack.js';
 import { runReviewsSweep } from './automations/reviews.js';
 import { runPostPurchaseSweep } from './automations/postPurchase.js';
@@ -51,7 +61,24 @@ app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'telenow-shopify' }));
+// The key pool is reported here because it is the one resource that silently
+// runs out: every install leases an entry and every uninstall quarantines one,
+// so `free` only ever falls. A monitor that alerts on it gives an operator days
+// of warning; without it the first symptom is a merchant seeing 503 provisioning
+// on a fresh install, which looks like an outage rather than an inventory
+// problem. `quarantined` is surfaced separately so it is obvious how much of
+// the shortfall is recoverable by wiping and re-seeding used workspaces.
+//
+// The census is emitted WHOLE rather than field-picked, which is what makes the
+// per-country and per-provider breakdowns (`byCountry` / `byProvider`, added by
+// keypoolStatus() and passed through poolStatus()) visible here for free. They
+// matter more than the total does: a pool holding forty free Indian numbers and
+// zero North-American ones reads as perfectly healthy on `free` alone, while
+// every US install is quietly leased a number that cannot reliably ring a US
+// mobile — which is the exact failure that gets a test call marked broken in
+// review. Alert on the country buckets, not just the total.
+app.get('/healthz', (_req, res) =>
+  res.json({ ok: true, service: 'telenow-shopify', keypool: poolStatus() }));
 
 // ── Webhook receivers (RAW body — must come before express.json) ──────────────
 // Shopify HMAC and Telenow X-VoiceAI-Signature both verify over raw bytes.
@@ -72,6 +99,92 @@ app.use(authRouter);
 
 // ── Landing ───────────────────────────────────────────────────────────────────
 app.get('/', rootHandler);
+
+// ── Billing return ────────────────────────────────────────────────────────────
+// Shopify sends the merchant here after they approve (or decline) a charge on
+// Shopify's own screen. This is a TOP-LEVEL browser navigation, not a fetch from
+// the embedded page, so there is no App Bridge session token to authenticate
+// with — every other /api route's authority is unavailable here.
+//
+// What stands in for it is the one-shot `state` nonce that requestSubscription()
+// minted and stored on settings.billing.pendingState. Without that check the URL
+// is a bare GET that anyone could replay for any shop; with it, an attacker
+// would have to guess 128 bits. It is compared with timingSafeEqual because a
+// byte-at-a-time `===` on a secret is measurable over enough requests, and the
+// nonce is cleared immediately afterwards so a replay of the same link fails.
+//
+// Note what this route deliberately does NOT do: trust the query string about
+// what was bought. `refreshEntitlement` re-reads the subscription from the Admin
+// API, so a merchant who edits the URL, or one whose approval silently failed,
+// gets whatever Shopify actually says they have.
+const SHOP_RE = new RegExp("^[a-zA-Z0-9][a-zA-Z0-9-]*[.]myshopify[.]com$");
+
+app.get('/billing/callback', async (req, res) => {
+  const shop = String(req.query.shop || '');
+  if (!SHOP_RE.test(shop) || !getShop(shop)) {
+    res.status(400).send('This billing link is not valid for an installed store.');
+    return;
+  }
+
+  const expected = String(getSettings(shop).billing?.pendingState || '');
+  const given = String(req.query.state || '');
+  const a = Buffer.from(expected, 'utf8');
+  const b = Buffer.from(given, 'utf8');
+  // timingSafeEqual throws on a length mismatch, so the length check has to come
+  // first — it leaks only the length of a random hex nonce, which is a constant.
+  if (!expected || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    // A bad state must NOT redirect. Bouncing an unverified request into the
+    // admin would make a forged link look like it worked.
+    res.status(400).send('This billing link has expired. Reopen the app and choose a plan again.');
+    return;
+  }
+
+  const billing = { ...(getSettings(shop).billing || {}), pendingState: null, pendingPlan: null };
+  updateSettings(shop, { billing });
+
+  try {
+    await refreshEntitlement(shop);
+  } catch (err) {
+    // The merchant has already paid at this point; a read failure here must not
+    // leave them staring at an error page. The scheduler and the next /api call
+    // both re-read the entitlement, so this self-heals within minutes.
+    console.error('[billing] callback refresh failed for', shop + ':', err.message);
+  }
+
+  // A brand-new paid shop usually has no workspace yet, and leasing one takes a
+  // round-trip to Telenow. Racing it against a short timer means the merchant
+  // lands on a working app when the lease is quick, and is never held on a blank
+  // page when it is slow — the lease continues in the background either way and
+  // is retried on the next request.
+  await Promise.race([
+    ensureWorkspace(shop).catch((err) => {
+      console.error('[billing] callback lease deferred for', shop + ':', err.message);
+      return null;
+    }),
+    new Promise((resolve) => setTimeout(resolve, 4000).unref?.()),
+  ]);
+
+  // The merchant has just approved a plan or a higher ceiling, so this is the
+  // moment any inbound line parked for billing comes back. Awaited, unlike the
+  // plan screen's call: landing back in the admin to find the number still dead
+  // is exactly the confusion an approval is supposed to end.
+  await enforceInboundAccess(shop).catch((err) =>
+    console.error('[inbound] callback reconcile failed for', shop + ':', err.message));
+
+  // Back into the admin, framed, on the app's own page. `host` is the base64
+  // admin origin App Bridge handed the page; it is validated rather than trusted
+  // so a crafted ?host= cannot turn this into an open redirect. The fallback
+  // derives the same URL from the shop domain, which is why this design needs no
+  // hand-typed app handle anywhere.
+  let decoded = null;
+  try {
+    decoded = req.query.host ? Buffer.from(String(req.query.host), 'base64').toString('utf8') : null;
+  } catch { decoded = null; }
+  const base = decoded && /^admin\.shopify\.com\/store\/[a-z0-9-]+$/.test(decoded)
+    ? decoded
+    : `admin.shopify.com/store/${shop.replace('.myshopify.com', '')}`;
+  res.redirect(`https://${base}/apps/${process.env.SHOPIFY_API_KEY || ''}`);
+});
 
 // ── Embedded settings UI ──────────────────────────────────────────────────────
 app.get('/app', async (req, res) => {
@@ -124,34 +237,354 @@ async function requireInstalledShop(req, res) {
 }
 
 // GET current settings (redacted key) + the automation catalog for the UI.
+//
+// The entitlement rides along because the page cannot render its first frame
+// without it — every gated control keys off it — and a second round-trip would
+// mean the UI briefly draws itself as if the merchant had no plan. getEntitlement
+// never throws and is cached for five minutes, so this costs nothing in the
+// common case.
 app.get('/api/settings', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
   res.json({
     settings: getRedactedSettings(shop),
+    entitlement: entitlementForClient(await getEntitlement(shop)),
     catalog: AUTOMATIONS.map(({ key, label, triggers }) => ({ key, label, triggers })),
   });
 });
 
-// ── Telenow read-through routes ───────────────────────────────────────────────
-// The UI never sees the API key: it calls these, and the server uses the key
-// stored for the shop. A shop with no key yet gets 409 so the UI can prompt.
+// ── Billing API (consumed by the plan screen) ─────────────────────────────────
 
-/** Build a Telenow client for the shop, or write 409 and return null. */
-/** Like telenowFor, but returns null instead of answering 409 — for routes
-  * that still have something useful to render without a key. */
-function telenowForOrNull(shop) {
-  const key = getSettings(shop).telenowApiKey;
+// GET /api/billing — everything the plan screen needs in one call: what the shop
+// is entitled to, how much of the allowance is spent, and what is on offer.
+// `?refresh=1` bypasses the five-minute entitlement cache, which the UI uses on
+// return from Shopify's approval screen so the new plan shows immediately rather
+// than after the cache expires.
+app.get('/api/billing', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+
+  const ent = req.query.refresh === '1'
+    ? await refreshEntitlement(shop)
+    : await getEntitlement(shop);
+
+  // Rolling here as well as inside checkAccess keeps the number the merchant
+  // reads honest: a shop that has not made a request since its period ended
+  // would otherwise be shown last period's total.
+  rollIfNeeded(shop, ent);
+  const included = planByHandle(ent.plan).includedMinutes;
+  const used = usedMinutes(shop);
+  const remaining = Math.max(0, included - used);
+
+  const plans = publicPlans();
+  for (const p of plans) p.current = p.handle === ent.plan;
+
+  // Reconcile the inbound lines while we are here. Not awaited: the plan screen
+  // must not wait on a Telenow round trip, and the reconciliation is a no-op on
+  // every load where nothing changed. This is the enforcement point the merchant
+  // reaches most often — the screen they open the moment minutes run out.
+  enforceInboundAccess(shop).catch((err) =>
+    console.error('[inbound] reconcile failed for', shop + ':', err.message));
+
+  res.json({
+    entitlement: entitlementForClient(ent),
+    usage: {
+      usedMinutes: used,
+      includedMinutes: included,
+      remaining,
+      pctUsed: included > 0 ? Math.min(100, Math.round((used / included) * 100)) : 0,
+    },
+    plans,
+  });
+});
+
+// POST /api/billing/subscribe — start (or change) a paid subscription.
+//
+// Nothing is charged here. Shopify returns a confirmationUrl and the merchant
+// approves the amount on Shopify's own screen; this app never sees a card and
+// never quotes a price outside Shopify's checkout.
+app.post('/api/billing/subscribe', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+
+  const plan = String(req.body?.plan || '').trim();
+  const host = String(req.body?.host || '').trim();
+  // Rejected here as well as inside requestSubscription so a typo answers 400
+  // rather than surfacing as a 500 from the billing layer.
+  if (!Object.prototype.hasOwnProperty.call(PLANS, plan) || plan === 'starter') {
+    res.status(400).json({ error: 'bad_plan', message: 'Choose one of the available plans.' });
+    return;
+  }
+
+  // Re-subscribing to the plan the shop is ALREADY on is refused, and not for
+  // tidiness. Every appSubscriptionCreate moves currentPeriodEnd forward, and a
+  // period boundary is what tells usage.js to zero usedMinutes — so without this
+  // guard "subscribe to Growth" is a button that resets the 300-minute allowance.
+  // replacementBehavior STANDARD prorates a credit for the unused part of the
+  // period the merchant is replacing, so the same-plan round trip costs a
+  // fraction of the fee and hands back a full fresh allowance each time: buy
+  // minutes at a discount, repeatedly, for as long as anyone cares to click.
+  //
+  // A genuine plan CHANGE (growth <-> scale) is untouched — it is the same route
+  // with a different handle, which is how requirement 1.2.3 is satisfied.
+  //
+  // Forced read rather than the five-minute cache: a merchant who cancelled a
+  // minute ago must not be told they still hold the plan they are re-buying.
+  // getEntitlement never throws, so the force cannot turn a cache miss into a 500.
+  const ent = await getEntitlement(shop, { force: true });
+  if (ent.status === 'ACTIVE' && ent.plan === plan) {
+    res.status(400).json({
+      error: 'already_on_plan',
+      plan: ent.plan,
+      message: `You are already on ${ent.planName || 'this plan'}. Pick a different plan to change.`,
+    });
+    return;
+  }
+
+  try {
+    res.json(await requestSubscription(shop, plan, { host }));
+  } catch (err) {
+    console.error('[billing] subscribe failed for', shop + ':', err.message);
+    res.status(502).json({ error: 'subscribe_failed', message: err.message });
+  }
+});
+
+// POST /api/billing/raise-cap — lift the monthly usage ceiling.
+//
+// raiseCap throws with a merchant-safe message for every rejection it makes
+// (non-positive amount, no usage line item on this plan, a new cap at or below
+// what has already been spent), so those become 400s the UI can show verbatim.
+app.post('/api/billing/raise-cap', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+
+  const capUsd = Number(req.body?.capUsd);
+  if (!Number.isFinite(capUsd) || capUsd <= 0) {
+    res.status(400).json({ error: 'bad_request', message: 'Enter a monthly maximum in dollars.' });
+    return;
+  }
+  try {
+    res.json(await raiseCap(shop, capUsd));
+  } catch (err) {
+    res.status(400).json({ error: 'raise_cap_failed', message: err.message });
+  }
+});
+
+// POST /api/billing/cancel — leave the paid plan and fall back to Starter.
+//
+// This route exists for requirement 1.2.3: the merchant must be able to stop
+// paying from inside the app, without emailing anyone. The plan screen's "Move
+// to Starter" button (public/app.html) has always POSTed here; until this route
+// landed it hit the catch-all 404 and the merchant had no in-app way out — in
+// the exact compliance area the app was paused for.
+//
+// NOTE: cancelSubscription()'s own docblock still says "Ops CLI only — the UI
+// never offers this". That is now out of date; it is the source of the drift
+// that left this route unwritten, and billing.js is owned elsewhere so it is
+// corrected there rather than here. The reasoning in it is still sound —
+// downgrading is a proration, not a cliff — which is why the UI frames this as
+// "move to Starter" rather than "cancel", and why nothing else is torn down:
+// agents, automations and call history survive, the shop simply drops to the
+// free allowance.
+//
+// Deliberately NOT gated on checkAccess: a merchant whose subscription is
+// FROZEN for a failed payment is exactly the merchant most likely to want out,
+// and a paywall in front of the exit is not a paywall we can defend.
+app.post('/api/billing/cancel', async (req, res) => {
+  const shop = await requireInstalledShop(req, res);
+  if (!shop) return;
+
+  try {
+    const result = await cancelSubscription(shop);
+    // cancelSubscription refreshes the entitlement itself once it has actually
+    // cancelled something, so that branch reads back the value it just wrote.
+    // The "there was nothing to cancel" branch does not refresh, so force one:
+    // a subscription that lapsed on Shopify's side would otherwise keep telling
+    // this shop it is on a paid plan for the rest of the cache window.
+    const ent = result.cancelled ? await getEntitlement(shop) : await refreshEntitlement(shop);
+    res.json({ cancelled: Boolean(result.cancelled), entitlement: entitlementForClient(ent) });
+  } catch (err) {
+    // err.message here comes from the Admin API, not from a merchant-safe
+    // rejection the way raiseCap's does, so it is logged and not echoed.
+    console.error('[billing] cancel failed for', shop + ':', err.message);
+    res.status(502).json({
+      error: 'cancel_failed',
+      message: 'Could not change the plan. Try again in a moment.',
+    });
+  }
+});
+
+// ── Telenow read-through routes ───────────────────────────────────────────────
+// The merchant never supplies, sees or manages a calling credential: the server
+// leases a workspace for the shop on first use and these routes use it. Every
+// route below therefore has exactly two ways to be turned away — the merchant's
+// plan does not cover what they asked for (402), or the workspace is not leased
+// yet (503, a retry state).
+
+/** Like telenowFor, but returns null instead of answering — for routes that
+  * still have something useful to render without a workspace. */
+async function telenowForOrNull(shop) {
+  const key = await ensureWorkspace(shop);
   return key ? new TelenowClient(key) : null;
 }
 
-function telenowFor(shop, res) {
-  const key = getSettings(shop).telenowApiKey;
+/**
+ * checkAccess, with the one correction `provision` needs.
+ *
+ * checkAccess answers 'provision' from the same branch as 'spend', so a shop
+ * that has used its 25 free minutes is refused `minutes_exhausted` when it tries
+ * to CREATE an agent, write a returns-policy knowledge base or publish a
+ * template. None of those place a call or consume a minute; they are the work a
+ * merchant does in order to spend the NEXT minutes, and refusing them is the
+ * wrong shape of block in both directions. It bricks free configuration screens,
+ * and it lands hardest on a reviewer, who evaluates in the natural order — make
+ * a test call first, configure second — and so meets the paywall on the screens
+ * that never bill.
+ *
+ * So the two ALLOWANCE refusals are downgraded to a pass for 'provision' alone.
+ * Nothing else is forgiven: FROZEN still blocks (a shop whose payment failed
+ * should not be building more automation on credit), and this whitelists the two
+ * codes it waives rather than listing the ones it honours, so any refusal code
+ * added later is refused by default instead of silently let through.
+ *
+ * The one act reached through 'provision' that genuinely commits to future
+ * spend — arming an automation — asks for 'spend' at its own call site rather
+ * than being carved back out of here.
+ *
+ * @param {string} shop
+ * @param {'read'|'spend'|'provision'} need
+ */
+async function gateFor(shop, need) {
+  const gate = await checkAccess(shop, need);
+  if (gate.ok || need !== 'provision') return gate;
+  const code = gate.body?.error;
+  if (code === 'minutes_exhausted' || code === 'usage_cap_reached') {
+    return { ok: true, ent: gate.ent };
+  }
+  return gate;
+}
+
+/**
+ * Build a Telenow client for the shop, or answer and return null.
+ *
+ * Gate 1 of five. The entitlement check comes BEFORE provisioning on purpose:
+ * a shop that has run out of minutes should be told so, not made to wait on a
+ * workspace lease it is not allowed to use.
+ *
+ * @param {string} shop
+ * @param {import('express').Response} res
+ * @param {'read'|'spend'|'provision'} need
+ */
+async function telenowFor(shop, res, need = 'read') {
+  const gate = await gateFor(shop, need);
+  if (!gate.ok) { res.status(402).json(gate.body); return null; }
+
+  const key = await ensureWorkspace(shop);
   if (!key) {
-    res.status(409).json({ error: 'no_api_key', message: 'Connect your Telenow API key first.' });
+    // "No workspace" is not a MERCHANT problem any more — it is a transient
+    // SERVER state, and it says so. This 503 replaces the old 409 "connect your
+    // API key first" response, which told every merchant, and every reviewer
+    // reading a network log, that the app depended on an off-platform signup.
+    // That error code is deliberately gone from the codebase entirely, so a
+    // grep for it is a clean release check rather than a judgement call.
+    res.status(503).json({
+      error: 'provisioning',
+      message: 'Setting up your calling workspace - this takes a few seconds. Reload to retry.',
+    });
     return null;
   }
   return new TelenowClient(key);
+}
+
+// ── Inbound containment ───────────────────────────────────────────────────────
+//
+// Gate 6, and the only one that does not sit in front of a request.
+//
+// Every other gate works because the app is in the path: the merchant asks, we
+// check, we refuse. An INBOUND call has no such moment. A customer dials the
+// number bound to a published agent, Telenow answers, and the first this app
+// hears of it is a call.ended webhook that meters minutes already spent. Left
+// alone that is not a leak at the edges — it is an uncapped one: a Starter shop
+// runs arbitrarily far past its 25 free minutes, and a FROZEN shop keeps taking
+// calls while the plan screen tells the merchant calling is paused. The bill for
+// both lands on us, because Starter is by design never invoiced.
+//
+// Since we cannot refuse the call, we take away the number. `inboundBindings`
+// records what each published agent's line SHOULD be, and enforceInboundAccess
+// reconciles that intent against the entitlement in both directions: unassign
+// when the shop may not spend, re-assign when it may again. It is idempotent and
+// state-compared, so the common case — desired state already matches — costs one
+// cached checkAccess and no Telenow round trip at all, which is what makes it
+// safe to call from a hot path.
+//
+// KNOWN GAP, stated rather than papered over: the enforcement points reachable
+// from THIS file are the plan screen, the billing callback and the six-hourly
+// sweep. The tight one — re-checking immediately after each call is metered —
+// belongs in recordCallUsage (src/webhooks/telenow.js), which is owned
+// elsewhere; until it calls this too, a shop that exhausts its allowance mid-
+// period keeps its inbound line for at most one sweep interval. The per-
+// workspace spend ceiling the operator sets on the pool entry is the backstop
+// under that window, and it is the only containment for it.
+
+/**
+ * Record what a published agent's inbound line is meant to be.
+ *
+ * `parked: true` means "the merchant asked for this number to be live and we are
+ * holding it down for billing reasons" — which is why a parked binding is kept
+ * rather than forgotten. Forgetting it would make the block permanent, and the
+ * merchant would have to republish the agent to get their number back after
+ * paying.
+ */
+function rememberInboundBinding(shop, numberId, agentId, parked) {
+  const bindings = { ...(getSettings(shop).inboundBindings || {}) };
+  bindings[numberId] = { agentId, parked: Boolean(parked), at: new Date().toISOString() };
+  updateSettings(shop, { inboundBindings: bindings });
+}
+
+/**
+ * Bring the shop's inbound lines into line with what it is entitled to.
+ *
+ * Never throws and never blocks a response on a Telenow failure: a number that
+ * could not be parked is logged and retried on the next call, because the
+ * alternative — a 500 on the plan screen — helps nobody and fixes nothing.
+ *
+ * @param {string} shop
+ * @returns {Promise<{changed:number, parked?:boolean}>}
+ */
+async function enforceInboundAccess(shop) {
+  const bindings = getSettings(shop).inboundBindings || {};
+  const ids = Object.keys(bindings);
+  if (!ids.length) return { changed: 0 };
+
+  const gate = await checkAccess(shop, 'spend');
+  const park = !gate.ok;
+  const stale = ids.filter((id) => bindings[id]?.agentId && Boolean(bindings[id].parked) !== park);
+  if (!stale.length) return { changed: 0 };
+
+  // Only now is a workspace needed. Ordering it after the state comparison is
+  // what keeps the no-op path free of a lease attempt.
+  const client = await telenowForOrNull(shop);
+  if (!client) return { changed: 0 };
+
+  const next = { ...bindings };
+  let changed = 0;
+  for (const id of stale) {
+    try {
+      if (park) await client.unassignNumber(id);
+      else await client.assignNumberToAgent(id, next[id].agentId);
+      next[id] = { ...next[id], parked: park, at: new Date().toISOString() };
+      changed += 1;
+    } catch (err) {
+      console.error(`[inbound] ${park ? 'park' : 'restore'} failed for ${shop} number=${id}:`,
+        err.message);
+    }
+  }
+  if (changed) {
+    updateSettings(shop, { inboundBindings: next });
+    console.log(`[inbound] shop=${shop} ${park ? 'parked' : 'restored'} ${changed} number(s)` +
+      (park ? ` (${gate.body?.error})` : ''));
+  }
+  return { changed, parked: park };
 }
 
 /** Map a TelenowError onto a sensible HTTP response. */
@@ -177,7 +610,7 @@ app.get('/api/agents', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
   const saved = getSavedAgents(shop);
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   // Nothing added yet — skip the Telenow round-trip entirely.
   if (!saved.length) {
@@ -204,7 +637,7 @@ app.get('/api/agents', async (req, res) => {
 app.get('/api/agents/available', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   try {
     const { agents, total, truncated } = await client.listAllAgents();
@@ -267,7 +700,7 @@ app.delete('/api/agents/saved/:id', async (req, res) => {
 app.get('/api/agents/:id', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   try {
     // Stats are a nice-to-have: a new agent with no calls can 404 here, and
@@ -294,16 +727,49 @@ app.get('/api/catalog', async (req, res) => {
     res.json(catalogCache.get(shop));
     return;
   }
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   try {
-    const catalog = await client.getCatalog();
+    const catalog = stripRateCard(await client.getCatalog());
     catalogCache.set(shop, catalog);
     res.json(catalog);
   } catch (err) {
     telenowFail(res, err, 'catalog');
   }
 });
+
+/**
+ * Remove the upstream rate card from a provider catalog.
+ *
+ * The catalog Telenow returns carries a per-provider `perMinuteUsd` and a
+ * top-level `platformFee`. Nothing in this app renders them, but they are a
+ * third-party price list, and a price list that reaches the Shopify admin iframe
+ * is an off-platform pricing artifact no matter who reads it — exactly what
+ * requirement 1.2.1 is about. The merchant's price is the plan they approved on
+ * Shopify's own screen, and it is the only one this app knows.
+ *
+ * This is deliberately the SECOND place the strip happens: TelenowClient.getCatalog()
+ * strips at the client boundary so no future caller can leak it, and this strips
+ * again at the response boundary so a change to the client — or a new upstream
+ * field arriving through a code path that bypasses it — cannot quietly put the
+ * rate card back on the wire. Two cheap object walks are worth more than trusting
+ * one of them to stay correct.
+ */
+function stripRateCard(catalog) {
+  if (!catalog || typeof catalog !== 'object') return catalog;
+  const out = { ...catalog };
+  delete out.platformFee;
+  for (const group of ['llm', 'stt', 'tts', 'telephony']) {
+    if (!Array.isArray(out[group])) continue;
+    out[group] = out[group].map((entry) => {
+      if (!entry || typeof entry !== 'object') return entry;
+      const e = { ...entry };
+      delete e.perMinuteUsd;
+      return e;
+    });
+  }
+  return out;
+}
 
 // POST /api/web-call — start a browser call so the merchant can TALK to the
 // agent through their microphone, the way the Telenow dashboard does.
@@ -313,7 +779,7 @@ app.get('/api/catalog', async (req, res) => {
 app.post('/api/web-call', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res, 'spend');
   if (!client) return;
 
   const agentId = String(req.body?.agentId || '').trim();
@@ -382,7 +848,7 @@ async function orgIdFor(shop, client) {
 app.get('/api/calls/:id/recording', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   try {
     const call = await client.getCallDetail(req.params.id);
@@ -504,7 +970,7 @@ async function connectShopifyIntegration(shop, client) {
 app.get('/api/integrations/shopify', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   try {
     const conn = (await client.listConnections('shopify'))
@@ -527,7 +993,7 @@ app.get('/api/integrations/shopify', async (req, res) => {
 app.post('/api/integrations/shopify/connect', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   res.json(await connectShopifyIntegration(shop, client));
 });
@@ -539,7 +1005,7 @@ app.get('/api/templates', async (req, res) => {
   if (!shop) return;
   const installed = getSettings(shop).installedTemplates || {};
   let connection = null;
-  const client = telenowForOrNull(shop);
+  const client = await telenowForOrNull(shop);
   if (client) {
     try {
       connection = (await client.listConnections('shopify'))
@@ -566,7 +1032,7 @@ app.post('/api/templates/:key/setup', async (req, res) => {
     res.status(404).json({ error: 'unknown_template', message: 'No such template.' });
     return;
   }
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res, 'provision');
   if (!client) return;
 
   try {
@@ -610,7 +1076,7 @@ app.post('/api/templates/:key/setup', async (req, res) => {
 app.post('/api/knowledge-bases', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res, 'provision');
   if (!client) return;
   const name = String(req.body?.name || '').trim();
   if (!name) {
@@ -683,7 +1149,7 @@ app.post('/api/ndr-endpoint/rotate', async (req, res) => {
 app.post('/api/voice-preview', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res, 'spend');
   if (!client) return;
 
   const provider = String(req.body?.provider || '').trim();
@@ -757,7 +1223,7 @@ app.get('/api/escalations', async (req, res) => {
   let calls = [];
   let callsError = null;
   const saved = getSavedAgents(shop);
-  const client = telenowForOrNull(shop);
+  const client = await telenowForOrNull(shop);
   if (client && saved.length) {
     try {
       const pages = await Promise.all(saved.slice(0, 10).map((id) =>
@@ -787,7 +1253,7 @@ app.get('/api/escalations', async (req, res) => {
 app.get('/api/integrations', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   try {
     const conns = await client.listConnections();
@@ -811,7 +1277,7 @@ app.get('/api/integrations', async (req, res) => {
 app.post('/api/integrations/connect', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   const providerId = String(req.body?.providerId || '').trim();
   if (!providerId || providerId === 'shopify') {
@@ -846,7 +1312,7 @@ app.post('/api/integrations/connect', async (req, res) => {
 app.get('/api/knowledge-bases', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   try {
     const orgId = await orgIdFor(shop, client);
@@ -872,7 +1338,7 @@ app.post('/api/templates/:key/publish', async (req, res) => {
     res.status(404).json({ error: 'unknown_template', message: 'No such template.' });
     return;
   }
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res, 'provision');
   if (!client) return;
   const b = req.body || {};
 
@@ -951,14 +1417,40 @@ app.post('/api/templates/:key/publish', async (req, res) => {
     // Inbound: bind the number so customers can actually reach the agent. Done
     // after creation because it needs the agent id, and reported separately so
     // a 409 does not throw away an otherwise-good agent.
+    //
+    // This is the ONE spending act in an otherwise free route (see gateFor), and
+    // it is the point where the gate changes shape: publishing costs nothing,
+    // but a bound number is a standing invitation for strangers to dial in and
+    // burn minutes with no request of ours in the path to refuse. So the binding
+    // asks for 'spend' on its own, and a shop that cannot spend gets the agent
+    // it published with the line parked rather than live.
+    //
+    // The intent is recorded either way, in settings.inboundBindings, so
+    // enforceInboundAccess() can put the line back the moment the shop can pay
+    // for it — and take it down again when it cannot.
     let inbound = null;
     if (b.inboundNumberId) {
-      try {
-        await client.assignNumberToAgent(String(b.inboundNumberId), agent.id);
-        inbound = { assigned: true };
-      } catch (err) {
-        inbound = { assigned: false, error: err.message, conflict: err?.status === 409 };
-        console.error(`[publish] number assign failed for ${agent.id}:`, err.message);
+      const numberId = String(b.inboundNumberId);
+      const spend = await checkAccess(shop, 'spend');
+      if (!spend.ok) {
+        rememberInboundBinding(shop, numberId, agent.id, true);
+        inbound = {
+          assigned: false,
+          parked: true,
+          billing: spend.body?.error || 'blocked',
+          error: spend.body?.message
+            || 'Calling is paused on this plan, so the number is not live yet.',
+        };
+        console.log(`[inbound] shop=${shop} publish parked number=${numberId} (${spend.body?.error})`);
+      } else {
+        try {
+          await client.assignNumberToAgent(numberId, agent.id);
+          rememberInboundBinding(shop, numberId, agent.id, false);
+          inbound = { assigned: true };
+        } catch (err) {
+          inbound = { assigned: false, error: err.message, conflict: err?.status === 409 };
+          console.error(`[publish] number assign failed for ${agent.id}:`, err.message);
+        }
       }
     }
 
@@ -1039,22 +1531,74 @@ app.post('/api/templates/:key/publish', async (req, res) => {
   }
 });
 
-// GET /api/numbers — phone numbers this org has bought, for the "call from"
-// picker. An empty list is a normal state, not an error: the merchant simply
-// has not purchased a number yet, and the UI points them at Telenow to buy one.
+// GET /api/numbers — the calling numbers on this shop's leased workspace, for
+// the "call from" and inbound pickers.
+//
+// An empty list is a NORMAL state, not an error, and the UI must keep saying so:
+// the number is still being set up, and the browser call needs no number at all.
+// There is deliberately no "no numbers? go buy one" branch anywhere downstream of
+// this route — sending a merchant off Shopify to a carrier or to telenow.ai to
+// obtain the thing they are already paying for is the off-platform purchase this
+// app was paused for under requirement 1.2.1. Numbers arrive with the plan.
+//
+// PROJECTION, NOT PASS-THROUGH. The six fields below are exactly what the
+// platform's GET /api/v1/numbers returns, and the shape is pinned here so that a
+// field the upstream adds later (a wholesale carrier account id, a rent figure,
+// an internal org id) cannot silently start appearing in a merchant's browser
+// just because it appeared upstream.
+//
+// `provider` and `country` are carried through because the pool is genuinely
+// mixed — Twilio and Plivo, and numbers in whatever countries the operator has
+// stocked — so "which number is this and will it reach my shoppers" is a real
+// question a merchant can only answer if the picker tells them. Both are
+// nullable upstream (`country` maps to a nullable column, and an entry may
+// simply predate the label), so the UI renders them when present and says
+// nothing when absent. Absent means UNKNOWN; it never means India.
 app.get('/api/numbers', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   try {
     const numbers = await client.listNumbers();
-    // Only live numbers can place a call, so do not offer the others.
-    res.json({ numbers: numbers.filter((n) => n && n.is_active !== false) });
+    res.json({
+      numbers: numbers
+        // Only live numbers can place a call, so do not offer the others.
+        .filter((n) => n && n.is_active !== false)
+        .map((n) => ({
+          id: n.id,
+          phone_number: n.phone_number,
+          provider: n.provider || null,
+          country: n.country || null,
+          agent_id: n.agent_id || null,
+          is_active: n.is_active !== false,
+        })),
+    });
   } catch (err) {
     telenowFail(res, err, 'numbers');
   }
 });
+
+/**
+ * The ISO-2 country this shop's unqualified local numbers belong to.
+ *
+ * Ordinary reads come off settings.shopCountry, which provisioning fills in when
+ * the workspace is leased. The Admin API call behind getShopCountry() is only
+ * reached when that cache is cold — a store installed before shopCountry
+ * existed, or one whose lookup failed at install time — and it is awaited rather
+ * than skipped because the alternative is showing a North-American merchant an
+ * Indian example on the single most visible field in the app. It never throws
+ * and it write-through caches, so this is at most one query per shop, ever.
+ *
+ * The PRECEDENCE (explicit → shop country → env → 'US') is not re-implemented
+ * here; resolveCountry() owns it. This function only decides how hard to work
+ * for the shopCountry candidate before handing it over.
+ */
+async function dialCountryFor(shop) {
+  let shopCountry = getSettings(shop).shopCountry || null;
+  if (!shopCountry) shopCountry = await getShopCountry(shop).catch(() => null);
+  return resolveCountry({ shopCountry, envDefault: process.env.DEFAULT_PHONE_COUNTRY });
+}
 
 // POST /api/test-call — ring the merchant's own phone so they can talk to an
 // agent. Telephony rather than a browser web call: this UI runs in an iframe
@@ -1063,21 +1607,40 @@ app.get('/api/numbers', async (req, res) => {
 //
 // This SPENDS the merchant's Telenow balance, so the number is validated here
 // as well as in the UI — never trust the client for something that costs money.
+//
+// THIS IS THE BUTTON A SHOPIFY REVIEWER PRESSES, and it used to be an India-only
+// door in two ways. It demanded a fully-qualified E.164 string, so a reviewer
+// typing their own number the way North Americans write it — (415) 555-0123 —
+// was rejected outright; and the rejection then taught them the format with an
+// Indian example. Both are fixed below: the number is normalised against the
+// SHOP's country first and only then held to the strict E.164 shape, and the
+// hint is built from that same country. The strict check still runs, on the
+// normalised value, because this route spends money.
 app.post('/api/test-call', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res, 'spend');
   if (!client) return;
 
   const agentId = String(req.body?.agentId || '').trim();
-  const mobileNumber = String(req.body?.mobileNumber || '').trim();
   if (!agentId) {
     res.status(400).json({ error: 'bad_request', message: 'agentId is required' });
     return;
   }
+
+  const country = await dialCountryFor(shop);
+  // toE164 passes an already-international number (leading + or 00) straight
+  // through, so a merchant who dials a country other than their own still gets
+  // exactly the number they typed. The shop country only fills in the code that
+  // a bare local number is missing.
+  const typed = String(req.body?.mobileNumber || '').trim();
+  const mobileNumber = toE164(typed, country) || typed;
   // E.164: leading +, no leading zero, 7-15 digits total.
   if (!new RegExp("^[+][1-9][0-9]{6,14}$").test(mobileNumber)) {
-    res.status(400).json({ error: 'bad_number', message: 'Enter a number in E.164 form, e.g. +919876543210.' });
+    res.status(400).json({
+      error: 'bad_number',
+      message: `Enter a number in E.164 form, e.g. ${exampleNumberFor(country)}.`,
+    });
     return;
   }
 
@@ -1126,7 +1689,7 @@ const MERGE_DEPTH_CAP = 400;
 app.get('/api/calls', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
 
   const saved = getSavedAgents(shop);
@@ -1189,7 +1752,7 @@ app.get('/api/calls', async (req, res) => {
 app.get('/api/calls/:id', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
-  const client = telenowFor(shop, res);
+  const client = await telenowFor(shop, res);
   if (!client) return;
   try {
     res.json(await client.getCallDetail(req.params.id));
@@ -1229,81 +1792,93 @@ app.get('/api/leads', async (req, res) => {
   res.json({ leads: listLeads(shop, 100) });
 });
 
-// POST settings update. If the API key changed, (re)subscribe the Telenow hook.
+// POST settings update.
+//
+// Gate 3 of five, and the reason there is more than one gate at all: switching an
+// automation on is an act of SPENDING — it arms a trigger that will place paid
+// calls for months — but it reaches the store through sanitizeSettingsPatch and
+// never constructs a Telenow client, so Gate 1 cannot see it. Without the check
+// below, a shop with no plan and no minutes could arm every automation it liked
+// and only discover the block later, from inside a webhook, where the merchant
+// is not there to be told.
 app.post('/api/settings', async (req, res) => {
   const shop = await requireInstalledShop(req, res);
   if (!shop) return;
 
-  const before = getSettings(shop).telenowApiKey;
   const patch = sanitizeSettingsPatch(req.body);
-  const saved = updateSettings(shop, patch);
 
-  // If a (new) key was provided, validate it and ensure the result webhook hook.
-  let hookStatus = '';
-  if (patch.telenowApiKey && patch.telenowApiKey !== before) {
-    try {
-      const client = new TelenowClient(saved.telenowApiKey);
-      await client.me(); // throws if invalid
-      await ensureTelenowHook(shop);
-      // Same auto-connect as validate-key, for the settings-save path.
-      try {
-        await connectShopifyIntegration(shop, new TelenowClient(saved.telenowApiKey));
-      } catch (e) { /* never block saving the key on this */ }
-      hookStatus = 'Telenow connected and result webhook subscribed.';
-    } catch (err) {
-      hookStatus = `Saved, but Telenow setup failed: ${err.message}`;
+  const enabling = Object.values(patch.automations || {}).some((a) => a && a.enabled);
+  if (enabling) {
+    // 'spend', not 'provision', and that is the whole distinction gateFor()
+    // draws. Creating an agent is free; arming the trigger that will call
+    // customers on that agent for months is a commitment to spend, and a shop
+    // with nothing left to spend must be told at the switch rather than in a
+    // webhook an hour later where nobody is listening. This asks for the strict
+    // answer explicitly so it keeps blocking on an exhausted allowance even
+    // after 'provision' stops doing so.
+    const gate = await checkAccess(shop, 'spend');
+    if (!gate.ok) {
+      res.status(402).json(gate.body);
+      return;
+    }
+    // Counted after the merge, not on the patch alone: the browser sends only
+    // the automation it touched, so counting the patch would let a merchant arm
+    // them one request at a time and never exceed the limit.
+    const after = countEnabledAfterMerge(shop, patch);
+    const max = (PLANS[gate.ent.plan] || PLANS.starter).maxActiveAutomations;
+    if (after > max) {
+      res.status(402).json({
+        error: 'plan_limit',
+        plan: gate.ent.plan,
+        limit: 'maxActiveAutomations',
+        allowed: max,
+        message: `Starter includes ${max} active automation. Choose a plan to run more.`,
+        action: 'choose_plan',
+        suggestPlan: 'growth',
+      });
+      return;
     }
   }
 
-  res.json({ settings: getRedactedSettings(shop), hookStatus });
+  updateSettings(shop, patch);
+  res.json({ settings: getRedactedSettings(shop), hookStatus: '' });
 });
 
-// POST validate-key: optionally save a new key, then call Telenow /me.
-app.post('/api/validate-key', async (req, res) => {
-  const shop = await requireInstalledShop(req, res);
-  if (!shop) return;
-
-  // Allow saving the key as part of validation.
-  if (req.body?.telenowApiKey) {
-    updateSettings(shop, { telenowApiKey: String(req.body.telenowApiKey) });
+/**
+ * How many automations would be enabled once this patch is merged?
+ *
+ * updateSettings deep-merges per automation key, so the answer is the stored
+ * state with the patch's keys overridden — not the patch, and not the stored
+ * state. Keys the patch does not mention keep whatever they had.
+ *
+ * @param {string} shop
+ * @param {{automations?: object}} patch
+ */
+function countEnabledAfterMerge(shop, patch) {
+  const current = getSettings(shop).automations || {};
+  const incoming = patch.automations || {};
+  let n = 0;
+  for (const def of AUTOMATIONS) {
+    const proposed = Object.prototype.hasOwnProperty.call(incoming, def.key)
+      ? incoming[def.key]
+      : current[def.key];
+    if (proposed && proposed.enabled) n += 1;
   }
-  const key = getSettings(shop).telenowApiKey;
-  if (!key) {
-    res.status(400).json({ error: 'no API key set' });
-    return;
-  }
-  try {
-    const client = new TelenowClient(key);
-    const me = await client.me();
-    // The key is good — now connect this Shopify store to their Telenow
-    // workspace using the Admin token we already hold, so the merchant never
-    // has to paste one into Telenow by hand.
-    //
-    // Deliberately non-fatal: a valid key must still save even if the store
-    // connection fails (a viewer-role key cannot write connections, for one).
-    let integration = null;
-    try {
-      integration = await connectShopifyIntegration(shop, client);
-      console.log(`[integration] shop=${shop} connected=${integration.connected}` +
-        (integration.error ? ` error=${integration.error}` : ''));
-    } catch (err) {
-      integration = { connected: false, error: err.message };
-    }
-    res.json({ ...me, integration });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
+  return n;
+}
 
 /**
  * Whitelist + coerce the settings patch coming from the browser so we never
  * persist arbitrary fields. Mirrors the shape settings.js understands.
+ *
+ * `telenowApiKey` is absent from this whitelist on purpose. The calling
+ * workspace is leased by the server and lives in the same field, so accepting it
+ * from the browser would let a merchant point their store at an arbitrary
+ * workspace — and would keep alive the one input that made this app look like it
+ * billed off-platform. There is no path from the page to that field any more.
  */
 function sanitizeSettingsPatch(body = {}) {
   const out = {};
-  if (typeof body.telenowApiKey === 'string' && body.telenowApiKey.trim()) {
-    out.telenowApiKey = body.telenowApiKey.trim();
-  }
   if (body.winBackDays != null) out.winBackDays = Number(body.winBackDays) || 60;
 
   if (body.automations && typeof body.automations === 'object') {
@@ -1364,6 +1939,33 @@ function startSchedulers() {
       await runPostPurchaseSweep();
     } catch (err) {
       console.error('[scheduler] post-purchase sweep error:', err.message);
+    }
+    // Reconciliation backstop for the app_subscriptions/update webhook.
+    //
+    // Webhooks get lost — a deploy mid-delivery, a 500 from a cold start, a
+    // topic that silently failed to register. When the lost one says "this
+    // merchant's card was declined", the app keeps serving a plan nobody is
+    // paying for; when it says "they upgraded", the app keeps blocking a
+    // merchant who has paid, which is the worse of the two. Re-reading every
+    // shop from the Admin API on the sweep makes the webhook an optimisation
+    // rather than a dependency. Each shop is caught on its own so one revoked
+    // token cannot stop the others being reconciled.
+    for (const row of listShops()) {
+      try {
+        await refreshEntitlement(row.shop);
+      } catch (err) {
+        console.error('[scheduler] entitlement refresh failed for', row.shop + ':', err.message);
+      }
+      // Reconciling inbound straight after the entitlement read is what makes
+      // this loop the backstop for the one gate nothing else can reach: a shop
+      // that ran out of minutes on inbound calls alone never touches a route,
+      // so this sweep is the only thing that will take its number down. It is
+      // also the path that restores a number after a webhook we never received.
+      try {
+        await enforceInboundAccess(row.shop);
+      } catch (err) {
+        console.error('[scheduler] inbound reconcile failed for', row.shop + ':', err.message);
+      }
     }
   };
   // Don't run immediately at boot (let the process settle); first run after one

@@ -120,7 +120,7 @@ export const TEMPLATES = [
     description:
       'Calls the customer right after a COD order and confirms they actually want it. '
       + 'Fake and impulse orders cancel themselves before you pay to ship them — the single '
-      + 'highest-return call an Indian store can make.',
+      + 'highest-return call a store taking cash on delivery can make.',
     capabilities: ['order.lookup', 'order.update'],
     opener: 'Hi, this is a quick call from {store_name} about your order.',
     variables: ['customer_name', 'order_number', 'order_total', 'items'],

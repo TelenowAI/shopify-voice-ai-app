@@ -16,6 +16,11 @@
 //   GET    /api/v1/calls/:id           → one call session
 //   GET    /api/v1/numbers             → list phone numbers
 //
+// Below the class there is a SECOND, operator-scoped surface: the partner
+// provisioning stubs (`X-Partner-Key`, not `X-API-Key`), which create and tear
+// down whole workspaces. They throw NotImplemented in v1 — see the block
+// comment there for why they exist and the exact HTTP contract they encode.
+//
 // SECURITY: never log the API key. Errors below include status + response body
 // for debugging but deliberately do not echo the Authorization/X-API-Key header.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -263,16 +268,70 @@ export class TelenowClient {
     return res?.data ?? res;
   }
 
+  /** The catalog sections that carry a per-provider rate card. */
+  static #CATALOG_PRICED_SECTIONS = ['llm', 'stt', 'tts', 'telephony'];
+
   /**
-   * Provider catalog — turns raw ids into human labels. Sections: llm, stt,
-   * tts, telephony (arrays of { id, name, blurb, latency:{ms,tier},
-   * perMinuteUsd, configFields:[{key,label,options:[{label,value}]}] }), plus
-   * platformFee:{perMinUsd,percent}. Stable enough to cache per process.
+   * Provider catalog, RAW — including the third-party rate card. Server-side
+   * callers only.
+   *
+   * This is the input to the margin model: whether a plan's included minutes
+   * are profitable depends on the fully-loaded per-minute cost of carrier +
+   * STT + LLM + TTS, and these are the only figures we have for it. It exists
+   * as a separate method rather than an option flag so that the pricing data
+   * can never reach a browser by someone forgetting to pass `false` — the
+   * public path is a different function with a different name, and a reviewer
+   * (or a grep) can see at a glance which callers touch money.
+   *
+   * NEVER return this payload, or any field of it, from an Express route.
+   * @returns {Promise<object>}
+   */
+  async getCatalogInternal() {
+    const res = await this.#request('GET', '/api/catalog');
+    return res?.data ?? res;
+  }
+
+  /**
+   * Provider catalog for the embedded UI — turns raw ids into human labels.
+   * Sections: llm, stt, tts, telephony (arrays of { id, name, blurb,
+   * latency:{ms,tier}, configFields:[{key,label,options:[{label,value}]}] }).
+   * Stable enough to cache per process.
+   *
+   * PRICING IS DELIBERATELY STRIPPED HERE. The upstream payload carries a
+   * `perMinuteUsd` on every provider plus a `platformFee:{perMinUsd,percent}`
+   * block — a third-party vendor's rate card. Shipping that into the Shopify
+   * admin iframe is a requirement-1.2.1 artifact even though nothing in the UI
+   * renders it: the merchant pays Shopify, and a payload describing what some
+   * other company charges per minute is evidence of an off-platform commercial
+   * relationship sitting one devtools tab away from the reviewer. The whole
+   * point of the billing rework is that this app looks, from inside the admin,
+   * like it has no vendor behind it.
+   *
+   * Server-side cost modelling must read the figures through
+   * getCatalogInternal() instead — see the margin note in the billing spec.
    * @returns {Promise<object>}
    */
   async getCatalog() {
-    const res = await this.#request('GET', '/api/catalog');
-    return res?.data ?? res;
+    const raw = await this.getCatalogInternal();
+    if (!raw || typeof raw !== 'object') return raw;
+
+    // Copy rather than delete in place. The caller holds no other reference
+    // today, but an in-client catalog cache added later would otherwise be
+    // poisoned for getCatalogInternal() by whichever call happened to be first.
+    const out = { ...raw };
+    delete out.platformFee;
+
+    for (const section of TelenowClient.#CATALOG_PRICED_SECTIONS) {
+      const list = out[section];
+      if (!Array.isArray(list)) continue; // section absent or reshaped upstream
+      out[section] = list.map((entry) => {
+        if (!entry || typeof entry !== 'object') return entry;
+        const copy = { ...entry };
+        delete copy.perMinuteUsd;
+        return copy;
+      });
+    }
+    return out;
   }
 
   /**
@@ -559,3 +618,189 @@ export class TelenowClient {
 export function telenow(apiKey, opts) {
   return new TelenowClient(apiKey, opts);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PARTNER PROVISIONING — v1.1 seam. STUBS ONLY; every function below throws.
+//
+// WHY THIS EXISTS AS DEAD CODE. The app may not ask a merchant to create a
+// Telenow account or paste a `vai_live_` key — that is the off-platform signup
+// wall the Shopify review flagged — so the server has to own the workspace
+// lifecycle. Telenow does not expose that API yet, and the class above is
+// deliberately the wrong shape for it: every method there authenticates with
+// ONE merchant's `vai_live_` key, whereas creating a workspace happens before
+// any such key exists. v1 therefore leases pre-minted workspaces from an
+// operator pool (src/provisioning.js). These stubs are the seam that pool
+// sits behind: when the partner API ships, the bodies below are filled in and
+// no caller changes.
+//
+// AUTH FOR ALL FOUR CALLS: header `X-Partner-Key: tnp_live_…`, read from
+// process.env.TELENOW_PARTNER_KEY. This is a NEW credential class, distinct
+// from `vai_live_`, scoped to workspace lifecycle only and never to placing a
+// call — so a leaked merchant key cannot mint workspaces and a leaked partner
+// key cannot dial a phone number. It is an operator secret: it never reaches
+// the browser, never lands in settings, and is never logged.
+//
+// BASE URL: `${TELENOW_API_BASE}` (default https://api.telenow.ai).
+// Every call MUST be safe to retry, MUST NOT return a merchant-visible URL or
+// price, and MUST NOT require any human step on telenow.ai.
+//
+// ── 1) CREATE A WORKSPACE — idempotent on externalId ─────────────────────────
+//   POST /api/v1/partner/workspaces
+//   Content-Type: application/json
+//   X-Partner-Key: tnp_live_…
+//   { "externalId": "acme.myshopify.com",
+//     "name": "Acme Store (Shopify)",
+//     "plan": "growth",
+//     "monthlySpendCapUsd": 220,
+//     "countryHint": "IN",
+//     "metadata": { "platform": "shopify",
+//                   "shopifySubscriptionId": "gid://shopify/AppSubscription/123" } }
+//
+//   201 { "workspaceId": "ws_9f2…", "apiKey": "vai_live_…",
+//         "number": { "id": "num_…", "e164": "+91…", "country": "IN" } }
+//   409 { "error": "already_exists", "workspaceId": "ws_9f2…", "apiKey": "vai_live_…" }
+//   422 { "error": "no_numbers_available", "workspaceId": "ws_9f2…", "apiKey": "vai_live_…" }
+//
+//   `apiKey` MUST be present on the 409 as well. Without it, a retry after a
+//   lost response strands the shop: the workspace exists, so create will never
+//   again return a key, and the merchant has a workspace they cannot reach.
+//   On 422 the workspace is still created and usable for web calls; the number
+//   is claimed later through (3).
+//
+// ── 2) UPDATE PLAN / SPEND CEILING — on every app_subscriptions/update ───────
+//   PATCH /api/v1/partner/workspaces/{workspaceId}
+//   { "plan": "scale", "monthlySpendCapUsd": 550, "status": "active" }   // status: active|suspended
+//   200 { "workspaceId": "ws_9f2…", "plan": "scale", "monthlySpendCapUsd": 550, "status": "active" }
+//
+//   `monthlySpendCapUsd` MUST be enforced server-side by Telenow. It is the
+//   containment for src/webhooks/ndr.js, which places calls from an
+//   unauthenticated public endpoint — a client-side cap there is no cap at all.
+//
+// ── 3) CLAIM AN ADDITIONAL NUMBER (Scale allows 3) ──────────────────────────
+//   POST /api/v1/partner/workspaces/{workspaceId}/numbers
+//   { "country": "IN", "type": "local" }
+//   201 { "id": "num_…", "e164": "+91…", "country": "IN", "type": "local" }
+//   409 { "error": "limit_reached", "limit": 3 }
+//
+// ── 4) RELEASE — on uninstall. Revokes the key, releases numbers, archives ───
+//   DELETE /api/v1/partner/workspaces/{workspaceId}
+//   204 (no body)
+//   404 { "error": "not_found" }        // treat as success — already released
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Thrown by every partner stub in v1. Carries `code` so callers can tell "this
+ * seam is not built yet" apart from "Telenow answered with an error", and fall
+ * through to the key pool only in the former case.
+ */
+export class NotImplementedError extends TelenowError {
+  constructor(what) {
+    super(`NotImplemented: ${what} — the Telenow partner provisioning API is not available yet. ` +
+      'v1 leases workspaces from the operator key pool (see src/provisioning.js).');
+    this.name = 'NotImplementedError';
+    this.code = 'not_implemented';
+  }
+}
+
+/** Internal: assert the operator credential exists before pretending to call. */
+function requirePartnerKey(what) {
+  if (!process.env.TELENOW_PARTNER_KEY) {
+    // Never echo the value, and never hint at its length or prefix.
+    throw new TelenowError(`${what}: TELENOW_PARTNER_KEY is not configured`);
+  }
+}
+
+/**
+ * Create (or re-fetch) the Telenow workspace backing one Shopify store.
+ * Idempotent on `externalId` — see contract (1) above.
+ *
+ * Accepts either `provisionWorkspace(externalId, opts)` or a single options
+ * object carrying `externalId`. Both forms are supported on purpose:
+ * src/provisioning.js calls the object form, while the seam is specified as
+ * (externalId, opts), and a v1.1 implementer must not have to guess which the
+ * live caller uses.
+ *
+ * @param {string|object} externalId  The shop domain, or the whole opts object.
+ * @param {object} [opts]
+ * @param {string} [opts.name]
+ * @param {string} [opts.plan]                'starter'|'growth'|'scale'
+ * @param {number} [opts.monthlySpendCapUsd]  Enforced upstream, not here.
+ * @param {string} [opts.countryHint]
+ * @param {object} [opts.metadata]
+ * @returns {Promise<{ workspaceId: string, apiKey: string,
+ *                     number?: { id: string, e164: string, country: string } }>}
+ * @throws {NotImplementedError} always, in v1.
+ */
+export async function provisionWorkspace(externalId, opts = {}) {
+  const args = (externalId && typeof externalId === 'object') ? externalId : { externalId, ...opts };
+  requirePartnerKey('provisionWorkspace');
+  void args; // v1.1: POST /api/v1/partner/workspaces with `args` as the body.
+  throw new NotImplementedError('provisionWorkspace');
+}
+
+/**
+ * Update a workspace's plan, spend ceiling or status — contract (2) above.
+ * Called on every app_subscriptions/update so the upstream ceiling tracks the
+ * plan the merchant is actually paying Shopify for.
+ *
+ * @param {string} workspaceId
+ * @param {object} patch
+ * @param {string} [patch.plan]
+ * @param {number} [patch.monthlySpendCapUsd]
+ * @param {'active'|'suspended'} [patch.status]
+ * @returns {Promise<{ workspaceId: string, plan: string,
+ *                     monthlySpendCapUsd: number, status: string }>}
+ * @throws {NotImplementedError} always, in v1.
+ */
+export async function updatePartnerWorkspace(workspaceId, patch = {}) {
+  if (!workspaceId) throw new TelenowError('updatePartnerWorkspace: workspaceId is required');
+  requirePartnerKey('updatePartnerWorkspace');
+  void patch; // v1.1: PATCH /api/v1/partner/workspaces/{workspaceId}.
+  throw new NotImplementedError('updatePartnerWorkspace');
+}
+
+/**
+ * Claim an additional caller-ID number for a workspace — contract (3) above.
+ * Scale allows 3; the upstream 409 `limit_reached` is authoritative, so do not
+ * pre-check the plan here.
+ *
+ * @param {string} workspaceId
+ * @param {object} [opts]
+ * @param {string} [opts.country='IN']
+ * @param {'local'|string} [opts.type='local']
+ * @returns {Promise<{ id: string, e164: string, country: string, type: string }>}
+ * @throws {NotImplementedError} always, in v1.
+ */
+export async function claimNumber(workspaceId, opts = {}) {
+  if (!workspaceId) throw new TelenowError('claimNumber: workspaceId is required');
+  requirePartnerKey('claimNumber');
+  void opts; // v1.1: POST /api/v1/partner/workspaces/{workspaceId}/numbers.
+  throw new NotImplementedError('claimNumber');
+}
+
+/**
+ * Tear a workspace down on uninstall — contract (4) above. Revokes the key,
+ * releases the numbers and archives the workspace, so a partner-minted
+ * workspace is destroyed rather than quarantined the way a pooled one is.
+ *
+ * A 404 MUST be treated as success by the implementation: the only reason to
+ * call this twice is a retry, and turning "already gone" into an error would
+ * leave the uninstall path failing forever on a workspace that is already dead.
+ *
+ * @param {string} workspaceId
+ * @returns {Promise<void>}
+ * @throws {NotImplementedError} always, in v1.
+ */
+export async function releasePartnerWorkspace(workspaceId) {
+  if (!workspaceId) throw new TelenowError('releasePartnerWorkspace: workspaceId is required');
+  requirePartnerKey('releasePartnerWorkspace');
+  throw new NotImplementedError('releasePartnerWorkspace');
+}
+
+/**
+ * Alias kept because src/provisioning.js probes for `telenow.releaseWorkspace`
+ * on its uninstall path. The unprefixed name is ambiguous inside this module —
+ * everything else here is merchant-scoped and this one is operator-scoped —
+ * so releasePartnerWorkspace is the name to write in new code.
+ */
+export { releasePartnerWorkspace as releaseWorkspace };

@@ -1,7 +1,7 @@
 {
   "name": "@telenow/shopify-app",
   "version": "1.0.0",
-  "description": "Telenow Voice AI for Shopify: an AI voice agent that automatically calls shoppers for abandoned cart recovery, cash-on-delivery (COD) confirmation and RTO reduction, order confirmation, delivery and shipping updates, failed-delivery (NDR) retry, win-back, instant lead callback, and review/NPS calls — and writes the call outcome back onto the order. Free app; requires a Telenow account billed on usage.",
+  "description": "Telenow Voice AI for Shopify: an AI voice agent that automatically calls shoppers for abandoned cart recovery, cash-on-delivery (COD) confirmation and RTO reduction, order confirmation, delivery and shipping updates, failed-delivery (NDR) retry, win-back, instant lead callback, and review/NPS calls — and writes the call outcome back onto the order. Plans from $0/month, billed through Shopify.",
   "type": "module",
   "license": "MIT",
   "engines": {

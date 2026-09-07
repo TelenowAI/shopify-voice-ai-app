@@ -22,6 +22,8 @@ import { DeliveryMethod, InvalidWebhookError } from '@shopify/shopify-api';
 
 import { shopify, HOST } from '../shopify.js';
 import { deleteShop, collectCustomerData, redactCustomer } from '../store.js';
+import { refreshEntitlement } from '../billing.js';
+import { releaseWorkspace } from '../provisioning.js';
 import { removeTelenowHook } from './telenow.js';
 
 import { handleAbandonedCheckout } from '../automations/abandonedCheckout.js';
@@ -44,6 +46,9 @@ export const WEBHOOK_TOPICS = [
   'ORDERS_FULFILLED',
   'CUSTOMERS_CREATE',
   'APP_UNINSTALLED',
+  // Billing lifecycle: fires whenever a subscription is approved, declined,
+  // frozen for a failed payment, cancelled or expired.
+  'APP_SUBSCRIPTIONS_UPDATE',
   // Mandatory compliance topics (required for public app review):
   'CUSTOMERS_DATA_REQUEST',
   'CUSTOMERS_REDACT',
@@ -107,15 +112,47 @@ shopify.webhooks.addHandlers({
       runHandler('customers/create→lead', () => handleLeadCallback(shop, JSON.parse(body))),
   },
 
+  // ── Billing lifecycle ───────────────────────────────────────────────────────
+  // The payload carries the new subscription state, and we deliberately throw it
+  // away: refreshEntitlement() re-reads the subscription from the Admin API and
+  // writes settings.billing through the same mapping every other billing path
+  // uses. One authoritative code path means the webhook, the /billing/callback
+  // return and the reconciliation sweep can never disagree about what a shop is
+  // entitled to — and a truncated or reordered delivery self-heals instead of
+  // persisting a wrong plan until someone notices.
+  APP_SUBSCRIPTIONS_UPDATE: {
+    deliveryMethod: DeliveryMethod.Http,
+    callbackUrl: CALLBACK_URL,
+    callback: (_topic, shop) =>
+      runHandler('app_subscriptions/update', () => refreshEntitlement(shop)),
+  },
+
   // ── App lifecycle ───────────────────────────────────────────────────────────
   APP_UNINSTALLED: {
     deliveryMethod: DeliveryMethod.Http,
     callbackUrl: CALLBACK_URL,
     callback: (_topic, shop) => {
       console.log(`[webhook] app uninstalled by ${shop} — cleaning up`);
-      // Best-effort: remove our Telenow hook for this shop, then purge local data.
-      runHandler('app/uninstalled→telenow-cleanup', () => removeTelenowHook(shop));
-      deleteShop(shop);
+      // ORDERING IS LOAD-BEARING, and this used to be a race.
+      //
+      // deleteShop() wipes db.settings[shop], and the two steps before it both
+      // read from there: removeTelenowHook() needs settings.telenowApiKey to
+      // authenticate the upstream delete, and releaseWorkspace() needs
+      // settings.telenowWorkspaceRef to know which pool entry to reclaim. Firing
+      // them through separate fire-and-forget runHandler() calls and then
+      // deleting synchronously meant deleteShop usually won the race, so the
+      // hook leaked upstream and — once workspaces come from a finite pool — the
+      // entry was stranded as leased forever, with no ref left anywhere to
+      // reclaim it by. One awaited chain instead, and only then the purge.
+      //
+      // removeTelenowHook's failure is swallowed rather than allowed to abort
+      // the chain: a stale upstream hook is untidy, but skipping the release and
+      // the data purge because of it is worse on both counts.
+      runHandler('app/uninstalled', async () => {
+        await removeTelenowHook(shop).catch(() => {});
+        await releaseWorkspace(shop);
+        deleteShop(shop);
+      });
     },
   },
 
@@ -165,8 +202,20 @@ shopify.webhooks.addHandlers({
       // Fired 48h after a shop uninstalls: erase ALL data for the shop. deleteShop
       // purges shops/settings/hooks/callMap/attempts; we also drop the Telenow hook.
       console.log(`[gdpr] shop/redact shop=${shop} — purging all shop data`);
-      runHandler('shop/redact→telenow-cleanup', () => removeTelenowHook(shop));
-      deleteShop(shop);
+      // Same awaited chain, same reason, as APP_UNINSTALLED above: every step
+      // before deleteShop() reads the settings row deleteShop() destroys.
+      //
+      // releaseWorkspace() is a backstop here, not a duplicate. Normally the
+      // uninstall 48 hours earlier already quarantined the entry and this is a
+      // no-op, but shop/redact is the one delivery Shopify guarantees for a
+      // departing shop — if the uninstall webhook was never delivered or failed
+      // outright, this is the last moment a leased pool entry can still be
+      // reclaimed by ref before the settings row is gone.
+      runHandler('shop/redact', async () => {
+        await removeTelenowHook(shop).catch(() => {});
+        await releaseWorkspace(shop);
+        deleteShop(shop);
+      });
       // TODO(production): also request Telenow delete this shop's call data.
     },
   },

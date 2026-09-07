@@ -576,15 +576,15 @@
     <div class="step">
       <div class="step-n">1</div>
       <div>
-        <h2>Connect your Telenow account</h2>
-        <div class="hint">Paste your <code>vai_live_…</code> API key from Telenow → Developers → API Keys.</div>
+        <h2>Pick a template</h2>
+        <div class="hint">COD confirmation, abandoned checkout, delivery updates — each one publishes a working voice agent in three steps.</div>
       </div>
     </div>
     <div class="step">
       <div class="step-n">2</div>
       <div>
-        <h2>Pick a voice agent</h2>
-        <div class="hint">Connect your key, then fetch your Telenow agents and add the ones this store should use.</div>
+        <h2>Try it on your own phone</h2>
+        <div class="hint">Talk to the agent in your browser, or have it ring your phone. Both are included in your plan.</div>
       </div>
     </div>
     <div class="step">
@@ -596,8 +596,8 @@
     </div>
 
     <div class="modal-actions">
-      <button class="btn secondary" id="welcomeSkip">Skip for now</button>
-      <button class="btn" id="welcomeStart">Connect Telenow</button>
+      <button class="btn secondary" id="welcomeSkip">Look around first</button>
+      <button class="btn" id="welcomeStart">Browse templates</button>
     </div>
   </div>
 </div>
@@ -680,6 +680,18 @@
       </svg>
       <span>Settings</span>
     </button>
+    <!-- Plans sits in ACCOUNT rather than under RUN because choosing one is an
+         account decision, not a calling task — and because every paywall in the
+         app routes here, it must be reachable from any view, not only Settings. -->
+    <button class="nav-item" data-view="plans">
+      <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+        <rect x="2.8" y="5.2" width="18.4" height="13.6" rx="2.4" />
+        <path d="M2.8 9.9h18.4" />
+        <path d="M6.4 14.5h3.4" />
+      </svg>
+      <span>Plans</span>
+    </button>
     <button class="nav-item" data-view="store">
       <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
@@ -701,7 +713,7 @@
           <path d="M15 10.2h2.6a1.8 1.8 0 0 1 1.8 1.8v8.6" />
           <path d="M8.7 7.8h2.6M8.7 11.4h2.6M8.7 15h2.6" />
         </svg>
-        Organization <b id="orgName">—</b>
+        Plan <b id="orgName">—</b>
       </div>
       <div class="org-chip" id="shopChip" hidden>
         <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
@@ -878,6 +890,24 @@
       Progress.done();
     }
     if (!r.ok) {
+      // A 402 is the entitlement gate refusing ONE spend. It carries the whole
+      // decision — the machine `error` code, a merchant-facing `message`, and
+      // the `action` the merchant can take — so parking it in S.block makes
+      // EVERY existing call site paywall-aware without touching any of them:
+      // the next render() draws the block from state rather than from whatever
+      // local error string the caller happened to write.
+      //
+      // It must NOT be merged into S.entitlement. The server's answer here says
+      // "this action costs more than you have left", never "this shop lost its
+      // plan" — and the 402 body carries no `status`, so any derived flag built
+      // from it would be a guess. An earlier version merged it with a hard
+      // active:false; dismissing the dialog left that false behind and the whole
+      // app read as un-entitled until a reload. Entitlement comes from
+      // /api/settings and /api/billing, and from nowhere else.
+      if (r.status === 402) {
+        S.block = { ...data };
+        render();
+      }
       // The server's catch-all 404 ({error:'not found', path}) means the route
       // is missing from the RUNNING build — /app re-reads app.html from disk on
       // every request, so a new UI can be served by an older server process.
@@ -1012,6 +1042,21 @@
   // on that distinction to show a spinner rather than an empty state.
   const S = {
     settings: null,
+    // The redacted entitlement from GET /api/settings, later refreshed by
+    // GET /api/billing. `null` means "not loaded". ONLY those two reads may
+    // write it — see the note on `block` for why a 402 must not.
+    entitlement: null,
+    // The last 402 the server returned: { error, message, plan, action }.
+    // Deliberately a SEPARATE slot from `entitlement`. A 402 is a refusal of one
+    // specific spend ("this call would exceed your cap"), not a statement about
+    // what the shop is entitled to; folding it into the entitlement made a
+    // single refused action look like a downgrade for the rest of the session.
+    block: null,
+    // { usedMinutes, includedMinutes, remaining, pctUsed } — the server owns the
+    // count, so it is never derived in the browser.
+    usage: null,
+    plans: null,
+    planErr: '',
     agent: null,
     agentStats: null,
     agentId: null,
@@ -1057,7 +1102,42 @@
   const contentEl = $('#content');
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const connected = () => Boolean(S.settings && S.settings.telenowApiKeySet);
+  // ── Entitlement ─────────────────────────────────────────────────────────────
+  // entitled() is TRUE on the free Starter plan. Starter is a real plan with a
+  // real allowance, so the app is fully usable before any money question exists;
+  // the only state that turns this false is a subscription Shopify has frozen.
+  //
+  // READING IS NOT SPENDING. The server draws that line itself — checkAccess()
+  // only ever refuses need !== 'read', and FROZEN is deliberately soft there so
+  // a merchant whose card was declined keeps their agents, call history and
+  // templates while they fix it. So nothing that merely displays what the shop
+  // already has may consult this flag: gating a read on it locks a paying
+  // merchant out of their own records over a payment problem, and every one of
+  // those routes would have answered 200. Use it only to colour spend-shaped
+  // affordances, and even then it is a convenience for drawing the UI, never
+  // the authority — every spend is re-checked server-side and comes back as a
+  // 402 that S.block renders.
+  const entitled = () => Boolean(S.entitlement && S.entitlement.active);
+  const planName = () => (S.entitlement && S.entitlement.planName) || 'Starter';
+  // Whether the calling workspace has finished provisioning. Separate from
+  // entitlement on purpose: a shop can be fully paid up while the lease is still
+  // seconds away, and that is a transient server state, not a merchant problem.
+  const ready = () => Boolean(S.settings && S.settings.callingReady);
+  /**
+   * Is this failure the billing gate or a workspace still provisioning?
+   *
+   * Both are already shown to the merchant — the 402 through the paywall the
+   * api() interceptor raised, the 503 as a transient setup state — so a loader
+   * that hits one must not ALSO write a raw error banner over the page. This
+   * replaces the old "merchant has not pasted a key" error-code test, which the
+   * server no longer emits at all.
+   */
+  const isGated = (err) => err.status === 402 || err.status === 503;
+  const usedMin = () => Number(S.usage?.usedMinutes ?? 0);
+  const includedMin = () => Number(
+    S.usage?.includedMinutes
+      ?? (S.plans || []).find((p) => p.current)?.includedMinutes
+      ?? 0);
 
   function fmtDate(v) {
     if (!v) return '—';
@@ -1068,6 +1148,161 @@
     if (sec == null) return '—';
     const s = Math.max(0, Math.round(Number(sec) || 0));
     return Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's';
+  }
+  /**
+   * An illustrative amount in the shop's OWN currency, for sample copy.
+   *
+   * Sample text that quotes a currency the store does not trade in reads as an
+   * app built for somebody else's market — which is exactly how "Rs 5000" read
+   * to every merchant outside India. Intl decides both the symbol and where it
+   * sits ("$50" against "50 €"), so no symbol table is carried here and no
+   * currency is privileged. The locale is left to the browser on purpose: this
+   * is rendered for one merchant looking at their own admin, not spoken to a
+   * shopper the way formatMoney() in the automations is, so their own grouping
+   * conventions are the right ones.
+   *
+   * S.profile is fetched at boot and is null when GET /api/shop failed. USD is
+   * the fallback rather than anything regional — it is what Shopify App Review
+   * reads in, and a placeholder is never submitted, so a wrong guess costs
+   * nothing but a wrong-looking example costs the review.
+   */
+  function sampleMoney(amount) {
+    const code = String(S.profile?.currency ?? '').trim().toUpperCase();
+    try {
+      return new Intl.NumberFormat(undefined, {
+        style: 'currency',
+        currency: /^[A-Z]{3}$/.test(code) ? code : 'USD',
+        maximumFractionDigits: 0,
+      }).format(amount);
+    } catch {
+      // Intl rejects a well-formed code it does not know. The example still has
+      // to say a number, so fall back to the plain digits.
+      return String(amount);
+    }
+  }
+
+  // ── Phone numbers ───────────────────────────────────────────────────────────
+  // GET /api/numbers is a pass-through of the platform row, so `provider` is a
+  // raw carrier id ("plivo", "twilio") and `country` is whatever that carrier
+  // reported — Twilio hands back ISO-2, Plivo hands back the full country name.
+  // Both are merchant-visible, so both are normalised in one place here rather
+  // than at the six call sites that render a number. The labels are the
+  // platform's own; nothing new is invented, and an id we have no label for
+  // falls back to its own capitalised form rather than disappearing.
+  const PROVIDER_LABELS = {
+    plivo: 'Plivo',
+    twilio: 'Twilio',
+    exotel: 'Exotel',
+    vonage: 'Vonage',
+    vobiz: 'Vobiz',
+    smartflo: 'Tata Tele Smartflo',
+    sip: 'SIP trunk',
+    web: 'Browser',
+  };
+  const providerLabel = (raw) => {
+    const id = String(raw ?? '').trim().toLowerCase();
+    if (!id) return '';
+    return PROVIDER_LABELS[id] || (id.charAt(0).toUpperCase() + id.slice(1));
+  };
+  // ISO-2 is shown as-is in upper case; a full country name is passed through
+  // untouched, because re-deriving an ISO code from a carrier's free text would
+  // be a guess, and a wrong country on a caller ID is worse than a long one.
+  const countryLabel = (raw) => {
+    const v = String(raw ?? '').trim();
+    if (!v) return '';
+    return /^[A-Za-z]{2}$/.test(v) ? v.toUpperCase() : v;
+  };
+  /** "Plivo · US", "Twilio", or '' when the row carries neither. */
+  const numberMeta = (n) =>
+    [providerLabel(n && n.provider), countryLabel(n && n.country)].filter(Boolean).join(' · ');
+  /** "+15551234567 (Twilio · US)" — the one shape every picker and row uses. */
+  function numberLabel(n) {
+    if (!n) return '';
+    const meta = numberMeta(n);
+    return meta ? `${n.phone_number} (${meta})` : String(n.phone_number || '');
+  }
+
+  // The example number in the "To" field, in the six transfer-number fields and
+  // in every E.164 refusal. A reviewer in North America typing against a "+91…"
+  // hint reads the app as India-only, so the example follows the shop's own
+  // country. settings.shopCountry is resolved server-side from Shopify and may
+  // be absent on an older settings row; US is the fallback because that is where
+  // Shopify App Review dials from, and because it matches what resolveCountry()
+  // falls back to on the server.
+  //
+  // THIS TABLE IS A VERBATIM MIRROR OF EXAMPLE_NUMBERS IN src/util/phone.js AND
+  // MUST STAY ONE. The server builds its own 400 hint from that table
+  // (exampleNumberFor(), quoted by POST /api/test-call), so the moment the two
+  // drift the placeholder in the field and the error under the button name two
+  // different numbers for the same country, which reads as a broken app. There
+  // is deliberately no second opinion here: this file holds no country logic of
+  // its own, only a copy of the server's, and phone.js is the source of truth.
+  //
+  // The values are not decorative either. Where a regulator reserves a range for
+  // fiction we use it (US/CA 555-01xx, GB 07700 900xxx, AU 0491 570 xxx, DE
+  // 30 23125 xxx, FR 06 39 98 xx xx) so a merchant who submits the placeholder
+  // instead of their own number cannot ring a stranger. The previous table here
+  // had none of that discipline — its US/CA example used NPA 555, which is not
+  // an assignable North-American area code at all, so it passed both validators
+  // and then simply never connected.
+  const EXAMPLE_E164 = {
+    US: '+14155550123', CA: '+16045550123', MX: '+525500000000', BR: '+5511900000000',
+    AR: '+5491100000000', CL: '+56900000000', CO: '+573000000000', GB: '+447700900123',
+    IE: '+353850000000', FR: '+33639980123', DE: '+493023125100', ES: '+34600000000',
+    PT: '+351900000000', IT: '+393000000000', NL: '+31600000000', BE: '+32470000000',
+    CH: '+41760000000', AT: '+436600000000', DK: '+4520000000', SE: '+46700000000',
+    NO: '+4740000000', FI: '+358400000000', PL: '+48500000000', RO: '+40700000000',
+    GR: '+306900000000', TR: '+905000000000', AE: '+971500000000', SA: '+966500000000',
+    QA: '+97430000000', KW: '+96550000000', IL: '+972500000000', IN: '+919876543210',
+    PK: '+923000000000', BD: '+8801700000000', LK: '+94700000000', SG: '+6580000000',
+    MY: '+60120000000', ID: '+6281000000000', TH: '+66800000000', VN: '+84900000000',
+    PH: '+639000000000', CN: '+8613000000000', HK: '+85250000000', JP: '+818000000000',
+    KR: '+821000000000', AU: '+61491570156', NZ: '+64210000000', ZA: '+27600000000',
+    NG: '+2348000000000', KE: '+254700000000', EG: '+201000000000', MA: '+212600000000',
+  };
+  const exampleNumber = () =>
+    EXAMPLE_E164[String(S.settings?.shopCountry ?? '').trim().toUpperCase()] || EXAMPLE_E164.US;
+
+  /**
+   * Tidy the punctuation out of a number the merchant already wrote in
+   * INTERNATIONAL form, and leave anything else exactly as typed.
+   *
+   * This exists for the wizard's transfer number, and only for it. The test-call
+   * number is normalised on the server by toE164() against the shop's country;
+   * the transfer number is not normalised anywhere — POST /api/templates/publish
+   * hands transferDestinations straight through, and templates.js only checks
+   * that a number is non-empty before writing it into the agent's transfer tool.
+   * So this field's own check is the last one there is, and it has to stay.
+   *
+   * What it can safely fix without a country is the formatting a human puts
+   * around a number that already carries its country code: "+1 (415) 555-0123"
+   * and "00 1 415 555 0123" are unambiguous, and refusing them taught the
+   * merchant nothing except that the field is fussy. What it deliberately does
+   * NOT do is guess a country for a bare national number — that needs the
+   * dial-code table in phone.js, and a second copy of that table in the browser
+   * is exactly the drift this file is trying to stop having. A bare number falls
+   * through unchanged and is refused with an example from the merchant's own
+   * country, which shows the leading "+" they need to add.
+   *
+   * Only true formatting characters are stripped. Letters are not, so a trailing
+   * "ext 4" fails the match and is refused rather than being silently glued onto
+   * the subscriber number.
+   *
+   * The one notation that has to be understood rather than merely stripped is a
+   * PARENTHESISED TRUNK ZERO \u2014 "+44 (0)20 7946 0958", which is how most of
+   * Europe writes a number for both audiences at once. E.123 defines those
+   * brackets as "dial this digit nationally, omit it internationally", so the
+   * zero is removed rather than kept. Deleting the brackets and nothing else
+   * would yield +4402079460958: still 13 digits, still passes the E.164 shape
+   * test below it, and dials nowhere. That is the failure this whole field is
+   * meant to prevent, so it is handled here instead of being inherited. Only a
+   * bracketed lone zero is touched; "(415)" is an area code and is left alone.
+   */
+  function tidyInternational(raw) {
+    const s = String(raw ?? '').trim();
+    const m = /^(?:\+|00)([-\d\s().\/\u2010-\u2015]+)$/.exec(s);
+    if (!m) return s;
+    return '+' + m[1].replace(/\(\s*0\s*\)/g, '').replace(/[-\s().\/\u2010-\u2015]/g, '');
   }
 
   // ── Theme ───────────────────────────────────────────────────────────────────
@@ -1088,13 +1323,42 @@
   });
 
   // ── Views ───────────────────────────────────────────────────────────────────
-  function notConnected(what) {
-    return `<div class="card empty">
-      <div class="big">🔌</div>
-      <h2>Connect Telenow to see ${esc(what)}</h2>
-      <p class="hint">Add your <code>vai_live_…</code> API key in Settings and this page fills in automatically.</p>
-      <p><button class="btn" data-go="settings">Go to Settings</button></p>
-    </div>`;
+  /**
+   * The block that has to reach the merchant wherever they are.
+   *
+   * This dialog is the app's ONLY paywall surface, and it is raised by an action
+   * the merchant just took. There is deliberately no full-page "needs a plan"
+   * screen: every page in the nav shows something the shop already owns, and a
+   * lock icon over a page the server would happily serve is the single loudest
+   * way to look like an app that demands payment to be used at all.
+   *
+   * Drawn into #confirmHost, which render() repaints on every pass regardless of
+   * S.view, so a 402 raised three steps into a wizard is visible without tearing
+   * the wizard down and losing what they typed. When the 402 supplied a message,
+   * that message is used verbatim: the server already decided what the merchant
+   * should be told and which of choose_plan / raise_cap / fix_payment to offer,
+   * so the UI never infers it.
+   */
+  function blockedDialog() {
+    const e = S.block;
+    if (!e || !e.error) return '';
+    const action = e.action || 'choose_plan';
+    const ok = action === 'raise_cap'
+      ? { label: 'Raise monthly maximum', view: 'settings' }
+      : action === 'fix_payment'
+        ? { label: 'Open Plans', view: 'plans' }
+        : { label: 'See plans', view: 'plans' };
+    return `
+      <div class="overlay" id="blockedOverlay">
+        <div class="modal" style="max-width:460px;" role="dialog" aria-modal="true">
+          <h1 style="margin:0 0 8px;">${esc(action === 'fix_payment' ? 'Subscription on hold' : 'Plan limit reached')}</h1>
+          <p class="hint" style="margin:0;">${esc(e.message || 'Your plan does not include this.')}</p>
+          <div class="modal-actions">
+            <button class="btn secondary" id="blockedClose">Not now</button>
+            <button class="btn" id="blockedGo" data-blocked-go="${ok.view}">${esc(ok.label)}</button>
+          </div>
+        </div>
+      </div>`;
   }
 
   function viewHome() {
@@ -1105,9 +1369,10 @@
       <h1>Home</h1>
       <p class="page-sub">Your Telenow voice AI, wired into ${esc(p?.name || shop)}.</p>
 
-      ${connected() ? '' : `<div class="banner warn">
-        <span>⚠</span><div><b>Telenow not connected.</b> Add your API key in Settings to place calls.</div>
-      </div>`}
+      ${S.entitlement?.status === 'FROZEN' ? `<div class="banner warn">
+        <span>⚠</span><div><b>Your subscription is on hold.</b> Update your payment method in Shopify
+        to resume calls — your agents and history are untouched.</div>
+      </div>` : ''}
 
       <div class="grid grid-3" style="margin-bottom:18px;">
         <div class="card stat"><span class="n">${esc(num(S.agents))}</span><span class="l">Agents added</span></div>
@@ -1127,22 +1392,23 @@
             </div>` : '<p class="hint">Store details unavailable.</p>'}
         </div>
         <div class="card">
-          <h2>Telenow</h2>
-          <p class="hint">Voice calling account.</p>
+          <h2>Plan</h2>
+          <p class="hint">Billed through Shopify.</p>
           <div class="kv">
-            <div><div class="k">Status</div>
-              ${connected() ? '<span class="pill ok"><span class="dot"></span>Connected</span>'
-                            : '<span class="pill err"><span class="dot"></span>Not connected</span>'}</div>
-            <div><div class="k">API key</div>${esc(S.settings?.telenowApiKey || '—')}</div>
+            <div><div class="k">Plan</div>${esc(planName())}</div>
+            <div><div class="k">Minutes</div>${esc(String(usedMin()))} of ${esc(String(includedMin()))} this period</div>
+            <div><div class="k">Calling</div>
+              ${ready() ? '<span class="pill ok"><span class="dot"></span>Ready</span>'
+                        : '<span class="pill"><span class="dot"></span>Setting up</span>'}</div>
           </div>
         </div>
         <div class="card">
           <h2>Next step</h2>
-          <p class="hint">${connected()
+          <p class="hint">${(S.agents || []).length
             ? 'Browse your voice agents and review recent calls.'
-            : 'Connect your Telenow API key to get started.'}</p>
-          <p><button class="btn" data-go="${connected() ? 'agents' : 'settings'}">
-            ${connected() ? 'Open Agents' : 'Connect Telenow'}</button></p>
+            : 'Publish your first agent from a template.'}</p>
+          <p><button class="btn" data-go="${(S.agents || []).length ? 'agents' : 'templates'}">
+            ${(S.agents || []).length ? 'Open Agents' : 'Browse templates'}</button></p>
         </div>
       </div>`;
   }
@@ -1174,10 +1440,12 @@
   }
 
   function viewAgents() {
-    if (!connected()) return notConnected('your agents');
+    // No entitlement gate: listing the agents already attached to this store is
+    // a read, and GET /api/agents answers it on every plan including a frozen
+    // one. See the note above entitled().
     if (S.agents === null) return skPage(skCards(6)) + agentPicker();
 
-    // The fetch action lives top-right on every state, so it is in the same
+    // The add action lives top-right on every state, so it is in the same
     // place whether the list is empty or full.
     const header = `
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
@@ -1186,43 +1454,47 @@
           <p class="page-sub" style="margin:4px 0 0;">
             ${S.agents.length
               ? esc(String(S.agents.length)) + ' agent' + (S.agents.length === 1 ? '' : 's') + ' added to this store.'
-              : 'Add the Telenow agents you want to use with this store.'}
+              : 'Choose the voice agents this store should use.'}
           </p>
         </div>
         <button class="btn" id="fetchAgentsBtn" style="flex:0 0 auto;">
-          <span style="margin-right:6px;">⟳</span>Fetch agents from Telenow
+          <span style="margin-right:6px;">+</span>Add agents
         </button>
       </div>`;
 
+    // The toolbar sits OUTSIDE the empty/non-empty branch deliberately. It used
+    // to render only alongside a populated grid, so a list that came back empty
+    // — including one emptied by a failed load — carried no Refresh at all and
+    // the only way to retry was reloading the whole page.
+    const toolbar = `
+      <div class="toolbar" style="margin-top:16px;">
+        ${S.agents.length ? '<input id="agentSearch" placeholder="Search name or description…" />' : ''}
+        <button class="btn secondary" data-refresh="agents">Refresh</button>
+      </div>`;
+
     if (!S.agents.length) {
-      return `${header}
-        <div class="card empty" style="margin-top:18px;">
+      return `${header}${toolbar}
+        <div class="card empty" style="margin-top:14px;">
           <div class="big">${bigIcon('agents')}</div>
           <h2>No agents added yet</h2>
-          <p class="hint">Pull in the voice agents from your Telenow organization,<br/>then pick the ones this store should use.</p>
-          <p><button class="btn" id="fetchAgentsEmpty">Fetch agents from Telenow</button></p>
+          <p class="hint">Publish a ready-made agent from Templates,<br/>or add one this store already has.</p>
+          <p><button class="btn" data-go="templates">Browse templates</button>
+            <button class="btn secondary" id="fetchAgentsEmpty" style="margin-left:8px;">Add agents</button></p>
         </div>
         ${agentPicker()}`;
     }
 
-    return `${header}
-      <div class="toolbar" style="margin-top:16px;">
-        <input id="agentSearch" placeholder="Search name or description…" />
-        <button class="btn secondary" data-refresh="agents">Refresh</button>
-      </div>
+    return `${header}${toolbar}
       ${(S.missingAgents || []).length ? `<div class="banner warn" style="margin-bottom:14px;"><span>⚠</span>
-        <div>${esc(String(S.missingAgents.length))} added agent(s) no longer exist in Telenow.
+        <div>${esc(String(S.missingAgents.length))} added agent(s) no longer exist and can no longer be called.
         <button class="btn secondary" id="clearMissing" style="margin-left:8px;">Remove them</button></div></div>` : ''}
       <div class="grid grid-3" id="agentGrid">${S.agents.map(agentCard).join('')}</div>
       ${agentPicker()}`;
   }
 
   /**
-   * The "Fetch agents from Telenow" picker. Rendered inline (hidden) rather than
-   * as a separate view so opening it does not lose the page behind it.
-   */
-  /**
-   * The "Fetch agents from Telenow" picker.
+   * The "Add agents" picker. Rendered inline (hidden) rather than as a separate
+   * view so opening it does not lose the page behind it.
    *
    * Two rules learned the hard way:
    *  - the list is NEVER replaced by an error. An error is a banner ABOVE the
@@ -1237,13 +1509,14 @@
 
     let body;
     if (p.loading) {
-      body = loadingInline('Fetching agents from Telenow…');
+      body = loadingInline('Loading your agents…');
     } else if (!p.agents) {
       body = `<div class="empty"><h2>Could not load agents</h2>
         <p><button class="btn secondary" id="pickerRetry">Try again</button></p></div>`;
     } else if (!p.agents.length) {
-      body = `<div class="empty"><h2>No agents found</h2>
-        <p class="hint">Create an agent in the Telenow dashboard first, then fetch again.</p></div>`;
+      body = `<div class="empty"><h2>No agents yet</h2>
+        <p class="hint">Publish one from Templates — it is ready to call the moment it is created.</p>
+        <p><button class="btn" id="pickerTemplates">Browse templates</button></p></div>`;
     } else {
       const q = (p.query || '').trim().toLowerCase();
       const list = q
@@ -1259,10 +1532,10 @@
 
     return `
       <div class="overlay" id="pickerOverlay">
-        <div class="modal" style="max-width:640px;" role="dialog" aria-modal="true" aria-label="Agents in Telenow">
+        <div class="modal" style="max-width:640px;" role="dialog" aria-modal="true" aria-label="Your voice agents">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
             <div>
-              <h1 style="margin:0;">Agents in Telenow</h1>
+              <h1 style="margin:0;">Your voice agents</h1>
               <p class="hint" style="margin:4px 0 0;">
                 ${p.agents
                   ? esc(String(p.agents.length)) + ' available · ' + esc(String(addedCount)) + ' added'
@@ -1398,7 +1671,8 @@
   }
 
   function viewCalls() {
-    if (!connected()) return notConnected('call history');
+    // No entitlement gate — a merchant's own call history is theirs to read
+    // whatever the state of their subscription. See the note above entitled().
     if (S.calls === null) {
       return skPage(`<div class="toolbar">
           <div class="sk" style="width:150px;height:34px;border-radius:8px;"></div>
@@ -1503,19 +1777,24 @@
     }
     return `
       <h1>Settings</h1>
-      <p class="page-sub">Connect Telenow and tune the scheduled jobs.</p>
+      <p class="page-sub">Your plan, and the scheduled jobs.</p>
       <div class="grid grid-3">
         <div class="card" style="grid-column:1/-1;">
-          <h2>Telenow connection</h2>
-          <p class="hint">Your <code>vai_live_…</code> key from Telenow → Developers → API Keys.
-             Stored per store and never shown again.</p>
-          <div class="row" style="margin-top:12px;">
-            <div style="flex:3 1 320px;"><label>API key</label>
-              <input type="password" id="apiKey" placeholder="${esc(S.settings.telenowApiKey || 'vai_live_…')}" /></div>
-            <div style="flex:0 0 auto;align-self:flex-end;">
-              <button class="btn" id="validateBtn">Validate &amp; save</button></div>
+          <h2>Plan</h2>
+          <p class="hint">Billed through Shopify. Change or cancel any time from here.</p>
+          <div class="kv" style="margin-top:12px;">
+            <div><div class="k">Plan</div>${esc(planName())}</div>
+            <div><div class="k">Status</div>${esc(S.entitlement?.status || '—')}</div>
+            <div><div class="k">Minutes this period</div>${esc(String(usedMin()))} of ${esc(String(includedMin()))}</div>
+            <div><div class="k">Renews</div>${esc(fmtDate(S.entitlement?.currentPeriodEnd))}</div>
           </div>
-          <p id="keyMsg" class="hint" style="margin-top:10px;"></p>
+          <p style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <button class="btn" data-go="plans">Change plan</button>
+            ${S.entitlement?.capUsd
+              ? '<button class="btn secondary" id="raiseCap">Raise monthly maximum</button>'
+              : ''}
+            <span id="capMsg" class="hint"></span>
+          </p>
         </div>
         <div class="card">
           <h2>Win-back threshold</h2>
@@ -1527,6 +1806,159 @@
             <span id="winBackMsg" class="hint"></span></p>
         </div>
       </div>`;
+  }
+
+  /**
+   * Plans.
+   *
+   * Every card is priced and worded from GET /api/billing, which serves the same
+   * src/plans.js objects the Shopify billing config is built from — so the price
+   * shown here cannot drift from the price Shopify charges, which is the whole
+   * point of requirement 4.2.1.
+   *
+   * Starter's card is the odd one out: there is nothing to buy, so its action
+   * cancels the Shopify subscription instead. That is the downgrade path
+   * requirement 1.2.3 wants, and it must be one click from here rather than
+   * something the merchant has to ask for.
+   */
+  function viewPlans() {
+    if (S.plans === null) return skPage(skCards(3));
+
+    const e = S.entitlement || {};
+    const card = (p) => {
+      // The server stamps `current`; the handle comparison is the fallback, so a
+      // merchant is never shown three cards with no indication of what they are
+      // already paying for.
+      const isCurrent = p.current != null ? Boolean(p.current) : p.handle === (e.plan || 'starter');
+      const price = p.priceUsd > 0 ? '$' + p.priceUsd : 'Free';
+      const action = isCurrent
+        ? '<button class="btn secondary" disabled>Current plan</button>'
+        : (p.priceUsd > 0
+          ? `<button class="btn" data-plan="${esc(p.handle)}">Choose ${esc(p.name || p.handle)}</button>`
+          : '<button class="btn secondary" id="cancelPlan">Move to Starter</button>');
+      return `<div class="card" style="display:flex;flex-direction:column;${isCurrent ? 'border-color:var(--accent);' : ''}">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
+          <h2 style="margin:0;">${esc(p.name ?? 'Starter')}</h2>
+          ${isCurrent ? '<span class="pill ok"><span class="dot"></span>Current</span>' : ''}
+        </div>
+        <p style="margin:10px 0 2px;font-size:26px;font-weight:700;letter-spacing:-.02em;">
+          ${esc(price)}<span class="hint" style="font-size:13px;font-weight:400;">${p.priceUsd > 0 ? ' / month' : ''}</span></p>
+        <p class="hint" style="margin:0 0 12px;">Charged by Shopify${p.priceUsd > 0 ? ', on your Shopify invoice' : ' — nothing to pay'}.</p>
+        <!-- The feature lines are the plan's OWN strings from src/plans.js, which
+             also compose the Partner Dashboard listing card. Rewording them here
+             would put the in-app price out of step with the listed price, which
+             is exactly what requirement 4.2.1 checks. -->
+        <div class="kv" style="margin-bottom:12px;">
+          ${(p.features || []).map((f) => `<div>${esc(f)}</div>`).join('')}
+        </div>
+        <p style="margin-top:auto;">${action}</p>
+      </div>`;
+    };
+
+    return `
+      <h1>Plans</h1>
+      <p class="page-sub">Every plan is charged by Shopify on your existing Shopify invoice. Nothing is paid anywhere else.</p>
+
+      ${e.status === 'FROZEN' ? `<div class="banner warn"><span>⚠</span>
+        <div><b>Your subscription is on hold.</b> Update your payment method in Shopify to resume calls.</div></div>` : ''}
+      ${S.planErr ? `<div class="banner err"><span>✕</span><div>${esc(S.planErr)}</div></div>` : ''}
+
+      <div class="grid grid-3">${S.plans.map(card).join('')}</div>
+
+      <div class="card" style="margin-top:18px;">
+        <h2>How the minutes work</h2>
+        <p class="hint" style="margin-bottom:10px;">
+          A minute is a minute of connected call time, rounded up per call. Included minutes reset
+          every billing period. On a paid plan, minutes past the included allowance are charged at the
+          plan's per-minute rate up to the monthly maximum you approve when you subscribe — calls pause
+          at that ceiling rather than running past it. Starter never charges anything: calls simply stop
+          once the free minutes are used.
+        </p>
+        <div class="kv">
+          <div><div class="k">This period</div>${esc(String(usedMin()))} of ${esc(String(includedMin()))} minutes used</div>
+          <div><div class="k">Renews</div>${esc(fmtDate(e.currentPeriodEnd))}</div>
+          ${e.capUsd ? `<div><div class="k">Monthly maximum</div>$${esc(String(e.balanceUsedUsd ?? 0))} of $${esc(String(e.capUsd))} approved</div>` : ''}
+        </div>
+      </div>`;
+  }
+
+  /**
+   * Hand off to Shopify's own subscription approval screen.
+   *
+   * open(url, '_top') is MANDATORY here, and leaveTo() must never be used: it
+   * sets location.href, which navigates only this iframe, and Shopify's approval
+   * page sets frame-ancestors so it refuses to be framed — the merchant would be
+   * left staring at a blank pane inside the admin with no way forward.
+   */
+  async function choosePlan(handle) {
+    S.planErr = '';
+    render();
+    try {
+      const r = await api('/api/billing/subscribe', {
+        method: 'POST',
+        body: JSON.stringify({ plan: handle, host: params.get('host') || '' }),
+      });
+      if (!r.confirmationUrl) throw new Error('Shopify did not return an approval link.');
+      open(r.confirmationUrl, '_top');
+    } catch (err) {
+      S.planErr = 'Could not start the subscription: ' + err.message;
+      render();
+    }
+  }
+
+  /** Raise the merchant-approved monthly ceiling; Shopify re-asks for approval. */
+  async function raiseCap() {
+    const msg = $('#capMsg');
+    const current = Number(S.entitlement?.capUsd || 0);
+    const next = Math.max(current * 2, current + 50);
+    const ok = await askConfirm({
+      title: 'Raise your monthly maximum?',
+      body: `Shopify will ask you to approve a new maximum of $${next} for usage above your included `
+        + 'minutes. You are only ever charged for minutes you actually use.',
+      okLabel: 'Continue in Shopify',
+    });
+    if (!ok) return;
+    if (msg) msg.textContent = 'Opening Shopify…';
+    try {
+      const r = await api('/api/billing/raise-cap', {
+        method: 'POST',
+        body: JSON.stringify({ capUsd: next }),
+      });
+      if (!r.confirmationUrl) throw new Error('Shopify did not return an approval link.');
+      open(r.confirmationUrl, '_top');
+    } catch (err) {
+      if ($('#capMsg')) $('#capMsg').textContent = 'Failed: ' + err.message;
+    }
+  }
+
+  /**
+   * Downgrade to Starter — cancels the Shopify subscription, keeps everything else.
+   *
+   * Requirement 1.2.3 wants the merchant able to leave a paid plan without
+   * contacting anyone, so this button exists unconditionally. If the running
+   * server has no cancel route yet, the catch below says so in merchant language
+   * rather than surfacing api()'s developer-facing stale-route message.
+   */
+  async function moveToStarter() {
+    const ok = await askConfirm({
+      title: 'Move to Starter?',
+      body: 'Your paid subscription is cancelled and the store keeps working on 25 free minutes a '
+        + 'period. Agents, automations and call history are not deleted.',
+      okLabel: 'Move to Starter',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api('/api/billing/cancel', { method: 'POST' });
+      await loadBilling(true);
+      render();
+      toast('Moved to Starter.', 'ok');
+    } catch (err) {
+      S.planErr = err.status === 404
+        ? 'Changing back to Starter is not available in this build yet. Reload and try again in a moment.'
+        : 'Could not change the plan: ' + err.message;
+      render();
+    }
   }
 
   // ── Agent detail ────────────────────────────────────────────────────────────
@@ -1810,13 +2242,27 @@
    * iframe needs the embedder to set allow="microphone", and the Shopify
    * admin owns that iframe. A top-level window always has it.
    */
+  /**
+   * Shown on both test panels when an agent is switched off.
+   *
+   * It names an in-app route out rather than an external console: the merchant
+   * has no login anywhere else, and there is no endpoint here that flips the
+   * flag, so the honest instruction is the one that does work — publish from
+   * Templates, which creates the agent already live. Held in one constant
+   * because the browser-call and telephony panels both render it, and the two
+   * copies drifted apart the last time they were written out separately.
+   */
+  const INACTIVE_BANNER = '<div class="banner warn" style="margin-top:10px;"><span>⚠</span>'
+    + '<div>This agent is switched off, so it will not answer or place calls. Agents you publish'
+    + ' from Templates are live as soon as they are created.</div></div>';
+
   function webCallPanel(a) {
     const w = S.webCall || {};
     return `
       <div class="card" style="margin-bottom:18px;">
         <h2>Talk to ${esc(a.name || "your agent")} live</h2>
         <p class="hint">Speak to the agent through your browser. Opens in a new window so it can use your microphone.</p>
-        ${a.is_active ? '' : '<div class="banner warn"><span>⚠</span><div>This agent is inactive — activate it in Telenow before testing.</div></div>'}
+        ${a.is_active ? '' : INACTIVE_BANNER}
         <div style="margin-top:12px;display:flex;gap:10px;align-items:center;">
           <button class="btn" id="webCallBtn"${a.is_active ? '' : ' disabled'}>
             ${w.status === 'starting' ? 'Starting…' : '&#9742; Start call'}</button>
@@ -1859,8 +2305,9 @@
    * Telephony test — places a REAL outbound call through the agent, or shows
    * the numbers to dial for an inbound test.
    *
-   * Needs a purchased number to call FROM. With none, there is nothing useful to
-   * render, so the panel becomes a link to buy one rather than a broken form.
+   * Needs a number to call FROM. Every plan includes one, so an empty list means
+   * the workspace has not finished provisioning; the panel says so and points at
+   * the browser call rather than rendering a form that cannot work.
    */
   function testPanel(a, vars) {
     const t = S.test || {};
@@ -1874,18 +2321,19 @@
         ${loadingInline('Loading your phone numbers…', true)}</div>`;
     }
 
-    // No number bought yet — send them to Telenow to get one.
+    // A number comes with every plan, so an empty list is the workspace still
+    // being provisioned — a transient server state, not something the merchant
+    // has to go and buy. The panel says how long and offers the browser call,
+    // which needs no number at all, instead of dead-ending.
     if (!nums.length) {
       return `<div class="card">
         <h2>&#9990; Test over telephony</h2>
-        <p class="hint">You need a phone number before the agent can place or receive calls.</p>
         <div class="banner warn" style="margin-top:12px;"><span>⚠</span>
-          <div>No phone number on this Telenow account yet.</div></div>
-        <p style="margin-top:12px;">
-          <a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">
-            Buy a number on Telenow &#8599;</a>
-        </p>
-        <p class="hint" style="margin-top:8px;">Once you have one, reopen this agent and it will appear here.</p>
+          <div>Your calling number is still being set up.</div></div>
+        <p class="hint" style="margin-top:10px;">This usually takes under a minute. Reload this page and it
+          will appear here. Meanwhile you can talk to the agent in your browser — a browser call needs no
+          phone number at all.</p>
+        <p><button class="btn" id="jumpToWebCall">Talk to this agent</button></p>
       </div>`;
     }
 
@@ -1901,22 +2349,24 @@
           <p class="hint" style="margin-bottom:8px;">Dial from your phone to reach this agent.</p>
           ${nums.map((n) => `<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);">
             <div><code style="font-size:13px;">${esc(n.phone_number)}</code>
-              <span class="hint"> · ${esc(n.provider || '—')}${n.country ? ' · ' + esc(n.country) : ''}</span></div>
+              <span class="hint"> · ${esc(numberMeta(n) || '—')}</span></div>
             <span class="pill ${n.agent_id === a.id ? 'ok' : ''}"><span class="dot"></span>
               ${n.agent_id === a.id ? 'This agent' : 'Other agent'}</span>
           </div>`).join('')}
           ${nums.some((n) => n.agent_id === a.id) ? '' : `<div class="banner warn" style="margin-top:12px;"><span>⚠</span>
-            <div>None of your numbers routes to this agent. Assign one in Telenow, or it will answer as a different agent.</div></div>`}
+            <div>Your number currently answers with a different agent, so dialling it reaches that one.
+            Talk to this agent in your browser instead, or pick this number as the inbound number when you
+            publish an agent from Templates.</div></div>`}
         </div>`
       : `<div style="margin-top:14px;">
           <label>Call from</label>
           <select id="testFrom">
             ${nums.map((n) => `<option value="${esc(n.id)}"${t.fromId === n.id ? ' selected' : ''}>
-              ${esc(n.phone_number)} (${esc(n.provider || '—')})</option>`).join('')}
+              ${esc(numberLabel(n))}</option>`).join('')}
           </select>
 
           <label style="margin-top:12px;display:block;">To</label>
-          <input type="tel" id="testNumber" placeholder="+919876543210" value="${esc(t.number || '')}" />
+          <input type="tel" id="testNumber" placeholder="${esc(exampleNumber())}" value="${esc(t.number || '')}" />
           <div class="hint" style="margin-top:4px;">Your own number, with the country code.</div>
 
           <label style="margin-top:12px;display:block;">Answering-machine detection</label>
@@ -1947,7 +2397,7 @@
     return `<div class="card">
       <h2>&#9990; Test over telephony</h2>
       <p class="hint">Select a scenario to test real-time conversations.</p>
-      ${a.is_active ? '' : '<div class="banner warn" style="margin-top:10px;"><span>⚠</span><div>This agent is inactive — activate it in Telenow before testing.</div></div>'}
+      ${a.is_active ? '' : INACTIVE_BANNER}
       <div class="scenarios">
         ${tab('outbound', '&#8599; Outbound Call', 'Make a call from agent')}
         ${tab('inbound', '&#8600; Inbound Call', 'Receive a call for agent')}
@@ -2004,8 +2454,29 @@
     });
 
     const keep = { number, vars, fromId, amd, scenario: 'outbound' };
-    if (!/^\+[1-9]\d{6,14}$/.test(number)) {
-      S.test = { ...keep, status: 'error', message: 'Enter a number in E.164 form, e.g. +919876543210.' };
+    // THE NUMBER IS NOT HELD TO E.164 HERE, AND THAT IS THE POINT.
+    //
+    // This is the button a Shopify reviewer presses, and it used to refuse
+    // anything that was not already a bare "+1…" string. A reviewer typing their
+    // own number the way North Americans write it — (415) 555-0123 — never got
+    // past this line, so the country-aware normalisation the server grew for
+    // exactly that case (toE164 against the shop's own country, in
+    // POST /api/test-call) was unreachable from the only path a reviewer uses.
+    //
+    // So the browser no longer decides what a valid number looks like. It cannot:
+    // the country a bare local number belongs to lives in settings.shopCountry
+    // and in phone.js's dial-code table, and re-deriving either here would be a
+    // second, drifting implementation of the one thing that must not drift. The
+    // server normalises, and if the result still is not E.164 it answers 400
+    // `bad_number` with a hint built from the shop's own country — the same
+    // example this field's placeholder shows.
+    //
+    // What survives locally is only the check that needs no country knowledge:
+    // fewer than 7 digits cannot be an E.164 number in any country, so an empty
+    // or half-typed field is caught without a round trip. Everything else is the
+    // server's call, because the server is the one spending money.
+    if ((number.match(/\d/g) || []).length < 7) {
+      S.test = { ...keep, status: 'error', message: 'Enter a number to call, e.g. ' + exampleNumber() + '.' };
       render();
       return;
     }
@@ -2026,7 +2497,13 @@
       S.test = { ...keep, status: 'placed',
         message: 'Calling ' + number + ' now — answer to talk to the agent.' + (r.sessionId ? ' Session ' + r.sessionId : '') };
     } catch (err) {
-      S.test = { ...keep, status: 'error', message: 'Call failed: ' + err.message };
+      // `bad_number` is the server rejecting the number BEFORE it dialled, and
+      // its message already tells the merchant the shape to use with an example
+      // from their own country. Prefixing that with "Call failed" would report a
+      // failed call that never happened and bury the instruction, so it is shown
+      // verbatim; anything else really is a call that did not go through.
+      S.test = { ...keep, status: 'error',
+        message: err.code === 'bad_number' ? err.message : 'Call failed: ' + err.message };
     }
     render();
   }
@@ -2038,7 +2515,11 @@
       S.numbers = r.numbers || [];
     } catch (err) {
       // An empty list and a failed fetch look the same to the panel, which is
-      // the safe direction: it offers the "buy a number" route either way.
+      // the safe direction: either way it says the number is still being set
+      // up and points at the browser call, which needs no number at all. It
+      // must never grow a "get one yourself" branch — a merchant-reachable
+      // route to buying telephony outside Shopify is what requirement 1.2.1
+      // paused this app for.
       S.numbers = [];
     }
   }
@@ -2250,8 +2731,8 @@
 
 
   // ── Templates ───────────────────────────────────────────────────────────────
-  // Ready-made agents. Setting one up creates a real agent in the merchant's
-  // Telenow workspace, wired to their Shopify connector so it can read the store
+  // Ready-made agents. Setting one up creates a real agent in this store's own
+  // calling workspace, wired to its Shopify connector so it can read the store
   // mid-call, and adds it to this store's agent list.
 
   /** Templates with a guided multi-step setup. The rest are one-click. */
@@ -2278,7 +2759,7 @@
         ${done
           ? `<span class="pill ok"><span class="dot"></span>Set up</span>
              <button class="btn secondary" data-open-tpl="${esc(done.agentId)}" style="flex:0 0 auto;">View agent</button>`
-          : `<span class="hint" style="font-size:11.5px;">Creates an agent in Telenow</span>
+          : `<span class="hint" style="font-size:11.5px;">Creates a ready-to-call agent</span>
              <button class="btn${st ? ' busy' : ''}" data-${WIZARD_TEMPLATES.has(t.key) ? 'wizard' : 'setup'}-tpl="${esc(t.key)}" style="flex:0 0 auto;"${st ? ' disabled' : ''}>
                Setup</button>`}
       </div>
@@ -2286,21 +2767,22 @@
   }
 
   function viewTemplates() {
-    if (!connected()) return notConnected('agent templates');
+    // No entitlement gate: browsing the catalogue is a read. Publishing one is
+    // the spend, and the server answers that with a 402 the dialog renders.
     if (S.templates === null) return skPage(skCards(6));
 
     const t = S.templates;
     return `
       <h1>Templates</h1>
-      <p class="page-sub">Ready-made voice agents for a Shopify store. Setup creates the agent in your Telenow account.</p>
+      <p class="page-sub">Ready-made voice agents for a Shopify store. Publishing one sets it up end to end — included with your plan.</p>
 
       ${t.connected
         ? `<div class="banner" style="border-color:var(--ok);margin-bottom:16px;"><span>✓</span>
-            <div><b>Your store is connected to Telenow.</b> Agents made here can look up orders,
+            <div><b>Your store is connected.</b> Agents made here can look up orders,
             find customers and search products during a call.</div></div>`
         : `<div class="banner warn" style="margin-bottom:16px;"><span>⚠</span>
-            <div><b>Store not connected yet.</b> Agents will still be created, but without live access
-            to your orders and products. Save your API key in Settings and it connects automatically.</div></div>`}
+            <div><b>Store link still being set up.</b> Agents will still be created, but without live access
+            to your orders and products until it finishes — usually under a minute.</div></div>`}
 
       ${S.templateErr ? `<div class="banner err"><span>✕</span><div>${esc(S.templateErr)}</div></div>` : ''}
       ${S.templateMsg ? `<div class="banner" style="border-color:var(--ok);"><span>✓</span><div>${esc(S.templateMsg)}</div></div>` : ''}
@@ -2314,7 +2796,7 @@
       S.templateErr = '';
     } catch (err) {
       S.templates = { templates: [], connected: false };
-      if (err.code !== 'no_api_key') S.templateErr = 'Could not load templates: ' + err.message;
+      if (!isGated(err)) S.templateErr = 'Could not load templates: ' + err.message;
     }
   }
 
@@ -2408,8 +2890,8 @@
     const name = agent ? (agent.name || 'this agent') : 'this agent';
     const ok = await askConfirm({
       title: 'Remove ' + name + '?',
-      body: 'It will be taken off this store’s list. The agent itself stays in Telenow, '
-        + 'so you can add it back any time from "Fetch agents from Telenow".',
+      body: 'It will be taken off this store’s list. The agent itself is not deleted, '
+        + 'so you can put it back any time from "Add agents".',
       okLabel: 'Yes, remove',
       cancelLabel: 'No, keep it',
       danger: true,
@@ -2496,6 +2978,94 @@
     </select>`;
   }
 
+  /**
+   * The "Call from" body, shared by all five outbound wizard steps.
+   *
+   * There is deliberately no branch here for acquiring a number: every plan
+   * includes one, so an empty list can only mean the workspace lease has not
+   * landed yet. That is a transient server state and it must not block
+   * publishing — the agent binds the number the moment it appears — so the empty
+   * case explains the wait instead of sending the merchant anywhere.
+   */
+  function callFromField(selectedId) {
+    const nums = (S.numbers || []);
+    if (!nums.length) {
+      return `<p class="hint">Calls will come from your store's number — included with your plan.</p>
+        <div class="banner warn" style="margin-top:8px;"><span>⚠</span>
+          <div>It is still being set up. You can publish now — the agent picks it up automatically.</div></div>`;
+    }
+    const chosen = nums.find((n) => n.id === selectedId) || (nums.length === 1 ? nums[0] : null);
+    const opts = nums.map((n) => ({ value: n.id, label: numberLabel(n) }));
+    return `<p class="hint">${chosen
+      ? 'Calls will come from ' + esc(numberLabel(chosen)) + ' — included with your plan.'
+      : 'The number the customer sees — included with your plan.'}</p>
+      ${selectOf('wFrom', opts, selectedId, { blank: "The agent's default" })}`;
+  }
+
+  /**
+   * Timezone choices for the quiet-hours picker.
+   *
+   * Intl.supportedValuesOf hands back the browser's whole IANA list, which is
+   * every browser the Shopify admin runs in; the short fallback only has to be
+   * long enough that a merchant on something older can still find their own
+   * zone. `current` is spliced in when the list does not already contain it, so
+   * the pre-filled value can never be missing from the list it is selected from
+   * — a select whose selected option does not exist silently reports the first
+   * option instead, which is exactly how a wrong zone gets published.
+   */
+  function timezoneOptions(current) {
+    let zones = [];
+    try {
+      if (typeof Intl.supportedValuesOf === 'function') zones = Intl.supportedValuesOf('timeZone') || [];
+    } catch (e) { /* fall through to the short list */ }
+    if (!zones.length) {
+      zones = ['UTC', 'America/Los_Angeles', 'America/Denver', 'America/Chicago', 'America/New_York',
+        'America/Sao_Paulo', 'Europe/London', 'Europe/Madrid', 'Europe/Berlin', 'Africa/Lagos',
+        'Africa/Johannesburg', 'Asia/Dubai', 'Asia/Karachi', 'Asia/Kolkata', 'Asia/Dhaka',
+        'Asia/Bangkok', 'Asia/Singapore', 'Asia/Shanghai', 'Asia/Tokyo', 'Australia/Sydney',
+        'Pacific/Auckland'];
+    }
+    if (current && !zones.includes(current)) zones = [current, ...zones];
+    return zones.map((z) => ({ value: z, label: z.replace(/_/g, ' ') }));
+  }
+
+  /**
+   * The quiet-hours card, shared by every step that has one.
+   *
+   * The timezone is ASKED FOR, never assumed. The window is evaluated on the
+   * server, and a start/end with the wrong zone behind it does the opposite of
+   * what the merchant set: a Chicago store typing 21:00–09:00 against an Indian
+   * clock suppresses calls through its own working afternoon and dials shoppers
+   * around midnight local time — a calling-hours problem, not a cosmetic one.
+   * It is pre-filled from the shop's own Shopify timezone, so in the normal case
+   * the merchant is confirming a correct value rather than hunting for one.
+   */
+  function quietHoursCard(c, hint) {
+    return `<div class="card">
+      <h2>Quiet hours</h2>
+      <p class="hint">${hint}</p>
+      <label class="toggle" style="margin:10px 0;">
+        <input type="checkbox" id="wQuiet" ${c.quietEnabled ? 'checked' : ''} />
+        <span>Hold calls outside these hours</span>
+      </label>
+      <div class="row">
+        <div style="flex:1;"><label>From</label>
+          <input type="text" id="wQuietStart" value="${esc(c.quietStart)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
+        <div style="flex:1;"><label>To</label>
+          <input type="text" id="wQuietEnd" value="${esc(c.quietEnd)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
+      </div>
+      <div class="field" style="margin-top:10px;">
+        <label>In this timezone</label>
+        ${selectOf('wQuietTz', timezoneOptions(c.quietTimezone), c.quietTimezone, { disabled: !c.quietEnabled })}
+        <div class="hint" style="margin-top:6px;">
+          ${S.profile?.iana_timezone
+            ? 'Pre-filled from your store’s Shopify timezone. Change it if you call customers in another one.'
+            : 'Your store’s timezone could not be read from Shopify, so pick the one your customers are in.'}
+        </div>
+      </div>
+    </div>`;
+  }
+
   function wizStep1(c) {
     const llm = (S.catalog?.llm || []).map((p) => ({ value: p.id, label: p.name || p.id }));
     const llmModels = ((catProvider('llm', c.llmProvider) || {}).models || [])
@@ -2545,8 +3115,8 @@
         </div>
         <div class="banner" style="margin-top:12px;"><span>ℹ</span>
           <div>Want a different voice? These four are a shortlist —
-          ${esc(String(((catProvider('tts', c.ttsProvider) || {}).voices || []).length))} are available.
-          After setup, open the agent in <b>Telenow → Agents → Voice</b> to browse and preview them all.</div>
+          ${esc(String(((catProvider('tts', c.ttsProvider) || {}).voices || []).length))} come with this provider.
+          Press ▶ to hear any of them, or switch the text-to-speech provider above for a different set.</div>
         </div>
       </div>
 
@@ -2592,7 +3162,7 @@
              </div>
              <div class="field">
                <label>Content</label>
-               <textarea id="wKbBody" rows="8" placeholder="Returns accepted within 7 days of delivery, unused and in original packaging.&#10;COD available on orders under Rs 5000.&#10;Delivery is 3-5 working days for metros, 5-8 elsewhere.">${esc(c.kbBody || '')}</textarea>
+               <textarea id="wKbBody" rows="8" placeholder="Returns accepted within 30 days of delivery, unused and in original packaging.&#10;Free shipping on orders over ${esc(sampleMoney(50))}.&#10;Delivery is 3-5 business days.">${esc(c.kbBody || '')}</textarea>
                <div class="hint" style="margin-top:6px;">Plain sentences work best. The agent quotes from this instead of improvising.</div>
              </div>`
           : (kbs.length
@@ -2616,7 +3186,7 @@
           <b>Outcome</b> column on the Calls page and what your automations write back
           onto the order.
           <br /><br />
-          <b>Off by default because it is billed per call</b>, on top of the call itself.
+          <b>Off by default</b> because it adds a few seconds after each call.
           Leave it off while you are testing; switch it on once the calls are real and you
           want to know how they went without listening to each one.
         </div>
@@ -2641,9 +3211,9 @@
    * number reaches this agent, when does it hand over to a person, and what is
    * it allowed to say.
    *
-   * Deliberately absent: a business-hours picker. Telenow has no time gate on
-   * the inbound path (plan_inbound reads no clock), so an hours control here
-   * would be a switch that does nothing. The card says so instead.
+   * Deliberately absent: a business-hours picker. There is no time gate on the
+   * inbound path (plan_inbound reads no clock), so an hours control here would
+   * be a switch that does nothing. The card says so instead.
    */
   function wizStep2Support(c) {
     const freshdesk = (S.integrations || []).find((x) => x.providerId === 'freshdesk' && x.status === 'active');
@@ -2658,26 +3228,24 @@
                <label>Inbound number</label>
                ${selectOf('wInbound', nums.map((n) => ({
                  value: n.id,
-                 label: `${n.phone_number} (${n.provider || '—'})${n.agent_id ? ' — currently answered by another agent' : ''}`,
+                 label: `${numberLabel(n)}${n.agent_id ? ' — currently answered by another agent' : ''}`,
                })), c.inboundNumberId, { blank: 'Do not assign a number yet' })}
                <div class="hint" style="margin-top:6px;">
-                 Numbers bought through Telenow need no carrier setup. Leave this unset and the agent is created but unreachable by phone.
+                 Your number is included with your plan and needs no carrier setup. Leave this unset and the agent is created but unreachable by phone.
                </div>
              </div>
              ${taken.length ? `<div class="banner warn" style="margin-top:10px;"><span>⚠</span>
                <div>That number already answers with a different agent. Publishing will move it to this one.</div></div>` : ''}`
           : `<div class="banner warn" style="margin-top:10px;"><span>⚠</span>
-              <div>You have no phone number, so customers have no way to reach this agent.</div></div>
-             <p style="margin-top:10px;">
-               <a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">Buy a number on Telenow ↗</a>
-             </p>`}
+              <div>Your calling number is still being set up. Publish anyway and assign it here once it appears —
+              it usually takes under a minute.</div></div>`}
       </div>
 
       <div class="grid grid-2" style="margin-bottom:16px;">
         <div class="card">
           <h2>Availability</h2>
           <div class="banner" style="margin-top:6px;"><span>ℹ</span>
-            <div>This agent answers <b>24 hours a day</b>. Telenow has no business-hours setting for inbound calls, so there is no switch here that could change that.</div>
+            <div>This agent answers <b>24 hours a day</b>. There is no business-hours setting for inbound calls, so there is no switch here that could change that.</div>
           </div>
           <p class="hint" style="margin-top:10px;">
             If you only want it live during working hours, either unassign the number outside them,
@@ -2698,7 +3266,7 @@
             <div style="flex:1 1 140px;"><label>Label</label>
               <input type="text" id="wXferLabel" value="${esc(c.transferLabel || 'support')}" /></div>
             <div style="flex:2 1 200px;"><label>Number</label>
-              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="+919876543210" /></div>
+              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="${esc(exampleNumber())}" /></div>
           </div>
           <div class="field" style="margin-top:10px;">
             <label>What the agent says</label>
@@ -2786,7 +3354,6 @@
    * call everyone and you spend more than the orders were worth.
    */
   function wizStep2Feedback(c) {
-    const nums = (S.numbers || []).map((n) => ({ value: n.id, label: `${n.phone_number} (${n.provider || '—'})` }));
     // The sweep runs on the scheduler's cadence, so the wait is approximate.
     const sweepHours = 6;
     return `
@@ -2801,7 +3368,7 @@
             <label>Call this many days after dispatch</label>
             <input type="number" id="wFbDays" min="1" max="60" value="${esc(String(c.daysAfter))}" />
             <div class="hint" style="margin-top:6px;">
-              7 is a good default in India: 3–5 days to arrive, a couple of days to actually use it.
+              7 works for most stores: a few days to arrive, a couple more to actually use it.
             </div>
           </div>
           <div style="flex:1 1 200px;">
@@ -2820,12 +3387,12 @@
       <div class="grid grid-2" style="margin-bottom:16px;">
         <div class="card">
           <h2>Who to call</h2>
-          <p class="hint">Feedback calls cost the same as any other. Spend them where the answer is worth something.</p>
+          <p class="hint">Feedback calls use the same minutes as any other. Point them where the answer is worth something.</p>
           <div class="field" style="margin-top:8px;">
             <label>Only orders worth at least</label>
             <input type="number" id="wFbMinValue" min="0" value="${esc(String(c.minOrderValue))}" />
             <div class="hint" style="margin-top:6px;">
-              In your store currency. 0 calls everyone — on a low-value order the call can cost more than the margin.
+              In your store currency. 0 calls everyone. On a low-value order the call is rarely worth the minute.
             </div>
           </div>
           <div class="field">
@@ -2837,20 +3404,7 @@
           </div>
         </div>
 
-        <div class="card">
-          <h2>Quiet hours</h2>
-          <p class="hint">Nothing about this call is urgent, so it should never be the reason someone's evening is interrupted.</p>
-          <label class="toggle" style="margin:10px 0;">
-            <input type="checkbox" id="wQuiet" ${c.quietEnabled ? 'checked' : ''} />
-            <span>Hold calls outside these hours</span>
-          </label>
-          <div class="row">
-            <div style="flex:1;"><label>From</label>
-              <input type="text" id="wQuietStart" value="${esc(c.quietStart)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
-            <div style="flex:1;"><label>To</label>
-              <input type="text" id="wQuietEnd" value="${esc(c.quietEnd)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
-          </div>
-        </div>
+        ${quietHoursCard(c, "Nothing about this call is urgent, so it should never be the reason someone's evening is interrupted.")}
       </div>
 
       <div class="card" style="margin-bottom:16px;">
@@ -2877,12 +3431,7 @@
       <div class="grid grid-2">
         <div class="card">
           <h2>Call from</h2>
-          ${nums.length
-            ? `<p class="hint">The number the customer sees.</p>
-               ${selectOf('wFrom', nums, c.fromNumberId, { blank: "The agent's default" })}`
-            : `<div class="banner warn" style="margin-top:8px;"><span>⚠</span>
-                <div>You have no phone number yet, so outbound calls cannot be placed.</div></div>
-               <p style="margin-top:10px;"><a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">Buy a number on Telenow ↗</a></p>`}
+          ${callFromField(c.fromNumberId)}
         </div>
         <div class="card">
           <h2>Transfer to a human <span class="hint" style="font-weight:400;">— optional</span></h2>
@@ -2891,7 +3440,7 @@
             <div style="flex:1 1 140px;"><label>Label</label>
               <input type="text" id="wXferLabel" value="${esc(c.transferLabel || 'support')}" /></div>
             <div style="flex:2 1 200px;"><label>Number</label>
-              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="+919876543210" /></div>
+              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="${esc(exampleNumber())}" /></div>
           </div>
           <div class="field" style="margin-top:10px;">
             <label>What the agent says</label>
@@ -2912,7 +3461,6 @@
    * useless.
    */
   function wizStep2PostPurchase(c) {
-    const nums = (S.numbers || []).map((n) => ({ value: n.id, label: `${n.phone_number} (${n.provider || '—'})` }));
     // Only connectors that can actually deliver a link.
     const waConns = (S.integrations || [])
       .filter((x) => x.status === 'active' && (x.capabilities || []).includes('whatsapp.send'))
@@ -2970,16 +3518,16 @@
               ${waConns.length
                 ? selectOf('wPpWa', waConns, c.waConnectionId, { blank: 'Read it out only — do not send' })
                 : `<div class="banner warn"><span>⚠</span>
-                    <div>No WhatsApp connector is active, so a link cannot be delivered.
-                    The agent can still read a short code aloud, but a URL over the phone rarely survives.
-                    Connect WhatsApp in Telenow → Integrations to enable this.</div></div>`}
+                    <div>No messaging channel is available on this store, so a checkout link cannot be
+                    delivered. The agent can still read a short code aloud, but a URL over the phone
+                    rarely survives — leave the cross-sell off if that is not worth the call.</div></div>`}
               ${waConns.length ? `<div class="hint" style="margin-top:6px;">
                 A voice call cannot hand over a URL — without a channel the link is created and never arrives.
               </div>` : ''}
             </div>
             <div class="banner" style="margin-top:10px;"><span>✓</span>
-              <div><b>Checkout links are always confirmed.</b> Telenow forces the agent to read the item
-              and price back and wait for a spoken yes before creating one — that is not a setting you can turn off.</div>
+              <div><b>Checkout links are always confirmed.</b> The agent always reads the item
+              and price back and waits for a spoken yes before creating one — that is not a setting you can turn off.</div>
             </div>
           </div>` : ''}
       </div>
@@ -2990,38 +3538,20 @@
           <div class="field" style="margin-top:8px;">
             <label>Only orders worth at least</label>
             <input type="number" id="wPpMinValue" min="0" value="${esc(String(c.minOrderValue))}" />
-            <div class="hint" style="margin-top:6px;">An upsell call needs margin behind it to be worth placing.</div>
+            <div class="hint" style="margin-top:6px;">An upsell call needs enough order value behind it to be worth placing.</div>
           </div>
           <div class="field">
             <label>Most calls per sweep</label>
             <input type="number" id="wPpMaxPer" min="1" max="200" value="${esc(String(c.maxPerSweep))}" />
           </div>
         </div>
-        <div class="card">
-          <h2>Quiet hours</h2>
-          <p class="hint">A sales-flavoured call at the wrong hour costs you the customer, not just the call.</p>
-          <label class="toggle" style="margin:10px 0;">
-            <input type="checkbox" id="wQuiet" ${c.quietEnabled ? 'checked' : ''} />
-            <span>Hold calls outside these hours</span>
-          </label>
-          <div class="row">
-            <div style="flex:1;"><label>From</label>
-              <input type="text" id="wQuietStart" value="${esc(c.quietStart)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
-            <div style="flex:1;"><label>To</label>
-              <input type="text" id="wQuietEnd" value="${esc(c.quietEnd)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
-          </div>
-        </div>
+        ${quietHoursCard(c, 'A sales-flavoured call at the wrong hour costs you the customer.')}
       </div>
 
       <div class="grid grid-2">
         <div class="card">
           <h2>Call from</h2>
-          ${nums.length
-            ? `<p class="hint">The number the customer sees.</p>
-               ${selectOf('wFrom', nums, c.fromNumberId, { blank: "The agent's default" })}`
-            : `<div class="banner warn" style="margin-top:8px;"><span>⚠</span>
-                <div>You have no phone number yet, so outbound calls cannot be placed.</div></div>
-               <p style="margin-top:10px;"><a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">Buy a number on Telenow ↗</a></p>`}
+          ${callFromField(c.fromNumberId)}
         </div>
         <div class="card">
           <h2>Transfer to a human <span class="hint" style="font-weight:400;">— optional</span></h2>
@@ -3030,7 +3560,7 @@
             <div style="flex:1 1 140px;"><label>Label</label>
               <input type="text" id="wXferLabel" value="${esc(c.transferLabel || 'support')}" /></div>
             <div style="flex:2 1 200px;"><label>Number</label>
-              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="+919876543210" /></div>
+              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="${esc(exampleNumber())}" /></div>
           </div>
           <div class="field" style="margin-top:10px;">
             <label>What the agent says</label>
@@ -3047,10 +3577,9 @@
    * Fires on orders/create — the same event as COD Confirmation — so the first
    * thing this step has to settle is which of the two calls a COD order gets.
    * The rest is about what the agent reads back, because this template exists to
-   * catch a wrong size or a bad pincode while it is still free to fix.
+   * catch a wrong size or a bad postcode while it is still free to fix.
    */
   function wizStep2OrderConfirm(c) {
-    const nums = (S.numbers || []).map((n) => ({ value: n.id, label: `${n.phone_number} (${n.provider || '—'})` }));
     const codOn = Boolean((S.templates?.templates || []).find((t) => t.key === 'cod')?.installed);
 
     return `
@@ -3063,11 +3592,11 @@
             <span>Items and quantity</span>
           </label>
           <div class="hint" style="margin:0 0 12px 26px;">
-            Reads them back with counts — "two Blue Kurtas and one Silk Scarf". Catches the duplicate tap that ordered two.
+            Reads them back with counts — "two Blue T-Shirts and one Silk Scarf". Catches the duplicate tap that ordered two.
           </div>
           <label class="toggle" style="margin-bottom:6px;">
             <input type="checkbox" id="wOcAddress" ${c.checkAddress ? 'checked' : ''} />
-            <span>Delivery address, including the pincode</span>
+            <span>Delivery address, including the postcode</span>
           </label>
           <div class="hint" style="margin:0 0 12px 26px;">
             The step that actually prevents a return. Slower to read, and worth it.
@@ -3114,20 +3643,7 @@
             <div class="hint" style="margin-top:6px;">60 is the default.</div>
           </div>
         </div>
-        <div class="card">
-          <h2>Quiet hours</h2>
-          <p class="hint">An order placed at midnight should not ring back at midnight.</p>
-          <label class="toggle" style="margin:10px 0;">
-            <input type="checkbox" id="wQuiet" ${c.quietEnabled ? 'checked' : ''} />
-            <span>Hold calls outside these hours</span>
-          </label>
-          <div class="row">
-            <div style="flex:1;"><label>From</label>
-              <input type="text" id="wQuietStart" value="${esc(c.quietStart)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
-            <div style="flex:1;"><label>To</label>
-              <input type="text" id="wQuietEnd" value="${esc(c.quietEnd)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
-          </div>
-        </div>
+        ${quietHoursCard(c, 'An order placed at midnight should not ring back at midnight.')}
       </div>
 
       <div class="card" style="margin-bottom:16px;">
@@ -3136,9 +3652,9 @@
         <div class="kv" style="margin-top:10px;">
           ${kv('{customer_name}', 'First name from the order')}
           ${kv('{order_number}', 'e.g. #1001')}
-          ${kv('{items}', 'Titles with counts — "2 x Blue Kurta, Silk Scarf"')}
+          ${kv('{items}', 'Titles with counts — "2 x Blue T-Shirt, Silk Scarf"')}
           ${kv('{quantity}', 'Total units across the order')}
-          ${kv('{delivery_address}', 'Street, city, state, pincode, country')}
+          ${kv('{delivery_address}', 'Street, city, state or region, postcode, country')}
           ${kv('{order_total}', 'Formatted with the store currency')}
         </div>
         <div class="banner" style="margin-top:12px;"><span>ℹ</span>
@@ -3150,12 +3666,7 @@
       <div class="grid grid-2">
         <div class="card">
           <h2>Call from</h2>
-          ${nums.length
-            ? `<p class="hint">The number the customer sees.</p>
-               ${selectOf('wFrom', nums, c.fromNumberId, { blank: "The agent's default" })}`
-            : `<div class="banner warn" style="margin-top:8px;"><span>⚠</span>
-                <div>You have no phone number yet, so outbound calls cannot be placed.</div></div>
-               <p style="margin-top:10px;"><a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">Buy a number on Telenow ↗</a></p>`}
+          ${callFromField(c.fromNumberId)}
         </div>
         <div class="card">
           <h2>Transfer to a human <span class="hint" style="font-weight:400;">— optional</span></h2>
@@ -3164,7 +3675,7 @@
             <div style="flex:1 1 140px;"><label>Label</label>
               <input type="text" id="wXferLabel" value="${esc(c.transferLabel || 'support')}" /></div>
             <div style="flex:2 1 200px;"><label>Number</label>
-              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="+919876543210" /></div>
+              <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="${esc(exampleNumber())}" /></div>
           </div>
           <div class="field" style="margin-top:10px;">
             <label>What the agent says</label>
@@ -3184,7 +3695,6 @@
    * on only the first wastes the other chances to save the parcel.
    */
   function wizStep2Rto(c) {
-    const nums = (S.numbers || []).map((n) => ({ value: n.id, label: `${n.phone_number} (${n.provider || '—'})` }));
     return `
       <div class="card" style="margin-bottom:16px;">
         <h2>Where failed deliveries come from</h2>
@@ -3196,7 +3706,8 @@
             <button class="btn secondary" id="wNdrCopy" style="flex:0 0 auto;">Copy</button>
           </div>
           <div class="hint" style="margin-top:6px;">
-            Paste this into Delhivery, Shiprocket, Blue Dart, Xpressbees or Ekart as the NDR / failed-delivery webhook.
+            Paste this into your courier or 3PL as the NDR / failed-delivery webhook
+            (e.g. Shippo, AfterShip, EasyPost, Delhivery, Shiprocket).
             The URL contains a secret — treat it like a password.
           </div>
         </div>
@@ -3220,36 +3731,20 @@
             <div class="hint" style="margin-top:6px;">0 calls immediately. The courier has just left, so the customer usually remembers.</div>
           </div>
         </div>
-        <div class="card">
-          <h2>Quiet hours</h2>
-          <p class="hint">NDR events arrive whenever the courier syncs, often late at night. Calls inside this window are held.</p>
-          <label class="toggle" style="margin:10px 0;">
-            <input type="checkbox" id="wQuiet" ${c.quietEnabled ? 'checked' : ''} />
-            <span>Hold calls outside working hours</span>
-          </label>
-          <div class="row">
-            <div style="flex:1;"><label>From</label><input type="text" id="wQuietStart" value="${esc(c.quietStart)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
-            <div style="flex:1;"><label>To</label><input type="text" id="wQuietEnd" value="${esc(c.quietEnd)}" ${c.quietEnabled ? '' : 'disabled'} /></div>
-          </div>
-        </div>
+        ${quietHoursCard(c, 'NDR events arrive whenever the courier syncs, often late at night. Calls inside this window are held.')}
       </div>
 
       <div class="grid grid-2">
         <div class="card">
           <h2>Call from</h2>
-          ${nums.length
-            ? `<p class="hint">The number the customer sees.</p>
-               ${selectOf('wFrom', nums, c.fromNumberId, { blank: "The agent's default" })}`
-            : `<div class="banner warn" style="margin-top:8px;"><span>⚠</span>
-                <div>You have no phone number yet, so outbound calls cannot be placed.</div></div>
-               <p style="margin-top:10px;"><a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">Buy a number on Telenow ↗</a></p>`}
+          ${callFromField(c.fromNumberId)}
         </div>
         <div class="card">
           <h2>Transfer to a human <span class="hint" style="font-weight:400;">— optional</span></h2>
           <p class="hint">An angry customer about a missed delivery is exactly who should reach a person.</p>
           <div class="row" style="margin-top:8px;">
             <div style="flex:1 1 140px;"><label>Label</label><input type="text" id="wXferLabel" value="${esc(c.transferLabel || 'support')}" /></div>
-            <div style="flex:2 1 200px;"><label>Number</label><input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="+919876543210" /></div>
+            <div style="flex:2 1 200px;"><label>Number</label><input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="${esc(exampleNumber())}" /></div>
           </div>
           <div class="field" style="margin-top:10px;">
             <label>What the agent says</label>
@@ -3260,7 +3755,6 @@
   }
 
   function wizStep2Orders(c) {
-    const nums = (S.numbers || []).map((n) => ({ value: n.id, label: `${n.phone_number} (${n.provider || '—'})` }));
     return `
       <div class="card" style="margin-bottom:16px;">
         <h2>Shopify order access</h2>
@@ -3272,8 +3766,8 @@
           ${kv('Writes back', 'Order tags and notes with the call outcome')}
         </div>
         ${c.wired ? '' : `<div class="banner warn" style="margin-top:12px;"><span>⚠</span>
-          <div>Your store is not connected to Telenow, so the agent cannot read orders mid-call.
-          Save your API key in Settings — it connects automatically.</div></div>`}
+          <div>The store link is still being set up, so the agent cannot read orders mid-call yet.
+          It connects on its own — usually under a minute.</div></div>`}
       </div>
 
       <div class="grid grid-2" style="margin-bottom:16px;">
@@ -3286,17 +3780,12 @@
             60 seconds is the default. Long enough that the customer has put the phone down, short enough that the order is still in their mind.
           </div>
         </div>
-        <div class="card">
-          <h2>Call from</h2>
-          ${nums.length
-            ? `<p class="hint">The number the customer sees.</p>
-               ${selectOf('wFrom', nums, c.fromNumberId, { blank: "The agent's default" })}`
-            : `<div class="banner warn" style="margin-top:8px;"><span>⚠</span>
-                <div>You have no phone number yet, so outbound calls cannot be placed.</div></div>
-               <p style="margin-top:10px;">
-                 <a class="btn" href="https://telenow.ai/numbers" target="_blank" rel="noopener">Buy a number on Telenow ↗</a>
-               </p>`}
-        </div>
+        ${quietHoursCard(c, 'Orders arrive at every hour; the call that confirms one should not.')}
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <h2>Call from</h2>
+        ${callFromField(c.fromNumberId)}
       </div>
 
       <div class="card">
@@ -3309,7 +3798,7 @@
           </div>
           <div style="flex:2 1 220px;">
             <label>Number</label>
-            <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="+919876543210" />
+            <input type="tel" id="wXferNumber" value="${esc(c.transferNumber || '')}" placeholder="${esc(exampleNumber())}" />
           </div>
         </div>
         <label style="margin-top:10px;display:block;">What the agent says while transferring</label>
@@ -3332,16 +3821,16 @@
             ${kv('Voice', voice ? [voice.name, voice.language, voice.gender].filter(Boolean).join(' · ') : (c.ttsVoice || 'default'))}
             ${kv('Knowledge base', c.kbMode === 'new' && (c.kbName || '').trim()
               ? c.kbName.trim() + ' (new)' : (kb ? kb.name : 'None'))}
-            ${kv('Post-call analysis', c.postCallAnalysis ? 'On — billed per call' : 'Off')}
+            ${kv('Post-call analysis', c.postCallAnalysis ? 'On' : 'Off')}
           </div>
         </div>
         <div class="card">
           <h2>Trigger &amp; access</h2>
           <div class="kv">
             ${S.wiz?.key === 'support' ? kv('Answers on',
-              (S.numbers || []).find((n) => n.id === c.inboundNumberId)?.phone_number
+              numberLabel((S.numbers || []).find((n) => n.id === c.inboundNumberId))
                 || 'No number assigned — unreachable by phone') : ''}
-            ${S.wiz?.key === 'support' ? kv('Available', '24 hours — Telenow has no inbound hours setting') : ''}
+            ${S.wiz?.key === 'support' ? kv('Available', '24 hours — no inbound hours setting') : ''}
             ${S.wiz?.key === 'order-confirmation' ? kv('Reads back', [c.checkItems && 'items + quantity',
               c.checkAddress && 'address', c.checkPhone && 'phone'].filter(Boolean).join(', ') || 'Nothing selected') : ''}
             ${S.wiz?.key === 'order-confirmation' ? kv('COD orders', c.skipCod ? 'Skipped — left to COD Confirmation' : 'Also called') : ''}
@@ -3361,9 +3850,10 @@
               ? kv('Fires on', 'Courier NDR webhook — a failed delivery attempt')
               : kv('Fires on', 'New Cash-on-Delivery orders')}
             ${S.wiz?.key === 'rto' ? kv('Calls on', c.maxAttempts === 1 ? 'First attempt only' : `First ${c.maxAttempts} attempts`) : ''}
-            ${S.wiz?.key === 'rto' ? kv('Quiet hours', c.quietEnabled ? `${c.quietStart}–${c.quietEnd} held` : 'Off') : ''}
+            ${S.wiz?.key === 'support' ? '' : kv('Quiet hours', c.quietEnabled
+              ? `${c.quietStart}–${c.quietEnd} held (${c.quietTimezone})` : 'Off')}
             ${kv('Calls after', c.delaySeconds + ' seconds')}
-            ${kv('Calls from', num ? num.phone_number : "The agent's default")}
+            ${kv('Calls from', num ? numberLabel(num) : "The agent's default")}
             ${kv('Store tools', c.wired ? c.capabilities.join(', ') : 'None — store not connected')}
             ${kv('Transfers to', c.transferNumber ? `${c.transferLabel || 'support'} · ${c.transferNumber}` : 'Not set')}
           </div>
@@ -3480,7 +3970,7 @@
     // A wizard opened and then abandoned mid-fetch must not overwrite a newer one.
     if (!S.wiz || S.wiz.key !== key) return;
     if (!S.catalog) {
-      S.wiz.error = 'Could not load the model catalog. Check your Telenow connection and try again.';
+      S.wiz.error = 'Could not load the voice and model catalogue. Reload the page and try again.';
       render();
       return;
     }
@@ -3516,7 +4006,13 @@
       checkItems: true, checkAddress: true, checkPhone: false, skipCod: true,
       tagOrder: true, flagLow: true,
       maxAttempts: 2,
+      // The shop's own Shopify timezone, never a fixed one: quiet hours are
+      // meaningless without the clock they are read against, and defaulting to
+      // somebody else's would silently invert the window for most merchants.
+      // UTC is the fallback rather than any populated zone — it is obviously
+      // neutral, so a merchant who sees it knows to set their own.
       quietEnabled: true, quietStart: '21:00', quietEnd: '09:00',
+      quietTimezone: S.profile?.iana_timezone || 'UTC',
       variables: tpl.variables,
       capabilities: tpl.capabilities,
       wired: Boolean(S.templates?.connected),
@@ -3593,6 +4089,7 @@
       const q = $('#wQuiet'); if (q) c.quietEnabled = q.checked;
       c.quietStart = val('#wQuietStart') ?? c.quietStart;
       c.quietEnd = val('#wQuietEnd') ?? c.quietEnd;
+      c.quietTimezone = val('#wQuietTz') || c.quietTimezone;
     }
   }
 
@@ -3600,13 +4097,27 @@
     const w = S.wiz;
     if (!w) return;
     collectWizard();
-    // A transfer number that is not E.164 would be accepted and then silently
-    // fail at call time, so stop here instead.
-    if (delta > 0 && w.step === 1 && w.config.transferNumber
-        && !/^\+[1-9]\d{6,14}$/.test(w.config.transferNumber)) {
-      w.error = 'The transfer number must be in E.164 form, e.g. +919876543210.';
-      render();
-      return;
+    // The transfer number is held to E.164 here because NOTHING DOWNSTREAM WILL
+    // DO IT. Unlike the test-call number — which the server normalises against
+    // the shop's country before it dials — transferDestinations is passed
+    // through publish untouched and written straight into the agent's transfer
+    // tool, so a number that is not already dialable is accepted here, saved,
+    // and then fails silently the first time a caller asks for a human.
+    //
+    // The check now runs on the TIDIED value, so the ways a merchant actually
+    // writes an international number — "+1 (415) 555-0123", "00 1 415 555 0123"
+    // — are accepted and stored in the form the carrier needs, instead of being
+    // refused for their punctuation. A bare national number still cannot be
+    // resolved without a country, so it is refused, and the example in the
+    // message comes from the merchant's own country rather than always India.
+    if (delta > 0 && w.step === 1 && w.config.transferNumber) {
+      const tidy = tidyInternational(w.config.transferNumber);
+      if (!/^\+[1-9]\d{6,14}$/.test(tidy)) {
+        w.error = 'The transfer number must include the country code, e.g. ' + exampleNumber() + '.';
+        render();
+        return;
+      }
+      w.config.transferNumber = tidy;
     }
     w.error = '';
     w.step = Math.max(0, Math.min(2, w.step + delta));
@@ -3698,7 +4209,8 @@
           },
           maxAttempts: c.maxAttempts,
           quietHours: c.quietEnabled
-            ? { enabled: true, start: c.quietStart, end: c.quietEnd, timezone: 'Asia/Kolkata' }
+            ? { enabled: true, start: c.quietStart, end: c.quietEnd,
+                timezone: c.quietTimezone || 'UTC' }
             : { enabled: false },
           fromNumberId: c.fromNumberId || undefined,
           transferDestinations: c.transferNumber
@@ -3823,7 +4335,7 @@
         <h2>Helpdesk tickets</h2>
         <p class="hint">
           Tickets raised by the Customer Support agent live in your helpdesk, not here.
-          Telenow's Freshdesk connector can <b>create</b> a ticket but cannot list them back,
+          The Freshdesk connector can <b>create</b> a ticket but cannot list them back,
           so this page would only ever show a stale copy.
         </p>
         <p style="margin-top:10px;">
@@ -3838,7 +4350,7 @@
       S.error = '';
     } catch (err) {
       S.escalations = { orders: [], calls: [] };
-      if (err.code !== 'no_api_key') S.error = 'Could not load issues: ' + err.message;
+      if (!isGated(err)) S.error = 'Could not load issues: ' + err.message;
     }
   }
 
@@ -3851,6 +4363,7 @@
     agent: viewAgent,
     call: viewCall,
     settings: viewSettings, store: viewStore,
+    plans: viewPlans,
   };
 
   // render() also runs for in-view updates (toggles, typing, polling). Replaying
@@ -3875,12 +4388,21 @@
     document.querySelectorAll('.nav-item').forEach((b) =>
       b.classList.toggle('active', b.dataset.view === ({ agent: 'agents', call: 'calls' }[S.view] || S.view)));
 
-    const pill = $('#connPill');
-    pill.className = 'pill ' + (connected() ? 'ok' : 'err');
-    pill.innerHTML = '<span class="dot"></span>' + (connected() ? 'Connected' : 'Not connected');
+    // The chip is the merchant's standing answer to "what am I on and how much
+    // is left", so it carries the allowance rather than a bare connection state.
+    const orgName = $('#orgName');
+    if (orgName) orgName.textContent = planName();
 
+    const pill = $('#connPill');
+    pill.className = 'pill ' + (entitled() ? 'ok' : 'err');
+    pill.innerHTML = '<span class="dot"></span>' + (S.entitlement
+      ? esc(planName()) + ' · ' + esc(String(Math.max(0, includedMin() - usedMin()))) + ' min left'
+      : '—');
+
+    // confirmDialog wins when both want the screen: the merchant asked that
+    // question, the paywall did not, and stacking two overlays reads as a bug.
     const ch = $('#confirmHost');
-    if (ch) ch.innerHTML = confirmDialog();
+    if (ch) ch.innerHTML = confirmDialog() || blockedDialog();
 
     // The picker list is rebuilt by every render; put it back where it was.
     const pl = $('#pickerList');
@@ -4000,6 +4522,10 @@
     if (overlay) overlay.addEventListener('click', (ev) => { if (ev.target === overlay) closePicker(); });
     const pickerRetry = $('#pickerRetry');
     if (pickerRetry) pickerRetry.addEventListener('click', openPicker);
+    // Close before navigating: the picker is rendered by viewAgents, so leaving
+    // it "open" in state would pop it straight back over the page on return.
+    const pickerTemplates = $('#pickerTemplates');
+    if (pickerTemplates) pickerTemplates.addEventListener('click', () => { closePicker(); go('templates'); });
     const pickerSearch = $('#pickerSearch');
     if (pickerSearch) {
       // Do not re-render mid-composition: an IME (Hindi, CJK) commits on
@@ -4068,8 +4594,35 @@
     const callNext = $('#callNext');
     if (callNext) callNext.addEventListener('click', () => pageCalls(1));
 
-    const validateBtn = $('#validateBtn');
-    if (validateBtn) validateBtn.addEventListener('click', withBusy(validateBtn, validateKey));
+    document.querySelectorAll('[data-plan]').forEach((b) =>
+      b.addEventListener('click', withBusy(b, () => choosePlan(b.dataset.plan))));
+    const capBtn = $('#raiseCap');
+    if (capBtn) capBtn.addEventListener('click', withBusy(capBtn, raiseCap));
+    const cancelPlan = $('#cancelPlan');
+    if (cancelPlan) cancelPlan.addEventListener('click', withBusy(cancelPlan, moveToStarter));
+
+    // Dismissing the paywall clears the block rather than hiding it, so the next
+    // render does not put the overlay straight back over whatever they clicked.
+    const blockedClose = $('#blockedClose');
+    if (blockedClose) blockedClose.addEventListener('click', clearBlock);
+    const blockedOv = $('#blockedOverlay');
+    if (blockedOv) blockedOv.addEventListener('click', (ev) => { if (ev.target === blockedOv) clearBlock(); });
+    const blockedGo = $('#blockedGo');
+    if (blockedGo) blockedGo.addEventListener('click', () => {
+      const to = blockedGo.dataset.blockedGo;
+      clearBlock();
+      go(to);
+    });
+
+    // The browser-call panel is the card immediately above this one, so the
+    // no-number state points at it rather than duplicating its button.
+    const jump = $('#jumpToWebCall');
+    if (jump) jump.addEventListener('click', () => {
+      const target = $('#webCallBtn');
+      if (!target) return;
+      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      target.focus();
+    });
 
     const saveWinBack = $('#saveWinBack');
     if (saveWinBack) saveWinBack.addEventListener('click', withBusy(saveWinBack, saveWinBackDays));
@@ -4091,46 +4644,56 @@
     }
   }
 
-  async function validateKey() {
-    const msg = $('#keyMsg');
-    const key = $('#apiKey').value.trim();
-    msg.textContent = 'Validating…';
-    try {
-      const r = await api('/api/validate-key', {
-        method: 'POST',
-        body: JSON.stringify(key ? { telenowApiKey: key } : {}),
-      });
-      const org = r.org || r.me || r || {};
-      if (org.org_name) $('#orgName').textContent = org.org_name;
-      msg.textContent = 'Connected' + (org.org_name ? ' to ' + org.org_name : '') + '.';
-      await loadSettings();
-      await loadAgents();
-      render();
-    } catch (err) {
-      msg.textContent = 'Failed: ' + err.message;
-    }
+  /**
+   * Drop a 402 block once the merchant has acknowledged or acted on it.
+   *
+   * Dropping it is all there is to do, because the block never touched the
+   * entitlement in the first place: "Not now" returns the merchant to exactly
+   * the app they had before they tried the action that was refused.
+   */
+  function clearBlock() {
+    if (!S.block) return;
+    S.block = null;
+    render();
   }
 
   // ── Data loading ────────────────────────────────────────────────────────────
+  // GET /api/settings carries the entitlement so first paint needs one
+  // round-trip, not two; GET /api/billing then fills in the usage counters and
+  // the plan cards.
   async function loadSettings() {
     const r = await api('/api/settings');
     S.settings = r.settings;
+    if (r.entitlement) S.entitlement = r.entitlement;
+  }
+
+  async function loadBilling(refresh = false) {
+    try {
+      const r = await api('/api/billing' + (refresh ? '?refresh=1' : ''));
+      if (r.entitlement) S.entitlement = r.entitlement;
+      if (r.usage) S.usage = r.usage;
+      S.plans = r.plans || [];
+      S.planErr = '';
+    } catch (err) {
+      // Never let a billing read blank the app: the entitlement from
+      // /api/settings still stands, and the server re-checks every spend anyway.
+      if (S.plans === null) S.plans = [];
+      S.planErr = 'Could not load plans: ' + err.message;
+    }
   }
 
   async function loadAgents() {
-    if (!connected()) { S.agents = []; return; }
     try {
       const r = await api('/api/agents');
       S.agents = r.agents || [];
       S.missingAgents = r.missing || [];
     } catch (err) {
       S.agents = [];
-      if (err.code !== 'no_api_key') S.error = 'Could not load agents: ' + err.message;
+      if (!isGated(err)) S.error = 'Could not load agents: ' + err.message;
     }
   }
 
   async function loadCalls() {
-    if (!connected()) { S.calls = []; render(); return; }
     const sort = $('#callSort') ? $('#callSort').value : 'newest';
     const status = $('#callStatus') ? $('#callStatus').value : '';
     // Remember the filters so paging keeps them; render() rebuilds the selects.
@@ -4152,7 +4715,7 @@
       S.error = '';
     } catch (err) {
       S.calls = [];
-      if (err.code !== 'no_api_key') S.error = 'Could not load calls: ' + err.message;
+      if (!isGated(err)) S.error = 'Could not load calls: ' + err.message;
     }
     render();
   }
@@ -4201,6 +4764,10 @@
     if (view === 'call' && S.callId && (S.call === null || force)) { await loadCall(S.callId); }
     if (view === 'calls' && (S.calls === null || force)) { await loadCalls(); }
     if (view === 'leads' && (S.leads === null || force)) { await loadLeads(); render(); }
+    // Plans is re-read on every visit, and forced past the server's 5-minute
+    // entitlement cache: the merchant lands back here straight from Shopify's
+    // approval screen, and a stale card would tell them the purchase failed.
+    if (view === 'plans') { await loadBilling(true); render(); }
   }
 
   document.querySelectorAll('.nav-item').forEach((b) =>
@@ -4219,10 +4786,11 @@
   document.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Escape') return;
     if (S.confirm) { settleConfirm(false); return; }
+    if (S.block) { clearBlock(); return; }
     if (S.picker && S.picker.open) closePicker();
   });
   $('#welcomeSkip').addEventListener('click', () => finishWelcome(null));
-  $('#welcomeStart').addEventListener('click', () => finishWelcome('settings'));
+  $('#welcomeStart').addEventListener('click', () => finishWelcome('templates'));
 
   // ── Re-auth self-heal ───────────────────────────────────────────────────────
   // A 401 on boot means we have no usable session token: the page was opened
@@ -4299,15 +4867,10 @@
     }
 
     // Independent fetches — run them together rather than in series.
-    await Promise.all([loadProfile(), loadLeads(), loadAgents()]);
-
-    if (connected()) {
-      try {
-        const r = await api('/api/validate-key', { method: 'POST', body: '{}' });
-        const org = r.org || r.me || r || {};
-        if (org.org_name) $('#orgName').textContent = org.org_name;
-      } catch { /* the pill already reflects connection state */ }
-    }
+    // loadBilling is in this set rather than deferred to the Plans view: the
+    // topbar chip, the Home card and the Settings card all read the counters, so
+    // there is no first paint that does not want them.
+    await Promise.all([loadProfile(), loadLeads(), loadAgents(), loadBilling()]);
 
     render();
 

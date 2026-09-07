@@ -28,6 +28,8 @@ import '@shopify/shopify-api/adapters/node'; // MUST be imported before shopifyA
 import { shopifyApi, ApiVersion, LogSeverity } from '@shopify/shopify-api';
 
 import { getShop } from './store.js';
+import { getSettings, updateSettings } from './settings.js';
+import { billingConfig } from './plans.js';
 
 // ── Config from env ──────────────────────────────────────────────────────────
 
@@ -117,6 +119,15 @@ export const shopify = shopifyApi({
   // Bridge, which is what gives the app its entry in the admin nav. Requires the
   // page to send App Bridge session tokens - see verifyAnySessionToken in session.js.
   isEmbeddedApp: true,
+  // The plan catalogue, keyed by the merchant-visible subscription name. This is
+  // not decoration: shopify.billing.check(), .request() and .cancel() all read
+  // config.billing and throw BillingError when it is absent, so leaving it unset
+  // does not disable billing — it makes every entitlement read fail. billing.js
+  // swallows that failure and serves the cached-or-Starter entitlement, so the
+  // symptom of forgetting this line is not a crash but every paying merchant
+  // silently dropping to the free tier. plans.js owns the shape; see the note
+  // above billingConfig() for why starter is deliberately absent from it.
+  billing: billingConfig(),
   logger: { level: LogSeverity.Warning },
 });
 
@@ -229,6 +240,66 @@ export async function setOrderMetafield(shop, orderId, key, value, type = 'singl
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin GraphQL
+//
+// One authenticated GraphQL call, raw fetch, same offline token as the REST
+// helpers above. It is raw fetch rather than the library's GraphqlClient for the
+// same reason adminRequest() is: the client wants a Session object, and every
+// caller here has only a shop domain and the stored offline token.
+//
+// The subtlety worth keeping in one place: GraphQL answers HTTP 200 with an
+// `errors` array. A caller that only checks res.ok reads `undefined` off a
+// failed query and treats it as an empty result — which for the billing paths is
+// the difference between "this shop has no subscription" and "we could not ask".
+// Both failure modes throw here so no caller can quietly get that wrong.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Run a GraphQL query/mutation against a shop's Admin API.
+ *
+ * Returns the UNWRAPPED `data` payload (so `res.orders`, not `res.data.orders`).
+ *
+ * @param {string} shop
+ * @param {string} query   GraphQL document
+ * @param {object} [variables]
+ * @returns {Promise<object>} the `data` object from the response
+ * @throws on a missing session, a non-2xx response, unparseable JSON, or a
+ *         populated `errors` array.
+ */
+export async function adminGraphQL(shop, query, variables = {}) {
+  const session = getShop(shop);
+  if (!session?.accessToken) {
+    throw new Error(`No offline session for ${shop} — is the app installed?`);
+  }
+
+  const res = await fetch(`https://${shop}/admin/api/${REST_API_VERSION}/graphql.json`, {
+    method: 'POST',
+    headers: {
+      'X-Shopify-Access-Token': session.accessToken,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    // 401/403 here almost always means the offline token was revoked without an
+    // app/uninstalled webhook reaching us; surfacing the status keeps that
+    // diagnosable. Never echo the body — it can carry request context we do not
+    // want in logs.
+    throw new Error(`Shopify GraphQL → ${res.status}`);
+  }
+  if (data?.errors?.length) {
+    throw new Error(data.errors[0]?.message || 'Shopify GraphQL error');
+  }
+  if (!data || typeof data !== 'object') {
+    throw new Error('Shopify GraphQL returned a non-JSON body');
+  }
+  return data.data ?? {};
+}
+
 /**
  * Orders this app's agents have flagged, newest first.
  *
@@ -241,8 +312,6 @@ export async function setOrderMetafield(shop, orderId, key, value, type = 'singl
  * @returns {Promise<Array<object>>}
  */
 export async function findFlaggedOrders(shop, limit = 50) {
-  const session = getShop(shop);
-  if (!session?.accessToken) throw new Error(`No offline session for ${shop}`);
   const query = `query FlaggedOrders($n: Int!) {
     orders(first: $n, reverse: true, query: "tag:telenow-*") {
       edges { node {
@@ -252,19 +321,10 @@ export async function findFlaggedOrders(shop, limit = 50) {
       } }
     }
   }`;
-  const res = await fetch(`https://${shop}/admin/api/${REST_API_VERSION}/graphql.json`, {
-    method: 'POST',
-    headers: {
-      'X-Shopify-Access-Token': session.accessToken,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ query, variables: { n: Math.min(Math.max(limit, 1), 100) } }),
-  });
-  const data = await res.json().catch(() => null);
-  if (!res.ok) throw new Error(`Shopify GraphQL → ${res.status}`);
-  // GraphQL answers 200 with an errors array, so a bad query is not an HTTP error.
-  if (data?.errors?.length) throw new Error(data.errors[0]?.message || 'Shopify GraphQL error');
-  return (data?.data?.orders?.edges || []).map((e) => e.node).filter(Boolean);
+  // Shopify rejects `first` above 250 and below 1; clamping to 100 keeps the
+  // response inside the default query-cost budget on shops with fat orders.
+  const data = await adminGraphQL(shop, query, { n: Math.min(Math.max(limit, 1), 100) });
+  return (data?.orders?.edges || []).map((e) => e.node).filter(Boolean);
 }
 
 /**
@@ -282,4 +342,91 @@ export async function getShopProfile(shop) {
   ].join(",");
   const data = await adminRequest(shop, "GET", "/shop.json?fields=" + encodeURIComponent(fields));
   return data?.shop ?? null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shop country
+//
+// The store's own country decides which digits we dial. Every phone number this
+// app touches arrives from a Shopify payload in whatever format that merchant's
+// shoppers type, and turning "9876543210" into an E.164 number requires knowing
+// the country to prefix. The app used to answer that question with a module-level
+// 'IN' constant, which is correct for exactly one market and silently dials the
+// wrong country for every other — including the North-American reviewer whose
+// test call decides whether this app stays listed.
+//
+// So: ask Shopify, once, and cache it. `billingAddress.countryCodeV2` is the
+// right field rather than `shop.country_name` (which getShopProfile already
+// reads for display): it is a CountryCode enum, so it comes back as a stable
+// ISO-3166-1 alpha-2 token we can key a dial-code table on, whereas the REST
+// profile's `country_name` is a localised display string ("United States") that
+// no lookup table should ever be keyed on.
+//
+// The cache lives on the settings row rather than in a module Map because the
+// dialling paths that need it are cron sweeps and webhook handlers — processes
+// that may have booted seconds ago and have no warm memory — and because a
+// process-wide Map is exactly the multi-tenant bug (one server, one assumed
+// country) this change exists to remove.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve a shop's ISO-3166-1 alpha-2 country, cached on settings.shopCountry.
+ *
+ * NEVER THROWS. A country lookup is an enrichment, not a precondition: an
+ * uninstalled shop, a revoked offline token, a GraphQL error and a Shopify
+ * outage all return null, and the caller falls through the shared resolver
+ * (explicit argument → shopCountry → DEFAULT_PHONE_COUNTRY → 'US'). A throw here
+ * would take down the call path it was meant to improve.
+ *
+ * @param {string} shop myshopify domain
+ * @returns {Promise<string|null>} 'US' | 'IN' | … or null when unresolvable
+ */
+export async function getShopCountry(shop) {
+  const domain = String(shop || '').trim();
+  if (!domain) return null;
+
+  try {
+    // Cached value wins with no network round trip. Only a well-formed ISO-2
+    // token counts as cached — anything else (a legacy blob, a hand-edited
+    // store.json, a country name that leaked in from somewhere) is treated as
+    // unresolved and re-fetched, rather than being handed to a dial-code lookup
+    // that would quietly return null and drop the call.
+    const cached = normalizeCountryIso(getSettings(domain).shopCountry);
+    if (cached) return cached;
+
+    const data = await adminGraphQL(
+      domain,
+      `query ShopCountry { shop { billingAddress { countryCodeV2 } } }`,
+    );
+    const iso = normalizeCountryIso(data?.shop?.billingAddress?.countryCodeV2);
+    if (!iso) return null;
+
+    // Write-through, best effort. A persistence failure must not turn a
+    // successful lookup into a null — the value we just fetched is still
+    // correct for this request, we simply pay for the query again next time.
+    try {
+      updateSettings(domain, { shopCountry: iso });
+    } catch (err) {
+      console.warn(`[shopify] could not cache shopCountry for ${domain}: ${err.message}`);
+    }
+    return iso;
+  } catch (err) {
+    console.warn(`[shopify] shop country lookup failed for ${domain}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Accept only a real ISO-3166-1 alpha-2 code.
+ *
+ * 'ZZ' is rejected on purpose: it is a real member of Shopify's CountryCode enum
+ * meaning "Unknown Region", so it arrives looking like a valid two-letter answer
+ * while carrying no dialling information at all. Caching it would pin the shop
+ * to a country that can never resolve to a dial code, and — because a cached
+ * value short-circuits the fetch — would do so permanently.
+ */
+function normalizeCountryIso(value) {
+  const iso = String(value || '').trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(iso) || iso === 'ZZ') return null;
+  return iso;
 }
